@@ -1,0 +1,722 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF.AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <style>
+        :root {
+            --accent: #6366f1;
+            --accent-hover: #4f46e5;
+            --accent-glow: rgba(99,102,241,.25);
+            --green: #22c55e;
+            --green-bg: rgba(34,197,94,.08);
+            --red: #ef4444;
+            --red-bg: rgba(239,68,68,.08);
+            --amber: #f59e0b;
+            --bg-0: #0b0f1a;
+            --bg-1: #111827;
+            --bg-2: #1e2536;
+            --bg-3: #2a3244;
+            --text-0: #f1f5f9;
+            --text-1: #94a3b8;
+            --text-2: #64748b;
+            --border: rgba(148,163,184,.12);
+            --glass: rgba(30,37,54,.55);
+            --glass-border: rgba(148,163,184,.08);
+            --radius: 14px;
+            --radius-sm: 10px;
+            --transition: .2s cubic-bezier(.4,0,.2,1);
+        }
+        *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-0);
+            color: var(--text-0);
+            min-height: 100vh;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 2rem 1.5rem;
+            background-image:
+                radial-gradient(ellipse 80% 60% at 50% -20%, rgba(99,102,241,.15), transparent),
+                radial-gradient(ellipse 60% 50% at 80% 50%, rgba(139,92,246,.08), transparent);
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            user-select: none;
+        }
+        input, textarea { -webkit-user-select: text; user-select: text; }
+        .app { width: 100%; max-width: 1100px; }
+        .brand { text-align: center; margin-bottom: 1.75rem; }
+        .brand-logo {
+            display: inline-flex; align-items: center; gap: .6rem;
+            font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; color: var(--text-0);
+        }
+        .brand-logo .app-icon {
+            width: 32px; height: 32px; background: var(--accent); border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1rem; box-shadow: 0 0 20px var(--accent-glow);
+        }
+        .brand-sub { font-size: .8rem; color: var(--text-2); margin-top: .35rem; letter-spacing: .03em; }
+        .card {
+            background: var(--glass);
+            backdrop-filter: blur(24px) saturate(1.4);
+            -webkit-backdrop-filter: blur(24px) saturate(1.4);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius);
+            padding: 1.75rem;
+            box-shadow: 0 4px 24px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.04);
+        }
+        /* TABS */
+        .tabs { display: flex; background: var(--bg-2); border-radius: var(--radius-sm); padding: 3px; margin-bottom: 1.5rem; }
+        .tab-btn {
+            flex: 1; background: none; border: none; padding: .65rem .75rem;
+            font-size: .8rem; font-weight: 500; color: var(--text-2); cursor: pointer;
+            border-radius: 8px; transition: var(--transition);
+            display: flex; align-items: center; justify-content: center; gap: .4rem;
+        }
+        .tab-btn:hover { color: var(--text-1); }
+        .tab-btn.active { color: var(--text-0); background: var(--bg-3); box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+        .tab-icon { font-size: .95rem; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        /* FORM */
+        .form-group { margin-bottom: 1.25rem; }
+        .form-label { display: block; font-size: .8rem; font-weight: 500; color: var(--text-1); margin-bottom: .45rem; }
+        .form-hint { font-size: .7rem; color: var(--text-2); margin-bottom: .45rem; }
+        .dropzone {
+            position: relative; border: 2px dashed var(--border); border-radius: var(--radius-sm);
+            padding: 1.75rem 1rem; text-align: center; cursor: pointer;
+            transition: var(--transition); background: rgba(255,255,255,.015);
+        }
+        .dropzone:hover, .dropzone.drag-over { border-color: var(--accent); background: rgba(99,102,241,.04); }
+        .dropzone.has-file { border-color: var(--green); background: var(--green-bg); }
+        .dropzone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+        .dropzone-icon { width: 36px; height: 36px; margin: 0 auto .5rem; color: var(--text-2); transition: var(--transition); }
+        .dropzone:hover .dropzone-icon { color: var(--accent); }
+        .dropzone.has-file .dropzone-icon { color: var(--green); }
+        .dropzone-text { font-size: .8rem; color: var(--text-2); line-height: 1.5; }
+        .dropzone-text strong { color: var(--accent); font-weight: 500; }
+        .dropzone.has-file .dropzone-text strong { color: var(--green); }
+        .file-badge {
+            display: none; margin-top: .5rem; font-size: .75rem; font-weight: 500;
+            color: var(--green); background: rgba(34,197,94,.1);
+            padding: .25rem .6rem; border-radius: 20px; border: 1px solid rgba(34,197,94,.2);
+        }
+        .dropzone.has-file .file-badge { display: inline-block; }
+        .input {
+            width: 100%; padding: .7rem .9rem; border: 1px solid var(--border);
+            border-radius: var(--radius-sm); font-size: .9rem; font-family: inherit;
+            background: var(--bg-2); color: var(--text-0); outline: none; transition: var(--transition);
+        }
+        .input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+        .input::placeholder { color: var(--text-2); }
+        .calc-tag {
+            margin-top: .45rem; padding: .45rem .65rem;
+            background: rgba(99,102,241,.06); border: 1px solid rgba(99,102,241,.12);
+            border-radius: 8px; font-size: .7rem; color: var(--accent); line-height: 1.5; display: none;
+        }
+        .calc-tag.visible { display: block; }
+        /* BUTTONS */
+        .btn {
+            width: 100%; border: none; padding: .8rem 1rem; border-radius: var(--radius-sm);
+            font-size: .85rem; font-weight: 600; font-family: inherit; cursor: pointer;
+            transition: var(--transition); display: inline-flex; align-items: center;
+            justify-content: center; gap: .45rem;
+        }
+        .btn:disabled { opacity: .45; cursor: not-allowed; }
+        .btn-primary { background: var(--accent); color: #fff; box-shadow: 0 2px 12px var(--accent-glow); }
+        .btn-primary:hover:not(:disabled) { background: var(--accent-hover); box-shadow: 0 4px 20px var(--accent-glow); transform: translateY(-1px); }
+        .btn-outline { background: transparent; color: var(--accent); border: 1px solid rgba(99,102,241,.3); }
+        .btn-outline:hover:not(:disabled) { background: rgba(99,102,241,.08); border-color: var(--accent); }
+        .btn-danger { background: var(--red); color: #fff; }
+        .btn-danger:hover:not(:disabled) { background: #dc2626; transform: translateY(-1px); }
+        .btn-row { display: flex; gap: .5rem; }
+        .btn-row .btn { flex: 1; }
+        /* STATUS */
+        .status {
+            margin-top: .85rem; padding: .55rem .75rem; border-radius: 8px;
+            font-size: .78rem; font-weight: 500; text-align: center; display: none; animation: fadeIn .2s ease;
+        }
+        .status.visible { display: block; }
+        .status.ok { background: var(--green-bg); color: var(--green); border: 1px solid rgba(34,197,94,.15); }
+        .status.err { background: var(--red-bg); color: var(--red); border: 1px solid rgba(239,68,68,.15); }
+        /* RESULTS */
+        .results {
+            margin-top: 1rem; background: var(--bg-2); border: 1px solid var(--border);
+            border-radius: var(--radius-sm); overflow: hidden; display: none; animation: slideUp .3s ease;
+        }
+        .results.visible { display: block; }
+        .result-item {
+            display: flex; align-items: center; gap: .55rem; padding: .55rem .75rem;
+            border-bottom: 1px solid var(--border); font-size: .78rem; transition: background var(--transition);
+        }
+        .result-item:last-child { border-bottom: none; }
+        .result-item:hover { background: rgba(255,255,255,.02); }
+        .ri-icon { font-size: .95rem; flex-shrink: 0; }
+        .ri-name { font-weight: 500; color: var(--text-0); min-width: 140px; }
+        .ri-detail { color: var(--text-2); font-size: .7rem; flex: 1; text-align: right; }
+        .verdict-bar { padding: .65rem .75rem; text-align: center; font-weight: 600; font-size: .82rem; }
+        .verdict-bar.pass { background: var(--green-bg); color: var(--green); border-top: 1px solid rgba(34,197,94,.15); }
+        .verdict-bar.fail { background: var(--red-bg); color: var(--red); border-top: 1px solid rgba(239,68,68,.15); }
+        .issues-list { margin-top: .3rem; font-weight: 400; font-size: .72rem; line-height: 1.6; }
+        /* SPINNER */
+        .spinner {
+            display: inline-block; width: 14px; height: 14px;
+            border: 2px solid rgba(255,255,255,.3); border-top-color: #fff;
+            border-radius: 50%; animation: spin .6s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        /* LAYOUT */
+        .main-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; align-items: start; }
+        /* JOURNAL */
+        .journal-card {
+            background: var(--glass); backdrop-filter: blur(24px) saturate(1.4);
+            -webkit-backdrop-filter: blur(24px) saturate(1.4);
+            border: 1px solid var(--glass-border); border-radius: var(--radius);
+            padding: 1.5rem;
+            box-shadow: 0 4px 24px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.04);
+            max-height: 85vh; display: flex; flex-direction: column;
+        }
+        .journal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; flex-shrink: 0; }
+        .journal-title { font-size: .95rem; font-weight: 600; display: flex; align-items: center; gap: .4rem; }
+        .stats-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .5rem; margin-bottom: 1rem; flex-shrink: 0; }
+        .stat-box { background: var(--bg-2); border-radius: 8px; padding: .55rem .65rem; text-align: center; }
+        .stat-value { font-size: 1.15rem; font-weight: 700; color: var(--accent); line-height: 1.2; }
+        .stat-value.green { color: var(--green); }
+        .stat-label { font-size: .6rem; color: var(--text-2); text-transform: uppercase; letter-spacing: .04em; margin-top: .15rem; }
+        .journal-table-wrap { flex: 1; overflow-y: auto; border-radius: 8px; border: 1px solid var(--border); }
+        .journal-table-wrap::-webkit-scrollbar { width: 4px; }
+        .journal-table-wrap::-webkit-scrollbar-track { background: transparent; }
+        .journal-table-wrap::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 4px; }
+        .journal-table { width: 100%; border-collapse: collapse; font-size: .72rem; }
+        .journal-table thead { position: sticky; top: 0; z-index: 1; }
+        .journal-table th {
+            background: var(--bg-3); color: var(--text-1); font-weight: 600;
+            text-transform: uppercase; letter-spacing: .04em; font-size: .62rem;
+            padding: .55rem .5rem; text-align: left; white-space: nowrap;
+        }
+        .journal-table td { padding: .5rem .5rem; border-bottom: 1px solid var(--border); color: var(--text-0); white-space: nowrap; }
+        .journal-table tr:hover td { background: rgba(255,255,255,.02); }
+        .journal-table .td-num { color: var(--text-2); font-size: .65rem; text-align: center; }
+        .journal-table .td-file { max-width: 180px; overflow: hidden; text-overflow: ellipsis; color: var(--text-0); font-weight: 500; }
+        .journal-table .td-amount { font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+        .status-dot.ok { background: var(--green); box-shadow: 0 0 6px rgba(34,197,94,.4); }
+        .status-dot.err { background: var(--red); box-shadow: 0 0 6px rgba(239,68,68,.4); }
+        .journal-empty { text-align: center; padding: 2rem 1rem; color: var(--text-2); font-size: .8rem; }
+        .journal-footer { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; margin-top: .75rem; font-size: .65rem; color: var(--text-2); }
+        .btn-sm {
+            background: var(--bg-3); border: 1px solid var(--border); color: var(--text-1);
+            padding: .3rem .6rem; border-radius: 6px; font-size: .65rem; cursor: pointer; transition: var(--transition);
+        }
+        .btn-sm:hover { background: var(--bg-2); color: var(--text-0); }
+        @media (max-width: 768px) {
+            .main-layout { grid-template-columns: 1fr; }
+            .journal-card { max-height: 50vh; }
+            .card { padding: 1.25rem; }
+            .ri-name { min-width: 100px; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- APP -->
+<div class="app" id="appRoot">
+    <div class="brand">
+        <div class="brand-logo"><span class="app-icon">📄</span> PDF.AI</div>
+    </div>
+    <div class="main-layout">
+        <!-- LEFT COLUMN -->
+        <div>
+            <div class="card">
+                <div class="tabs">
+                    <button class="tab-btn active" data-tab="score"><span class="tab-icon">⚡</span> Скоринг</button>
+                    <button class="tab-btn" data-tab="business"><span class="tab-icon">🏢</span> Бизнес</button>
+                    <button class="tab-btn" data-tab="verify"><span class="tab-icon">🔍</span> Проверка</button>
+                </div>
+                <!-- SCORE TAB -->
+                <div class="tab-content active" id="tab-score">
+                    <div class="form-group">
+                        <label class="form-label">PDF-выписка</label>
+                        <div class="form-hint">Формат: оригинальная выписка (PDF)</div>
+                        <div class="dropzone" id="dropzone">
+                            <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M12 16V4m0 0l-4 4m4-4 4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            <div class="dropzone-text"><strong>Нажмите</strong> или перетащите PDF</div>
+                            <div class="file-badge" id="fileBadge"></div>
+                            <input type="file" id="fileInput" accept=".pdf" />
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Желаемый баланс, ₸</label>
+                        <input class="input" id="balanceInput" type="text" inputmode="numeric" placeholder="500 000" />
+                        <div class="calc-tag" id="calcTag"></div>
+                    </div>
+                    <button class="btn btn-primary" id="processBtn" onclick="doProcess()" disabled>
+                        <span id="processBtnText">⚡ Запустить скоринг</span>
+                    </button>
+                    <div class="status" id="processStatus"></div>
+                </div>
+                <!-- BUSINESS TAB -->
+                <div class="tab-content" id="tab-business">
+                    <div class="form-group">
+                        <label class="form-label">PDF-выписка (Бизнес)</label>
+                        <div class="form-hint">Справка Kaspi об оборотах по счёту (для ИП/ТОО)</div>
+                        <div class="dropzone" id="businessDropzone">
+                            <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M12 16V4m0 0l-4 4m4-4 4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            <div class="dropzone-text"><strong>Нажмите</strong> или перетащите PDF</div>
+                            <div class="file-badge" id="businessBadge"></div>
+                            <input type="file" id="businessFileInput" accept=".pdf" />
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Среднемесячный оборот, ₸</label>
+                        <input class="input" id="businessIncomeInput" type="text" inputmode="numeric" placeholder="1 000 000" />
+                        <div class="calc-tag" id="businessCalcTag">Мелкие месяцы будут подтянуты до этой суммы. Остатки и QR-код не меняются.</div>
+                    </div>
+                    <button class="btn btn-primary" id="businessBtn" onclick="doBusiness()" disabled>
+                        <span id="businessBtnText">🏢 Запустить Бизнес-скоринг</span>
+                    </button>
+                    <div class="status" id="businessStatus"></div>
+                </div>
+                <!-- VERIFY TAB -->
+                <div class="tab-content" id="tab-verify">
+                    <div class="form-group">
+                        <label class="form-label">PDF для проверки</label>
+                        <div class="dropzone" id="verifyDropzone">
+                            <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M12 16V4m0 0l-4 4m4-4 4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            <div class="dropzone-text"><strong>Нажмите</strong> или перетащите PDF</div>
+                            <div class="file-badge" id="verifyBadge"></div>
+                            <input type="file" id="verifyFileInput" accept=".pdf" />
+                        </div>
+                    </div>
+                    <div class="btn-row">
+                        <button class="btn btn-outline" id="verifyBtn" onclick="doVerify()" disabled>🔍 Проверить</button>
+                        <button class="btn btn-outline" id="fixBtn" onclick="doFix()" disabled>🔧 Исправить</button>
+                    </div>
+                    <div class="status" id="verifyStatus"></div>
+                    <div class="results" id="verifyResults"></div>
+                </div>
+            </div>
+        </div>
+        <!-- RIGHT COLUMN: JOURNAL -->
+        <div class="journal-card" id="journalCard">
+            <div class="journal-header">
+                <div class="journal-title">📋 Журнал</div>
+                <button class="btn-sm" onclick="loadJournal()">↻</button>
+            </div>
+            <div class="stats-row">
+                <div class="stat-box"><div class="stat-value" id="statTotal">0</div><div class="stat-label">Всего</div></div>
+                <div class="stat-box"><div class="stat-value green" id="statOk">0</div><div class="stat-label">Успешных</div></div>
+                <div class="stat-box"><div class="stat-value" id="statAvg">0</div><div class="stat-label">Ср. сумма</div></div>
+            </div>
+            <div class="journal-table-wrap">
+                <table class="journal-table">
+                    <thead><tr><th>#</th><th>Клиент</th><th>Сумма</th><th>Статус</th><th>Дата</th></tr></thead>
+                    <tbody id="journalBody"></tbody>
+                </table>
+            </div>
+            <div class="journal-footer">
+                <span id="journalCount"></span>
+                <div>
+                    <button class="btn-sm" id="prevPage" onclick="changePage(-1)">←</button>
+                    <button class="btn-sm" id="nextPage" onclick="changePage(1)">→</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+/* ===== ПРОСТЫЕ ОБЁРТКИ ДЛЯ FETCH ===== */
+async function appFetch(url, opts = {}) {
+    return fetch(url, opts);
+}
+
+async function appFetchForm(url, formData) {
+    return fetch(url, { method: 'POST', body: formData });
+}
+
+/* ===== СКАЧИВАНИЕ PDF =====
+   В desktop-сборке (pywebview) — диалог "Сохранить как" через Python API.
+   В браузере — обычный <a download>.
+   Возвращает true, если файл сохранён (или скачан), false если отменён/ошибка. */
+function _blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onloadend = () => {
+            const s = r.result || '';
+            const i = s.indexOf(',');
+            resolve(i >= 0 ? s.slice(i + 1) : s);
+        };
+        r.onerror = reject;
+        r.readAsDataURL(blob);
+    });
+}
+
+async function savePdfBlob(blob, suggestedName) {
+    if (!suggestedName.toLowerCase().endsWith('.pdf')) suggestedName += '.pdf';
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.save_pdf) {
+        try {
+            const b64 = await _blobToBase64(blob);
+            const res = await window.pywebview.api.save_pdf(suggestedName, b64);
+            return !!(res && res.ok);
+        } catch (e) {
+            console.error('save_pdf failed, fallback to download:', e);
+        }
+    }
+    // Фолбэк: обычное скачивание в Загрузки
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.download = suggestedName;
+    a.href = url;
+    a.click();
+    URL.revokeObjectURL(url);
+    return true;
+}
+
+function _filenameFromResponse(resp, fallback) {
+    const disp = resp.headers.get('content-disposition') || '';
+    const m = disp.match(/filename="?(.+?)"?(;|$)/);
+    return m ? m[1] : fallback;
+}
+
+/* ===== TABS ===== */
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        this.classList.add('active');
+        document.getElementById('tab-' + this.dataset.tab).classList.add('active');
+    });
+});
+
+/* ===== FILE INPUTS ===== */
+let _scoreFile = null;
+let _verifyFile = null;
+let _businessFile = null;
+
+function setupDrop(dropId, inputId, badgeId, cb) {
+    const dz = document.getElementById(dropId);
+    const inp = document.getElementById(inputId);
+    const badge = document.getElementById(badgeId);
+    inp.addEventListener('change', () => {
+        if (inp.files.length) {
+            dz.classList.add('has-file');
+            badge.textContent = inp.files[0].name;
+            cb(inp.files[0]);
+        }
+    });
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+    dz.addEventListener('drop', e => {
+        e.preventDefault();
+        dz.classList.remove('drag-over');
+        if (e.dataTransfer.files.length && e.dataTransfer.files[0].name.endsWith('.pdf')) {
+            inp.files = e.dataTransfer.files;
+            dz.classList.add('has-file');
+            badge.textContent = e.dataTransfer.files[0].name;
+            cb(e.dataTransfer.files[0]);
+        }
+    });
+}
+
+setupDrop('dropzone', 'fileInput', 'fileBadge', f => {
+    _scoreFile = f;
+    document.getElementById('processBtn').disabled = false;
+});
+setupDrop('verifyDropzone', 'verifyFileInput', 'verifyBadge', f => {
+    _verifyFile = f;
+    document.getElementById('verifyBtn').disabled = false;
+    document.getElementById('fixBtn').disabled = false;
+});
+setupDrop('businessDropzone', 'businessFileInput', 'businessBadge', f => {
+    _businessFile = f;
+    document.getElementById('businessBtn').disabled = false;
+});
+
+/* ===== BUSINESS INCOME FORMAT ===== */
+const businessIncomeInput = document.getElementById('businessIncomeInput');
+businessIncomeInput.addEventListener('input', function() {
+    let raw = this.value.replace(/\D/g, '');
+    if (raw) this.value = Number(raw).toLocaleString('ru-RU');
+    const num = parseInt(raw);
+    const tag = document.getElementById('businessCalcTag');
+    if (num && num > 0) {
+        tag.textContent = 'Целевой доход: ' + num.toLocaleString('ru-RU') + ' ₸';
+        tag.classList.add('visible');
+    } else {
+        tag.classList.remove('visible');
+    }
+});
+
+async function doBusiness() {
+    if (!_businessFile) return;
+    const btn = document.getElementById('businessBtn');
+    const btnText = document.getElementById('businessBtnText');
+    btn.disabled = true;
+    btnText.innerHTML = '<span class="spinner"></span> Обработка...';
+    document.getElementById('businessStatus').className = 'status';
+
+    const raw = businessIncomeInput.value.replace(/\D/g, '');
+    if (!raw) {
+        setStatus('businessStatus', 'Укажите желаемый доход', false);
+        btn.disabled = false;
+        btnText.textContent = '🏢 Запустить Бизнес-скоринг';
+        return;
+    }
+
+    const fd = new FormData();
+    fd.append('file', _businessFile);
+    fd.append('desired_income', raw);
+
+    try {
+        const resp = await appFetchForm('/process-business', fd);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            setStatus('businessStatus', err.error || 'Ошибка обработки', false);
+            btn.disabled = false;
+            btnText.textContent = '🏢 Запустить Бизнес-скоринг';
+            return;
+        }
+        const blob = await resp.blob();
+        const fname = _filenameFromResponse(resp, 'business_' + _businessFile.name);
+        const saved = await savePdfBlob(blob, fname);
+        setStatus('businessStatus', saved ? '✅ Бизнес-скоринг завершён — файл сохранён' : '⚠ Сохранение отменено', saved);
+        loadJournal();
+    } catch (e) {
+        setStatus('businessStatus', 'Ошибка сети: ' + e.message, false);
+    }
+    btn.disabled = false;
+    btnText.textContent = '🏢 Запустить Бизнес-скоринг';
+}
+
+/* ===== BALANCE FORMAT ===== */
+const balanceInput = document.getElementById('balanceInput');
+balanceInput.addEventListener('input', function() {
+    let raw = this.value.replace(/\D/g, '');
+    if (raw) this.value = Number(raw).toLocaleString('ru-RU');
+    const num = parseInt(raw);
+    const tag = document.getElementById('calcTag');
+    if (num && num > 0) {
+        tag.textContent = 'Целевой баланс: ' + num.toLocaleString('ru-RU') + ' ₸';
+        tag.classList.add('visible');
+    } else {
+        tag.classList.remove('visible');
+    }
+});
+
+/* ===== PROCESS ===== */
+function setStatus(id, text, ok) {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.className = 'status visible ' + (ok ? 'ok' : 'err');
+}
+
+async function doProcess() {
+    if (!_scoreFile) return;
+    const btn = document.getElementById('processBtn');
+    const btnText = document.getElementById('processBtnText');
+    btn.disabled = true;
+    btnText.innerHTML = '<span class="spinner"></span> Обработка...';
+    document.getElementById('processStatus').className = 'status';
+
+    const balRaw = balanceInput.value.replace(/\D/g, '');
+    const fd = new FormData();
+    fd.append('file', _scoreFile);
+    if (balRaw) fd.append('desired_income', balRaw);
+
+    try {
+        const resp = await appFetchForm('/process', fd);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            // Спец-обработка floor занижения (HTTP 400 + min_desired_income)
+            if (resp.status === 400 && err.min_desired_income) {
+                const minDes = Math.ceil(err.min_desired_income);
+                const minDesFmt = minDes.toLocaleString('ru-RU');
+                const msg = (err.error || 'Слишком низкий доход') +
+                            ` Подставить минимум ${minDesFmt} ₸?`;
+                setStatus('processStatus', msg, false);
+                // Кнопка автоподстановки
+                const statusEl = document.getElementById('processStatus');
+                let applyBtn = document.getElementById('applyMinBtn');
+                if (!applyBtn) {
+                    applyBtn = document.createElement('button');
+                    applyBtn.id = 'applyMinBtn';
+                    applyBtn.type = 'button';
+                    applyBtn.style.cssText = 'margin-left:8px;padding:4px 10px;cursor:pointer;border-radius:6px;border:1px solid currentColor;background:transparent;color:inherit;font-size:.85em;';
+                    applyBtn.textContent = 'Подставить минимум';
+                    statusEl.appendChild(applyBtn);
+                }
+                applyBtn.onclick = () => {
+                    balanceInput.value = minDesFmt + ' ₸';
+                    balanceInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    applyBtn.remove();
+                };
+                btn.disabled = false;
+                btnText.textContent = '⚡ Запустить скоринг';
+                return;
+            }
+            const msg = typeof err.detail === 'string' ? err.detail
+                      : Array.isArray(err.detail) ? err.detail.map(e => e.msg || e).join('; ')
+                      : err.error || 'Ошибка обработки';
+            setStatus('processStatus', msg, false);
+            btn.disabled = false;
+            btnText.textContent = '⚡ Запустить скоринг';
+            return;
+        }
+        const blob = await resp.blob();
+        const fname = _filenameFromResponse(resp, 'scored_' + _scoreFile.name);
+        const saved = await savePdfBlob(blob, fname);
+        setStatus('processStatus', saved ? '✅ Скоринг завершён — файл сохранён' : '⚠ Сохранение отменено', saved);
+        loadJournal();
+    } catch (e) {
+        setStatus('processStatus', 'Ошибка сети: ' + e.message, false);
+    }
+    btn.disabled = false;
+    btnText.textContent = '⚡ Запустить скоринг';
+}
+
+/* ===== VERIFY ===== */
+async function doVerify() {
+    if (!_verifyFile) return;
+    const btn = document.getElementById('verifyBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>';
+    document.getElementById('verifyStatus').className = 'status';
+    document.getElementById('verifyResults').className = 'results';
+
+    const fd = new FormData();
+    fd.append('file', _verifyFile);
+
+    try {
+        const resp = await appFetchForm('/verify', fd);
+        const data = await resp.json();
+        if (!resp.ok) {
+            setStatus('verifyStatus', data.detail || 'Ошибка', false);
+        } else {
+            renderVerifyResults(data);
+        }
+    } catch (e) {
+        setStatus('verifyStatus', 'Ошибка сети: ' + e.message, false);
+    }
+    btn.disabled = false;
+    btn.innerHTML = '🔍 Проверить';
+}
+
+function renderVerifyResults(data) {
+    const box = document.getElementById('verifyResults');
+    let html = '';
+    const checks = data.checks || [];
+    for (const c of checks) {
+        const icon = c.ok ? '✅' : '❌';
+        html += '<div class="result-item"><span class="ri-icon">' + icon + '</span>';
+        html += '<span class="ri-name">' + c.name + '</span>';
+        html += '<span class="ri-detail">' + (c.detail || '') + '</span></div>';
+    }
+    const ok = data.passed === true;
+    html += '<div class="verdict-bar ' + (ok ? 'pass' : 'fail') + '">';
+    html += ok ? '✅ Документ прошёл проверку' : '❌ Обнаружены проблемы';
+    if (!ok && data.issues && data.issues.length) {
+        html += '<div class="issues-list">' + data.issues.join('<br>') + '</div>';
+    }
+    html += '</div>';
+    box.innerHTML = html;
+    box.classList.add('visible');
+}
+
+/* ===== FIX ===== */
+async function doFix() {
+    if (!_verifyFile) return;
+    const btn = document.getElementById('fixBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>';
+
+    const fd = new FormData();
+    fd.append('file', _verifyFile);
+
+    try {
+        const resp = await appFetchForm('/fix', fd);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            setStatus('verifyStatus', err.detail || 'Ошибка исправления', false);
+        } else {
+            const blob = await resp.blob();
+            const fname = _filenameFromResponse(resp, 'fixed_' + _verifyFile.name);
+            const saved = await savePdfBlob(blob, fname);
+            setStatus('verifyStatus', saved ? '✅ Файл исправлен и сохранён' : '⚠ Сохранение отменено', saved);
+        }
+    } catch (e) {
+        setStatus('verifyStatus', 'Ошибка сети: ' + e.message, false);
+    }
+    btn.disabled = false;
+    btn.innerHTML = '🔧 Исправить';
+}
+
+/* ===== JOURNAL ===== */
+let _journalPage = 1;
+const PAGE_SIZE = 50;
+
+async function loadJournal() {
+    try {
+        const [jResp, sResp] = await Promise.all([
+            appFetch('/journal?limit=' + PAGE_SIZE + '&offset=' + ((_journalPage - 1) * PAGE_SIZE)),
+            appFetch('/stats')
+        ]);
+        const jData = await jResp.json();
+        const stats = await sResp.json();
+
+        const entries = jData.entries || [];
+
+        document.getElementById('statTotal').textContent = stats.total_count || 0;
+        document.getElementById('statOk').textContent = stats.ok_count || 0;
+        const avgIncome = stats.ok_count > 0 ? Math.round(stats.total_income / stats.ok_count) : 0;
+        document.getElementById('statAvg').textContent = avgIncome
+            ? avgIncome.toLocaleString('ru-RU') + ' ₸' : '—';
+
+        const tbody = document.getElementById('journalBody');
+        if (!entries.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="journal-empty">Записей пока нет</td></tr>';
+        } else {
+            tbody.innerHTML = entries.map((e, i) => {
+                const num = (_journalPage - 1) * PAGE_SIZE + i + 1;
+                const statusClass = e.status === 'ok' ? 'ok' : 'err';
+                const date = e.ts ? new Date(e.ts).toLocaleString('ru-RU', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' }) : '—';
+                const amount = e.desired_income ? Number(e.desired_income).toLocaleString('ru-RU') + ' ₸' : '—';
+                const client = e.client_name || e.filename || '—';
+                return '<tr>'
+                    + '<td class="td-num">' + num + '</td>'
+                    + '<td class="td-file" title="' + (e.filename || '') + '">' + client + '</td>'
+                    + '<td class="td-amount">' + amount + '</td>'
+                    + '<td><span class="status-dot ' + statusClass + '"></span></td>'
+                    + '<td>' + date + '</td>'
+                    + '</tr>';
+            }).join('');
+        }
+        document.getElementById('journalCount').textContent = 'Стр. ' + _journalPage;
+        document.getElementById('prevPage').disabled = _journalPage <= 1;
+        document.getElementById('nextPage').disabled = entries.length < PAGE_SIZE;
+    } catch(e) {}
+}
+
+function changePage(delta) {
+    _journalPage = Math.max(1, _journalPage + delta);
+    loadJournal();
+}
+
+/* ===== INIT ===== */
+loadJournal();
+</script>
+</body>
+</html>
