@@ -27,6 +27,7 @@ from pdf_service import (
     Transaction,
     _get_month_key,
     _round_to_natural,
+    min_dayend_balance,
     parse_full_statement,
 )
 
@@ -264,14 +265,14 @@ def recalculate_statement_downscale(
             tx.new_amount = tx.amount
 
     # ── Шаг 2: Running balance ──
-    reversed_txs = list(reversed(stmt.transactions))
+    # Минимум замеряем на границах дней (min_dayend_balance): внутридневной
+    # порядок операций произволен, дип между дебетами и покрывающими их
+    # кредитами того же дня — не реальный овердрафт.
     current_rb = stmt.balance_start
-    min_rb = current_rb
-    for tx in reversed_txs:
+    for tx in reversed(stmt.transactions):
         current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
         tx.new_balance_after = current_rb
-        if current_rb < min_rb:
-            min_rb = current_rb
+    min_rb, _ = min_dayend_balance(stmt.transactions, stmt.balance_start, "new_amount")
 
     # ── ПРОВЕРКА 3: min_rb ≥ 0 (post-check) ──
     # Из-за epsilon-разброса возможен небольшой выход в минус. Если так —
@@ -282,15 +283,17 @@ def recalculate_statement_downscale(
         for attempt in range(5):
             for tx in stmt.transactions:
                 if tx.sign == 1 and tx.is_salary and not tx.is_refund:
-                    tx.new_amount = round(tx.new_amount * 1.02, 2)
-            reversed_txs2 = list(reversed(stmt.transactions))
+                    # _round_to_natural, не round(x, 2) — реальные Kaspi Gold
+                    # salary всегда целые тенге в «человеческом» шаге; голый
+                    # round(x, 2) после нескольких итераций ×1.02 оставляет
+                    # произвольные копейки (тот же класс проблемы, что и в
+                    # recalculate_statement's Шаг 3 — см. её комментарий).
+                    tx.new_amount = _round_to_natural(tx.new_amount * 1.02)
             current_rb = stmt.balance_start
-            min_rb = current_rb
-            for tx in reversed_txs2:
+            for tx in reversed(stmt.transactions):
                 current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
                 tx.new_balance_after = current_rb
-                if current_rb < min_rb:
-                    min_rb = current_rb
+            min_rb, _ = min_dayend_balance(stmt.transactions, stmt.balance_start, "new_amount")
             if min_rb >= 0:
                 print(f"  ✅ Скорректировано за {attempt + 1} итераций, "
                       f"min_rb={min_rb:,.2f}")
@@ -325,13 +328,14 @@ def recalculate_statement_downscale(
     )
     stmt.new_total_income = round(salary_income_pos - refund_topups_neg, 2)
 
-    # Расходы — оригинальные (не пересчитываем)
-    original_total_expense = (
-        sum(stmt.expense_categories.values())
-        if stmt.expense_categories else stmt.total_expense
-    )
-    stmt.total_expense = original_total_expense
-
+    # Расходы: оставляем ОРИГИНАЛЬНЫЕ из header PDF (вычислены по уравнению
+    # баланса при парсинге) — как и upscale-движок (pdf_service.py,
+    # recalculate_statement). НЕ пересчитываем через expense_categories: там
+    # дублируются строки типа «Переводы» и «Переводы на свои счета»
+    # (одинаковый ключ → перезапись), из-за чего сумма категорий может не
+    # совпадать с уже корректным stmt.total_expense — это ломало тождество
+    # баланса на уровне транзакций (воспроизведено на реальном файле:
+    # Δ = -2 539 262.48 ₸ после исправления recalc_fn выше).
     stmt.new_balance_end = round(
         stmt.balance_start + stmt.new_total_income - stmt.total_expense, 2
     )
@@ -399,9 +403,17 @@ def process_downscale(
     raise IncomeTooLowError СРАЗУ (до тяжёлой работы с PDF).
     """
     # Предварительная проверка — чтобы не делать тяжёлую работу впустую.
+    #
+    # cert-формат (см. pdf_service.detect_statement_format): реальная выписка
+    # начинается со стр. 1, стр. 0 — справка "Об остатке". Без этого сдвига
+    # parse_full_statement ищет шапку периода/сумм на неверной странице — тот
+    # же паттерн, что уже учтён в /process, process_pdf_bytes_raw и
+    # main.py:_verify_pdf.
     pre_doc = fitz.open(stream=input_bytes, filetype="pdf")
     try:
-        pre_stmt = parse_full_statement(pre_doc)
+        _pre_fmt = pdf_service.detect_statement_format(pre_doc)
+        _pre_start_page = 1 if _pre_fmt == "cert" else 0
+        pre_stmt = parse_full_statement(pre_doc, start_page=_pre_start_page)
     finally:
         pre_doc.close()
 

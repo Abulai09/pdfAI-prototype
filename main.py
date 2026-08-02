@@ -1,22 +1,43 @@
 import io
 import os
 import re
+import sys
 import zlib
 import sqlite3
 import traceback
+
+# На Windows кодировка консоли по умолчанию (cp1251/cp866) не покрывает тенге
+# (₸, U+20B8) и казахские буквы (Қ/Ғ/Қ/І и т.п.), которыми пестрят print()-логи
+# в halyk_pdf_service.py/kaspi_ip_pdf_service.py/pdf_service.py — при "python
+# main.py" (в отличие от desktop_app.py, который сам подменяет sys.stdout на
+# UTF-8-файл ДО импорта main) любой такой print() внутри recalculate_halyk и
+# т.п. падает с необработанным UnicodeEncodeError прямо во время обработки
+# запроса /process, роняя его 500-й ошибкой. Принудительно переводим stdout/
+# stderr в UTF-8 здесь же, до первого print() где-либо в приложении.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, Form, Query
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pdf_service import (
-    process_pdf_bytes, process_pdf_bytes_raw,
+    # process_pdf_bytes НЕ импортируем: устаревший писатель через update_stream,
+    # не поддерживает cert-формат (см. его докстринг). Единственный рабочий —
+    # process_pdf_bytes_raw.
+    process_pdf_bytes_raw,
     parse_full_statement, build_dynamic_cmap, _rebuild_xref_table,
     detect_statement_format, parse_certificate_page,
+    min_dayend_balance, HeaderCellOverflowError,
 )
 from pdf_service_downscale import (
     process_downscale, is_downscale_request, IncomeTooLowError,
 )
 from business_pdf_service import process_business_pdf, verify_business_pdf, is_business_pdf
+from halyk_pdf_service import (
+    detect_halyk_format, process_halyk_pdf, validate_halyk, NoScalableIncomeError,
+)
+from kaspi_ip_pdf_service import detect_kaspi_ip_format, process_kaspi_ip_pdf, validate_kaspi_ip
 import fitz
 
 app = FastAPI(title="PDF.AI")
@@ -168,29 +189,44 @@ async def process_endpoint(
         client_name = _extract_client_name(content)
         print(f"[Process] Клиент: {client_name or '(не определён)'}")
 
-        # ── Диспетчер upscale / downscale ──
-        # Если запрошенный target ниже текущего ср. зарплатного дохода —
-        # это занижение: используем отдельный модуль с floor-проверками.
-        # Иначе — рабочий путь завышения (process_pdf_bytes_raw) без изменений.
+        # ── Детектор формата (Halyk / Kaspi IP / Kaspi Gold) ──────────────
+        _pre_doc = fitz.open(stream=content, filetype="pdf")
         try:
-            pre_doc = fitz.open(stream=content, filetype="pdf")
-            try:
-                _fmt = detect_statement_format(pre_doc)
-                _start = 1 if _fmt == "cert" else 0
-                pre_stmt = parse_full_statement(pre_doc, start_page=_start)
-            finally:
-                pre_doc.close()
-            use_downscale = is_downscale_request(pre_stmt, target_monthly_income)
-        except Exception:
-            # Если предварительный парсинг упал — отдаём в upscale (старое поведение)
-            use_downscale = False
+            _is_halyk = detect_halyk_format(_pre_doc)
+            _is_kaspi_ip = (not _is_halyk) and detect_kaspi_ip_format(_pre_doc)
+        finally:
+            _pre_doc.close()
 
-        if use_downscale:
-            print(f"[Process] Режим: ЗАНИЖЕНИЕ (downscale)")
-            new_pdf_bytes = process_downscale(content, target_monthly_income)
+        if _is_halyk:
+            print(f"[Process] Формат: Halyk Bank выписка")
+            new_pdf_bytes = process_halyk_pdf(content, target_monthly_income)
+        elif _is_kaspi_ip:
+            print(f"[Process] Формат: Kaspi ИП выписка")
+            new_pdf_bytes = process_kaspi_ip_pdf(content, target_monthly_income)
         else:
-            print(f"[Process] Режим: ЗАВЫШЕНИЕ (upscale)")
-            new_pdf_bytes = process_pdf_bytes_raw(content, target_monthly_income)
+            # ── Диспетчер upscale / downscale (Kaspi Gold) ──
+            # Если запрошенный target ниже текущего ср. зарплатного дохода —
+            # это занижение: используем отдельный модуль с floor-проверками.
+            # Иначе — рабочий путь завышения (process_pdf_bytes_raw) без изменений.
+            try:
+                pre_doc = fitz.open(stream=content, filetype="pdf")
+                try:
+                    _fmt = detect_statement_format(pre_doc)
+                    _start = 1 if _fmt == "cert" else 0
+                    pre_stmt = parse_full_statement(pre_doc, start_page=_start)
+                finally:
+                    pre_doc.close()
+                use_downscale = is_downscale_request(pre_stmt, target_monthly_income)
+            except Exception:
+                # Если предварительный парсинг упал — отдаём в upscale (старое поведение)
+                use_downscale = False
+
+            if use_downscale:
+                print(f"[Process] Режим: ЗАНИЖЕНИЕ (downscale)")
+                new_pdf_bytes = process_downscale(content, target_monthly_income)
+            else:
+                print(f"[Process] Режим: ЗАВЫШЕНИЕ (upscale)")
+                new_pdf_bytes = process_pdf_bytes_raw(content, target_monthly_income)
 
         # Записываем в журнал
         _journal_add(file.filename, desired_income, target_monthly_income, client_name, "ok")
@@ -212,6 +248,16 @@ async def process_endpoint(
                 "Content-Disposition": cd
             },
         )
+    except NoScalableIncomeError as e:
+        # Ни одна строка дохода не распознана: раньше сюда не попадали вовсе —
+        # выписка возвращалась без изменений и выглядела как успешная обработка.
+        traceback.print_exc()
+        _journal_add(
+            file.filename, desired_income, target_monthly_income,
+            client_name if 'client_name' in locals() else "",
+            "no_scalable_income",
+        )
+        return JSONResponse(status_code=400, content=e.to_dict())
     except IncomeTooLowError as e:
         # Жёсткий floor: запрошенный доход ниже математически возможного
         traceback.print_exc()
@@ -219,6 +265,15 @@ async def process_endpoint(
             file.filename, desired_income, target_monthly_income,
             client_name if 'client_name' in locals() else "",
             f"income_too_low: {e.reason}",
+        )
+        return JSONResponse(status_code=400, content=e.to_dict())
+    except HeaderCellOverflowError as e:
+        # Жёсткий потолок: итоговая сумма не влезает в ячейку шапки справки
+        traceback.print_exc()
+        _journal_add(
+            file.filename, desired_income, target_monthly_income,
+            client_name if 'client_name' in locals() else "",
+            f"header_cell_overflow: {e.field_name}",
         )
         return JSONResponse(status_code=400, content=e.to_dict())
     except Exception as e:
@@ -290,13 +345,71 @@ async def stats_endpoint():
 #  Не трогает основной код. Читает PDF, проверяет математику + бинарку.
 # ─────────────────────────────────────────────────────────────────
 
+def _check_cert_balance(cert_balance_kzt: float, stmt_balance_end: float) -> dict:
+    """Сверяет остаток на титульной справке (стр. 0) с фактическим balance_end
+    выписки. В оригинале это равенство держится всегда (справка выдаётся на
+    ту же дату, что и конец периода выписки) — если после обработки они
+    разошлись, значит справка не была синхронизирована с новым балансом."""
+    delta = round(stmt_balance_end - cert_balance_kzt, 2)
+    ok = abs(delta) < 0.02
+    return {
+        "name": "Справка = баланс выписки",
+        "ok": ok,
+        "detail": f"Справка: {cert_balance_kzt:,.2f} ₸ | B_end выписки: {stmt_balance_end:,.2f} ₸ | Δ = {delta:+,.2f}",
+    }
+
+
+def _check_stream_integrity(raw: bytes) -> int:
+    """Считает битые zlib-стримы, слайсуя строго по /Length, а не по эвристике
+    "endswith \\r\\n / \\n" — та ошибочно бьёт корректные стримы, чьи
+    сжатые байты сами заканчиваются на 0x0D (см. process_kaspi_ip_pdf /
+    validate_kaspi_ip, где тот же баг уже был исправлен тем же способом)."""
+    stream_errors = 0
+    for obj_m in re.finditer(rb"(\d+)\s+0\s+obj", raw):
+        stream_start = raw.find(b"stream", obj_m.end(), obj_m.end() + 500)
+        if stream_start < 0:
+            continue
+        length_m = re.search(rb"/Length\s+(\d+)", raw[obj_m.end():stream_start])
+        if not length_m:
+            continue
+        ds = stream_start + 6
+        if raw[ds:ds+1] == b'\r':
+            ds += 2
+        else:
+            ds += 1
+        sd = raw[ds:ds + int(length_m.group(1))]
+        try:
+            zlib.decompress(sd)
+        except Exception:
+            stream_errors += 1
+    return stream_errors
+
+
 def _verify_pdf(pdf_bytes: bytes) -> dict:
     """Проверяет scored PDF: математика + бинарная структура."""
     checks = []
     issues = []
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    stmt = parse_full_statement(doc)
+    # cert-формат (стр. 0 — «Справка об остатке», см. detect_statement_format):
+    # шапка «Пополнения»/категории расходов физически на стр. 1, а не стр. 0.
+    # Без этого сдвига поиск шапки (`if line['page'] > start_page: break` в
+    # parse_full_statement) её не находит и total_income/total_expense тихо
+    # уходят в fallback на сумму транзакций — тот же паттерн, что уже учтён в
+    # /process (main.py, дисп. upscale/downscale) и в process_pdf_bytes_raw.
+    _verify_fmt = detect_statement_format(doc)
+    _verify_start = 1 if _verify_fmt == "cert" else 0
+    stmt = parse_full_statement(doc, start_page=_verify_start)
+
+    # ── 0. Справка (стр. 0) должна отражать тот же остаток, что и выписка ──
+    # Раньше эта страница не проверялась вовсе (парсинг начинался со стр. 1),
+    # поэтому /verify мог вернуть "passed: True" даже если титульная справка
+    # показывала совершенно другой (не обновлённый) остаток, чем сама выписка.
+    if _verify_fmt == "cert":
+        _cert = parse_certificate_page(doc)
+        checks.append(_check_cert_balance(_cert.balance_kzt, stmt.balance_end))
+        if not checks[-1]["ok"]:
+            issues.append(f"Справка не совпадает с выпиской: {checks[-1]['detail']}")
 
     # ── 1. Главная формула баланса через транзакции ──
     sum_plus = sum(t.amount for t in stmt.transactions if t.sign == 1)
@@ -321,13 +434,13 @@ def _verify_pdf(pdf_bytes: bytes) -> dict:
         issues.append(f"Header формула: Δ = {delta_hdr:+,.2f} ₸")
 
     # ── 3. Running balance цепочка ──
-    reversed_txs = list(reversed(stmt.transactions))
-    rb = stmt.balance_start
-    rb_negative = 0
-    for tx in reversed_txs:
-        rb = round(rb + tx.sign * tx.amount, 2)
-        if rb < 0:
-            rb_negative += 1
+    # Финальный RB не зависит от порядка (сумма коммутативна), а вот проверку
+    # неотрицательности делаем на границах дней: у Kaspi нет внутридневных
+    # меток времени, поэтому порядок операций ОДНОЙ даты произволен, и дип
+    # между дебетами и покрывающими их кредитами того же дня — не реальный
+    # овердрафт. Ловилось как ложный минус в −54 ₸ на немодифицированном
+    # реальном файле (см. min_dayend_balance).
+    min_rb, rb = min_dayend_balance(stmt.transactions, stmt.balance_start)
     delta_rb = round(rb - stmt.balance_end, 2)
 
     ok3 = abs(delta_rb) < 0.02
@@ -336,11 +449,11 @@ def _verify_pdf(pdf_bytes: bytes) -> dict:
     if not ok3:
         issues.append(f"Running balance: Δ = {delta_rb:+,.2f} ₸")
 
-    ok4 = rb_negative == 0
+    ok4 = min_rb >= -0.01
     checks.append({"name": "Баланс ≥ 0", "ok": ok4,
-                    "detail": f"Отрицательных точек: {rb_negative}"})
+                    "detail": f"Мин. баланс на границах дней: {min_rb:,.2f} ₸"})
     if not ok4:
-        issues.append(f"Баланс уходит в минус в {rb_negative} точках")
+        issues.append(f"Баланс уходит в минус (мин. на границе дня: {min_rb:,.2f} ₸)")
 
     # ── 4. ISI ──
     monthly_inc = {}
@@ -390,28 +503,7 @@ def _verify_pdf(pdf_bytes: bytes) -> dict:
         issues.append("xref offsets битые")
 
     # Стримы
-    stream_errors = 0
-    for obj_m in re.finditer(rb"(\d+)\s+0\s+obj", raw):
-        stream_start = raw.find(b"stream", obj_m.end(), obj_m.end() + 500)
-        if stream_start < 0:
-            continue
-        ds = stream_start + 6
-        if raw[ds:ds+1] == b'\r':
-            ds += 2
-        else:
-            ds += 1
-        es = raw.find(b"endstream", ds)
-        if es < 0:
-            continue
-        sd = raw[ds:es]
-        if sd.endswith(b'\r\n'):
-            sd = sd[:-2]
-        elif sd.endswith(b'\n'):
-            sd = sd[:-1]
-        try:
-            zlib.decompress(sd)
-        except:
-            stream_errors += 1
+    stream_errors = _check_stream_integrity(raw)
 
     ok6 = stream_errors == 0
     checks.append({"name": "Целостность стримов", "ok": ok6,
@@ -420,6 +512,9 @@ def _verify_pdf(pdf_bytes: bytes) -> dict:
         issues.append(f"{stream_errors} стримов не декомпрессируются")
 
     doc.close()
+
+    avg_monthly = sum(vals) / len(vals) if vals else 0.0
+    suggested_min = round(avg_monthly * 0.30 * INCOME_K, 2)
 
     passed = len(issues) == 0
     return {
@@ -434,6 +529,8 @@ def _verify_pdf(pdf_bytes: bytes) -> dict:
             "transactions": len(stmt.transactions),
             "months": len(monthly_inc),
             "isi": round(isi, 4),
+            "avg_monthly_income": round(avg_monthly, 2),
+            "suggested_min": suggested_min,
         },
     }
 
@@ -454,7 +551,18 @@ async def verify_endpoint(file: UploadFile = File(...)):
         if is_business_pdf(content):
             result = verify_business_pdf(content)
         else:
-            result = _verify_pdf(content)
+            _vdoc = fitz.open(stream=content, filetype="pdf")
+            try:
+                _is_halyk_v = detect_halyk_format(_vdoc)
+                _is_ip_v = (not _is_halyk_v) and detect_kaspi_ip_format(_vdoc)
+            finally:
+                _vdoc.close()
+            if _is_halyk_v:
+                result = validate_halyk(content)
+            elif _is_ip_v:
+                result = validate_kaspi_ip(content)
+            else:
+                result = _verify_pdf(content)
         return JSONResponse(content=result)
     except Exception as e:
         traceback.print_exc()
@@ -471,7 +579,10 @@ def _fix_pdf(pdf_bytes: bytes) -> bytes:
     """Хирургически правит balance_end и total_income чтобы формулы сходились."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     TO_UNICODE, FROM_UNICODE = build_dynamic_cmap(doc)
-    stmt = parse_full_statement(doc)
+    # См. комментарий в _verify_pdf выше — cert-формат держит шапку на стр. 1.
+    _fix_fmt = detect_statement_format(doc)
+    _fix_start = 1 if _fix_fmt == "cert" else 0
+    stmt = parse_full_statement(doc, start_page=_fix_start)
 
     def hex_to_text(hex_str):
         return "".join(TO_UNICODE.get(hex_str[i:i+4], "?") for i in range(0, len(hex_str), 4))

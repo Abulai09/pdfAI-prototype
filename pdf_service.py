@@ -3,7 +3,14 @@ import re
 import random
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Deque, Optional, Tuple
+
+
+# Метрики ArialMT (единственный шрифт сумм в выписке Kaspi Gold), в долях em.
+# Нужны, чтобы при изменении числа сдвинуть Td.x ровно на прирост ширины строки
+# и сохранить право-выравнивание колонки «Сумма».
+_ARIAL_DIGIT_EM = 0.556   # ширина цифры; пробел/запятая ровно вдвое уже (0.278)
+_FALLBACK_FONT_SIZE = 9.5  # кегль тела выписки — если /Tf не удалось прочитать
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +87,49 @@ class CertificateData:
     new_balance_eur: float = 0.0
 
 
+class HeaderCellOverflowError(Exception):
+    """
+    Итоговая сумма (доход/баланс) переросла разрядную вместимость своей ячейки
+    в шапке стр.1 (cert-формат Kaspi Gold).
+
+    Ячейка «Сумма» в этой шапке имеет фиксированные координаты x=207.7..306.3
+    (правый край — якорь право-выравнивания у x≈300.76). При 10 разрядах
+    право-выровненная строка начинается на ~2.3 pt левее левой границы ячейки
+    — сама строка помещается по ширине, но не на своей анкерной позиции
+    (см. find_frame_overflows() в tests/scripts/verify_gold_file.py и разбор
+    в CLAUDE.md, раздел «Known remaining limit»). Клэмпить позицию нельзя —
+    это либо ломает право-выравнивание колонки для этой строки
+    (check_column_alignment), либо требует перерисовки рамки ячейки. Поэтому
+    вместо тихой записи визуально сломанного PDF — явный отказ ДО записи,
+    тем же архитектурным принципом, что и IncomeTooLowError.
+    """
+
+    def __init__(self, field_name: str, value: float, max_safe_value: float):
+        self.field_name = field_name
+        self.value = round(value, 2)
+        self.max_safe_value = max_safe_value
+        self.message = (
+            f"Итоговая сумма «{field_name}» = {value:,.0f} ₸ не помещается "
+            f"в ячейку шапки справки (максимум 9 разрядов, т.е. до "
+            f"{max_safe_value:,.0f} ₸). Выберите менее агрессивную цель."
+        )
+        super().__init__(self.message)
+
+    def to_dict(self) -> dict:
+        return {
+            "error": self.message,
+            "reason": "header_cell_overflow",
+            "field": self.field_name,
+            "value": self.value,
+            "max_safe_value": self.max_safe_value,
+        }
+
+
+# Ячейка «Сумма» шапки стр.1 (cert-формат) вмещает право-выровненную строку
+# только до 9 разрядов целой части — см. HeaderCellOverflowError.
+_HEADER_CELL_MAX_SAFE_VALUE = 999_999_999.0
+
+
 @dataclass
 class ScoringReport:
     """Результат самопроверки."""
@@ -113,77 +163,110 @@ class ScoringReport:
 
 
 def _find_primary_font_tounicode_xref(doc) -> int | None:
-    """Определяет xref потока ToUnicode для основного шрифта (ArialMT, не Bold).
+    """Определяет xref потока ToUnicode для основного (не жирного) шрифта.
 
-    Числа в PDF Kaspi выписке записаны шрифтом F1 (ArialMT).
-    Шрифт F2 (Arial-BoldMT) используется для заголовков и имеет
-    собственную ToUnicode CMap с ДРУГИМИ CID-кодами для тех же символов.
-    Смешение этих CMap приводит к тому, что from_unicode возвращает
-    CID-код от Bold-шрифта, для которого в ArialMT нет глифа → белые
-    квадраты или подмена символов.
+    Числа в PDF Kaspi записаны шрифтом F1 (ArialMT).
+    В PDF Halyk — шрифтом F0 (Times New Roman, не Bold).
+    Bold-шрифты имеют собственные CMap с ДРУГИМИ CID для тех же символов:
+    смешение даёт неправильные CID при записи → испорченные числа.
 
-    Возвращает xref потока ToUnicode для ArialMT, или None если не найден.
+    Стратегия: сначала ищем ArialMT без Bold (Kaspi), затем — любой
+    не-Bold/не-Italic шрифт с ToUnicode (Halyk и другие форматы).
     """
+    def _is_bold_or_italic(name: str) -> bool:
+        n = name.lower()
+        return "bold" in n or "italic" in n or ",b" in n
+
+    # Первый проход: ArialMT без Bold (приоритет для Kaspi PDF)
     for page_num in range(min(1, len(doc))):
-        page = doc[page_num]
-        for font_info in page.get_fonts(full=True):
-            font_xref = font_info[0]
-            font_name = font_info[3]   # e.g. "AAVMDF+ArialMT"
-            # Основной шрифт: ArialMT без Bold
-            if "ArialMT" in font_name and "Bold" not in font_name:
+        for font_info in doc[page_num].get_fonts(full=True):
+            font_xref, _, _, font_name = font_info[:4]
+            if "ArialMT" in font_name and not _is_bold_or_italic(font_name):
                 try:
-                    font_obj = doc.xref_object(font_xref)
-                    tu_match = re.search(
-                        r"/ToUnicode\s+(\d+)\s+0\s+R", font_obj
-                    )
-                    if tu_match:
-                        return int(tu_match.group(1))
+                    obj = doc.xref_object(font_xref)
+                    m = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", obj)
+                    if m:
+                        return int(m.group(1))
+                except Exception:
+                    pass
+
+    # Второй проход: любой не-Bold/не-Italic шрифт (Halyk и др.)
+    for page_num in range(min(1, len(doc))):
+        for font_info in doc[page_num].get_fonts(full=True):
+            font_xref, _, _, font_name = font_info[:4]
+            if not _is_bold_or_italic(font_name):
+                try:
+                    obj = doc.xref_object(font_xref)
+                    m = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", obj)
+                    if m:
+                        return int(m.group(1))
                 except Exception:
                     pass
     return None
 
 
 def _parse_cmap_stream(stream_data: str) -> dict:
-    """Парсит ToUnicode CMap поток и возвращает словарь code→char."""
+    """Парсит ToUnicode CMap поток (bfrange и bfchar) → словарь CID→char.
+
+    Парсинг секционированный: регекс применяется только внутри блоков
+    beginbfrange/endbfrange и beginbfchar/endbfchar, чтобы избежать
+    ложных совпадений на границах строк между блоками.
+    """
     to_unicode = {}
 
-    # bfchar: <CODE> <UNICODE> (4-значные)
-    chars = re.findall(r"<([0-9a-fA-F]{4})>\s*<([0-9a-fA-F]{4})>", stream_data)
-    for code, char_hex in chars:
-        try:
-            to_unicode[code.upper()] = chr(int(char_hex, 16))
-        except Exception:
-            pass
+    # ── bfrange секции ──────────────────────────────────────────────────────
+    # Формат: <START><END><FIRST_UNICODE>  (без пробелов — компактный)
+    # или:    <START> <END> <FIRST_UNICODE> (с пробелами — стандартный)
+    for section in re.findall(
+        r"beginbfrange\s*(.*?)\s*endbfrange", stream_data, re.DOTALL
+    ):
+        # 4-значные CID
+        for start, end, base in re.findall(
+            r"<([0-9a-fA-F]{4})>\s*<([0-9a-fA-F]{4})>\s*<([0-9a-fA-F]{4})>",
+            section,
+        ):
+            s, e, b = int(start, 16), int(end, 16), int(base, 16)
+            for i in range(s, e + 1):
+                to_unicode[f"{i:04X}"] = chr(b + (i - s))
+        # 2-значные CID
+        for start, end, base in re.findall(
+            r"<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]{4})>",
+            section,
+        ):
+            s, e, b = int(start, 16), int(end, 16), int(base, 16)
+            for i in range(s, e + 1):
+                to_unicode[f"{i:02X}"] = chr(b + (i - s))
 
-    # bfchar: 2-значные коды
-    chars_short = re.findall(
-        r"<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]{4})>", stream_data
-    )
-    for code, char_hex in chars_short:
-        try:
-            to_unicode[code.upper()] = chr(int(char_hex, 16))
-        except Exception:
-            pass
+    # ── bfchar секции ────────────────────────────────────────────────────────
+    for section in re.findall(
+        r"beginbfchar\s*(.*?)\s*endbfchar", stream_data, re.DOTALL
+    ):
+        # 4-значные CID
+        for code, char_hex in re.findall(
+            r"<([0-9a-fA-F]{4})>\s*<([0-9a-fA-F]{4})>", section
+        ):
+            try:
+                to_unicode[code.upper()] = chr(int(char_hex, 16))
+            except Exception:
+                pass
+        # 2-значные CID
+        for code, char_hex in re.findall(
+            r"<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]{4})>", section
+        ):
+            try:
+                to_unicode[code.upper()] = chr(int(char_hex, 16))
+            except Exception:
+                pass
 
-    # bfrange: <START> <END> <BASE_UNICODE> (4-значные)
-    ranges = re.findall(
-        r"<([0-9a-fA-F]{4})>\s*<([0-9a-fA-F]{4})>\s*<([0-9a-fA-F]{4})>",
-        stream_data,
-    )
-    for start, end, base in ranges:
-        s, e, b = int(start, 16), int(end, 16), int(base, 16)
-        for i in range(s, e + 1):
-            to_unicode[f"{i:04X}"] = chr(b + (i - s))
-
-    # bfrange: 2-значные
-    ranges_short = re.findall(
-        r"<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]{4})>",
-        stream_data,
-    )
-    for start, end, base in ranges_short:
-        s, e, b = int(start, 16), int(end, 16), int(base, 16)
-        for i in range(s, e + 1):
-            to_unicode[f"{i:02X}"] = chr(b + (i - s))
+    # ── Fallback: нет секционных маркеров (старый формат) ────────────────────
+    if not to_unicode:
+        for code, char_hex in re.findall(
+            r"<([0-9a-fA-F]{4})>\s*<([0-9a-fA-F]{4})>", stream_data
+        ):
+            try:
+                to_unicode[code.upper()] = chr(int(char_hex, 16))
+            except Exception:
+                pass
 
     return to_unicode
 
@@ -233,6 +316,21 @@ def build_dynamic_cmap(doc):
                     if code not in to_unicode:
                         to_unicode[code] = ch
                         extra_added += 1
+
+            # Добор цифр в ОБРАТНУЮ карту. from_unicode построена по основному
+            # шрифту (строка выше) ДО добора to_unicode из доп. шрифтов —
+            # поэтому цифра, чей код объявлен только в доп. ToUnicode-стриме,
+            # в обратную карту не попадает. На реальном файле так пропала '8'
+            # (код 001B пришёл из доп. шрифта): при записи суммы справки с
+            # восьмёркой paren_encode/text_to_hex не находили её код и падали
+            # (ValueError) либо тихо писали пустой глиф. Цифра — один и тот же
+            # глиф во всех шрифтах Kaspi (ArialMT-подсемейство), поэтому код из
+            # общего to_unicode для неё корректен. Заполняем ТОЛЬКО отсутствующие
+            # (не перезаписываем выбор основного шрифта — конфликтов F1/F2 нет).
+            _digit_to_code = {ch: code for code, ch in to_unicode.items() if ch in "0123456789"}
+            for _d in "0123456789":
+                if _d not in from_unicode and _d in _digit_to_code:
+                    from_unicode[_d] = _digit_to_code[_d]
 
             print(
                 f"[CMap] Построена карта символов: {len(to_unicode)} записей "
@@ -379,7 +477,8 @@ def _collect_amount_on_line(words_on_line: list, x_min: float = 120.0) -> Tuple[
         
         # Если это слово операции — стоп
         if txt in ('Пополнение', 'Покупка', 'Перевод', 'Снятие', 'Оплата',
-                    'Платёж', 'Платеж', 'Комиссия', 'Разное', 'Возврат'):
+                    'Платёж', 'Платеж', 'Комиссия', 'Разное', 'Возврат',
+                    'Поступление', 'Зачисление'):
             break
         
         # Если цифра/запятая — часть суммы
@@ -501,25 +600,42 @@ def parse_certificate_page(doc) -> CertificateData:
         for yk, text, ws in lines:
             if yk <= header_y or yk > header_y + 30:
                 continue
-            if "₸" not in text or ("$" not in text and "USD" not in text):
-                # Допускаем что "$" не декодируется (paren-формат) — тогда
-                # просто проверяем ₸ и наличие цифр в USD-колонке (x 200..360)
-                has_usd_digits = any(
-                    200 < x < 360 and any(c.isdigit() for c in t)
-                    for x, t in ws
+
+            # Разбиваем по колонкам по X-координате: раньше — фиксированные
+            # пороги (x<200 / x<360), откалиброванные под короткие суммы
+            # оригинала. После апскейла writer сдвигает выросшее число ВЛЕВО,
+            # чтобы сохранить его правый край на месте (см. x_shift в
+            # cert_paren_callback/replace_callback) — на крупной справке
+            # (реальный файл: KZT выросло с 6 до 9 цифр) сдвиг утаскивает
+            # "$"/"€" ЗА фиксированный порог в соседнюю колонку, которая
+            # портит parse_amount() чужим нечисловым токеном (напр.
+            # "55 620 756,05 $" → ValueError → тихо 0.00). Вместо порогов —
+            # кластеризация по 2 наибольшим разрывам между соседними словами
+            # в этой строке: колонки всегда разделены пробелом много шире,
+            # чем между словами внутри одной суммы, независимо от того,
+            # куда сдвинулось число. Та же кластеризация (а не фиксированное
+            # окно 200..360) используется и для подтверждения, что это
+            # действительно строка значений — на случай если "$" не
+            # декодируется (paren-формат): тогда просто проверяем, что средний
+            # кластер вообще содержит цифры.
+            ws_sorted = sorted(ws, key=lambda p: p[0])
+            if len(ws_sorted) >= 3:
+                gap_idxs = sorted(
+                    range(len(ws_sorted) - 1),
+                    key=lambda i: ws_sorted[i + 1][0] - ws_sorted[i][0],
+                    reverse=True,
                 )
+                i1, i2 = sorted(gap_idxs[:2])
+                kzt_parts = ws_sorted[:i1 + 1]
+                usd_parts = ws_sorted[i1 + 1:i2 + 1]
+                eur_parts = ws_sorted[i2 + 1:]
+            else:
+                kzt_parts, usd_parts, eur_parts = ws_sorted, [], []
+
+            if "₸" not in text or ("$" not in text and "USD" not in text):
+                has_usd_digits = any(any(c.isdigit() for c in t) for _, t in usd_parts)
                 if not has_usd_digits:
                     continue
-
-            # Разбиваем по колонкам по X-координате
-            kzt_parts, usd_parts, eur_parts = [], [], []
-            for x, t in ws:
-                if x < 200:
-                    kzt_parts.append((x, t))
-                elif x < 360:
-                    usd_parts.append((x, t))
-                else:
-                    eur_parts.append((x, t))
 
             def _join_amount(parts: list, currency_marker: str) -> Tuple[str, float]:
                 """Собирает сумму, отделяя префикс валюты."""
@@ -608,13 +724,22 @@ def parse_full_statement(doc, start_page: int = 0) -> StatementData:
             continue
         
         date_str = None
+        date_word = None
         for w in line['words']:
             if date_pattern.search(w['text']):
                 date_str = w['text'].replace(':', '').strip()
+                date_word = w
                 break
-        
+
         if date_str:
-            amount_text, sign, val = _collect_amount_on_line(line['words'], x_min=200.0)
+            # x_min раньше был захардкожен константой 200.0 — тот же класс
+            # бага, что уже исправлен ниже для строк транзакций (см. докстринг
+            # у date_word['x1'] + 5.0 в цикле по all_lines): при очень большом
+            # балансе фиксированный порог может отрезать ведущую цифру. Дата
+            # в этой строке всегда предшествует сумме — считаем x_min от её
+            # правого края, а не от константы.
+            _x_min = (date_word['x1'] + 5.0) if date_word else 200.0
+            amount_text, sign, val = _collect_amount_on_line(line['words'], x_min=_x_min)
             if val > 0:
                 available_candidates.append((date_str, amount_text, val, line['page']))
 
@@ -657,16 +782,22 @@ def parse_full_statement(doc, start_page: int = 0) -> StatementData:
             continue
         
         first_word = words[0]['text']
-        
+        # Тот же класс бага, что и у "Доступно"/строк транзакций: фиксированный
+        # x_min=200.0 калиброван под типичную сумму и может отрезать ведущую
+        # цифру у очень большого итога. Метка ("Пополнения"/"Переводы"/...) —
+        # ровно первое слово строки, её правый край — надёжный якорь для
+        # начала суммы при любой её ширине.
+        _x_min = words[0]['x1'] + 5.0
+
         if first_word == 'Пополнения':
-            amount_text, sign, val = _collect_amount_on_line(words, x_min=200.0)
+            amount_text, sign, val = _collect_amount_on_line(words, x_min=_x_min)
             if val > 0:
                 stmt.total_income_text = amount_text or ""
                 stmt.total_income = val
                 print(f"[Parser] Итого пополнений: {stmt.total_income:,.2f} ₸")
-        
+
         if first_word in expense_labels:
-            amount_text, sign, val = _collect_amount_on_line(words, x_min=200.0)
+            amount_text, sign, val = _collect_amount_on_line(words, x_min=_x_min)
             if val > 0:
                 total_expense_parts[first_word] = val
                 stmt.expense_categories[first_word] = val
@@ -692,26 +823,69 @@ def parse_full_statement(doc, start_page: int = 0) -> StatementData:
     TX_TYPES_INCOME = {'Пополнение'}
     TX_TYPES_EXPENSE = {'Покупка', 'Перевод', 'Снятие', 'Оплата', 'Платёж',
                          'Платеж', 'Комиссия', 'Возврат', 'Разное'}
-    ALL_TX_TYPES = TX_TYPES_INCOME | TX_TYPES_EXPENSE
-    
+    # «Поступление» (со своего счета / С Kaspi Депозита) и «Зачисление» —
+    # приход денег С СОБСТВЕННОГО депозитного субсчёта клиента (self-transfer),
+    # а не внешнее пополнение. Раньше отсутствовали в ОБОИХ множествах типов
+    # → строка не проходила `if tx_type is None: continue` ниже и целиком
+    # выпадала из stmt.transactions, хотя реально двигает баланс счёта.
+    # Воспроизведено на реальной выписке (goldformat1.pdf, 62 стр.): 233 таких
+    # строки на 19 002 414,75 ₸ отсутствовали в парсинге — Σ(+)/Σ(-) и running
+    # balance не сходились с B_start/B_end уже на НЕТРОНУТОМ оригинале, и то
+    # же расхождение переносилось в обработанный (scored) PDF, ломая
+    # «Баланс (транзакции)»/Running balance проверки. Не добавлены в
+    # TX_TYPES_INCOME: как и «Возврат»/«Покупка» со знаком «+» (is_refund
+    # ниже), это не масштабируемая зарплата, а деньги, уже принадлежавшие
+    # клиенту — is_salary_income для них остаётся False по той же формуле.
+    TX_TYPES_SELF_TRANSFER = {'Поступление', 'Зачисление'}
+    ALL_TX_TYPES = TX_TYPES_INCOME | TX_TYPES_EXPENSE | TX_TYPES_SELF_TRANSFER
+
     trans_idx = 0
+    tx_line_texts: List[str] = []
     for line in all_lines:
         words = line['words']
-        
+
         tx_type = None
         for w in words:
             if w['text'] in ALL_TX_TYPES:
                 tx_type = w['text']
                 break
-        
+
         if tx_type is None:
             continue
-        
-        amount_text, sign_from_line, val = _collect_amount_on_line(words, x_min=120.0)
-        
+
+        # Обязательно должна быть дата — иначе это строка заголовка (напр. «Разное - 2 195,00 ₸»)
+        # которая совпадает по слову с типом транзакции, но НЕ является транзакцией.
+        # Ищем её ДО сбора суммы — её правая граница задаёт ДИНАМИЧЕСКУЮ левую
+        # границу колонки суммы (см. x_min ниже).
+        date_word = None
+        for w in words:
+            if w['x0'] < 100 and date_pattern.match(w['text']):
+                date_word = w
+                break
+
+        if date_word is None:
+            continue
+        date_str = date_word['text']
+
+        # x_min раньше был захардкожен константой 120.0, калиброванной под
+        # типичную 5-6-значную сумму («X≈127…140 — знак», см. докстринг
+        # _collect_amount_on_line). У 7-8-значных сумм (после сильного
+        # апскейла, напр. «+ 11 487 000,00») ведущая цифра физически рисуется
+        # ЛЕВЕЕ x=120 (замерено на реальных файлах: до x0≈104.75) — с
+        # фиксированным порогом её выкидывал `if x0 < x_min: continue` внутри
+        # _collect_amount_on_line, отрезая сумме один (и больше) разряд слева
+        # (воспроизведено на kaspi_gold_cert_scored.pdf: «1 899 000,00» читался
+        # как «899 000,00»). Дата — ровно 8 символов «ДД.ММ.ГГ», её правая
+        # граница на всех проверенных файлах стабильна (~88.76pt); считаем
+        # x_min от неё (+ запас), а не от константы, — работает при любой
+        # ширине суммы.
+        amount_text, sign_from_line, val = _collect_amount_on_line(
+            words, x_min=date_word['x1'] + 5.0
+        )
+
         if val <= 0:
             continue
-        
+
         # КРИТИЧНО: sign определяется по ЗНАКУ (+/-) в строке PDF,
         # а НЕ по типу операции. Примеры возвратов:
         #   "+ 2 316,00 ₸ Покупка ТОО Kaspi Travel"  → sign=+1 (возврат покупки)
@@ -721,18 +895,7 @@ def parse_full_statement(doc, start_page: int = 0) -> StatementData:
             sign = sign_from_line
         else:
             # Знак не найден в строке — fallback по типу операции
-            sign = 1 if tx_type in TX_TYPES_INCOME else -1
-        
-        # Обязательно должна быть дата — иначе это строка заголовка (напр. «Разное - 2 195,00 ₸»)
-        # которая совпадает по слову с типом транзакции, но НЕ является транзакцией.
-        date_str = None
-        for w in words:
-            if w['x0'] < 100 and date_pattern.match(w['text']):
-                date_str = w['text']
-                break
-        
-        if date_str is None:
-            continue
+            sign = 1 if tx_type in TX_TYPES_INCOME or tx_type in TX_TYPES_SELF_TRANSFER else -1
 
         # is_salary = True только для РЕАЛЬНЫХ пополнений (type=Пополнение И sign=+1)
         # Возвраты (type=Покупка, sign=+1) НЕ salary — не масштабируются как доход
@@ -740,6 +903,22 @@ def parse_full_statement(doc, start_page: int = 0) -> StatementData:
         is_salary_income = (tx_type in TX_TYPES_INCOME and sign == 1)
         is_refund = (tx_type not in TX_TYPES_INCOME and sign == 1)
 
+        # ПОПЫТКА (отклонена): автоматически вырезать строку с текстом,
+        # идентичным последней строке предыдущей страницы, считая это
+        # рендер-дублем на разрыве страниц (воспроизведено на
+        # "gold_statement - 2026-07-21T142737.432.pdf", страницы 6→7).
+        # ОПРОВЕРГНУТО на другом реальном файле (gold9.pdf, границы 19→20,
+        # "Обязательные Пенсионные Взносы Работодателя" 100 ₸): там точно
+        # такое же совпадение (идентичный текст ровно на границе страниц)
+        # оказалось ДВУМЯ РЕАЛЬНЫМИ отдельными транзакциями — удаление
+        # сломало баланс файла, который до этого сходился идеально (Δ=0 →
+        # Δ=-100 после вырезания). Т.е. «совпадение невозможно для двух
+        # независимых операций» — фактически неверное допущение. Нельзя
+        # надёжно отличить рендер-дубль от двух совпавших по тексту реальных
+        # платежей без дополнительных данных (напр. отдельного ID операции,
+        # которого в PDF нет). Оставлено ТОЛЬКО как диагностика (см. ⚠️ ниже,
+        # печатается после сборки stmt.transactions) — транзакции не
+        # удаляются никогда.
         ph = page_heights.get(line['page'], 841.89)
         tx = Transaction(
             index=trans_idx,
@@ -756,11 +935,40 @@ def parse_full_statement(doc, start_page: int = 0) -> StatementData:
         )
         
         stmt.transactions.append(tx)
+        tx_line_texts.append(line['text'])
         trans_idx += 1
+
+    # Диагностика для операторской видимости: две строки с ПОЛНОСТЬЮ
+    # идентичным текстом (дата+сумма+тип+контрагент) означают, что одна и та
+    # же операция напечатана в исходном PDF дважды — иногда это реальный рендер-
+    # артефакт разрыва страницы (последняя строка одной страницы повторяется
+    # первой строкой следующей — воспроизведено на реальном файле), иногда
+    # действительно два разных платежа на одну сумму в один день (напр. два
+    # снятия в банкомате). Различить по одному тексту нельзя — транзакции НЕ
+    # удаляются и баланс не трогается, только предупреждение для человека.
+    from collections import Counter as _Counter
+    _line_counts = _Counter(tx_line_texts)
+    _dup_texts = {t: c for t, c in _line_counts.items() if c > 1}
+    if _dup_texts:
+        _dup_tx_count = sum(_dup_texts.values())
+        _dup_amount = sum(
+            stmt.transactions[i].amount
+            for i, t in enumerate(tx_line_texts)
+            if t in _dup_texts
+        )
+        _samples = sorted(_dup_texts.keys())[:3]
+        print(
+            f"[Parser] ⚠️ Найдены полностью идентичные строки транзакций "
+            f"(дата+сумма+тип+контрагент совпадают дословно): {len(_dup_texts)} "
+            f"уникальных строк, {_dup_tx_count} транзакций всего, Σ={_dup_amount:,.2f} ₸. "
+            f"Не удаляются автоматически (может быть либо рендер-дубль на "
+            f"разрыве страницы, либо два реальных платежа на одну сумму). Примеры: "
+            f"{_samples}"
+        )
 
     parsed_income = sum(t.amount for t in stmt.transactions if t.sign == 1)
     parsed_expense = sum(t.amount for t in stmt.transactions if t.sign == -1)
-    
+
     print(f"\n[Parser] Найдено транзакций: {len(stmt.transactions)} "
           f"(пополнений: {sum(1 for t in stmt.transactions if t.sign == 1)}, "
           f"расходов: {sum(1 for t in stmt.transactions if t.sign == -1)})")
@@ -791,6 +999,92 @@ def _get_month_key(date_str: str) -> Optional[str]:
     if m:
         return f"20{m.group(3)}-{m.group(2)}"
     return None
+
+
+def min_dayend_balance(
+    transactions: List["Transaction"],
+    balance_start: float,
+    amount_attr: str = "amount",
+) -> Tuple[float, float]:
+    """Минимальный running balance, замеряемый ТОЛЬКО на границах дней.
+
+    Возвращает (min_dayend_rb, final_rb).
+
+    ПОЧЕМУ на границах дней, а не после каждой транзакции:
+    в выписках Kaspi (и Halyk/Kaspi ИП) нет внутридневных меток времени —
+    для транзакций с ОДНОЙ датой их порядок в PDF произволен. Инвариант
+    «баланс ≥ 0» имеет смысл только на границе дня: если день стартует и
+    заканчивается с неотрицательным балансом, всегда существует внутридневной
+    порядок (сначала кредиты, потом дебеты), при котором баланс не уходит в
+    минус. Поэтому строка отчёта, где на ОДНУ дату идут пять дебетов, а за
+    ними два кредита, покрывающих их, — не реальный овердрафт, а всего лишь
+    неудачная перестановка операций одного дня.
+
+    Реальный баг, который это ловило как ложный минус: немодифицированный
+    gold_statement.pdf уходил в −54,17 ₸ в единственной точке 12.12.25
+    (пять дебетов перед двумя кредитами того же дня), из-за чего /verify
+    объявлял валидную банковскую выписку невалидной, а движок пересчёта
+    запускал разрушительный цикл коррекции salary из-за 54 тенге.
+
+    Транзакции идут от НОВЫХ к СТАРЫМ (как в PDF) — считаем в обратном
+    порядке (от balance_start = самой ранней даты ВПЕРЁД). Граница дня
+    фиксируется в момент СМЕНЫ даты (накопленный rb = конец предыдущего дня)
+    плюс в самом конце (конец последнего дня).
+    """
+    rb = balance_start
+    min_rb = rb
+    prev_date = None
+    for tx in reversed(transactions):
+        if prev_date is not None and tx.date != prev_date and rb < min_rb:
+            min_rb = rb
+        rb = round(rb + tx.sign * getattr(tx, amount_attr), 2)
+        prev_date = tx.date
+    if rb < min_rb:
+        min_rb = rb
+    return min_rb, rb
+
+
+def _date_sort_key(date_str: Optional[str]) -> Tuple[int, int, int]:
+    """(yy, mm, dd) для хронологического сравнения дат '12.12.25'.
+
+    Неизвестная дата → максимум, чтобы такие транзакции считались «поздними»
+    и не блокировали логику на границе дня.
+    """
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{2})", date_str or "")
+    if not m:
+        return (99, 99, 99)
+    return (int(m.group(3)), int(m.group(2)), int(m.group(1)))
+
+
+def first_negative_dayend(
+    transactions: List["Transaction"],
+    balance_start: float,
+    amount_attr: str = "amount",
+) -> Tuple[float, Optional[str]]:
+    """(min_dayend_rb, дата первого хронологически отрицательного дня).
+
+    Дополняет min_dayend_balance: возвращает не только минимум на границах
+    дней, но и ДАТУ самой ранней границы дня, на которой баланс отрицателен —
+    чтобы коррекция знала, какой «горбатый» месяц поднимать (см. Шаг 3 в
+    recalculate_statement). Если отрицательных границ нет — дата = None.
+    """
+    rb = balance_start
+    min_rb = rb
+    first_neg_date: Optional[str] = None
+    prev_date = None
+    for tx in reversed(transactions):
+        if prev_date is not None and tx.date != prev_date:
+            if rb < 0 and first_neg_date is None:
+                first_neg_date = prev_date
+            if rb < min_rb:
+                min_rb = rb
+        rb = round(rb + tx.sign * getattr(tx, amount_attr), 2)
+        prev_date = tx.date
+    if rb < 0 and first_neg_date is None:
+        first_neg_date = prev_date
+    if rb < min_rb:
+        min_rb = rb
+    return min_rb, first_neg_date
 
 
 def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> StatementData:
@@ -907,55 +1201,89 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
     # ── Шаг 2: Running balance ──
     # ВАЖНО: Транзакции в Kaspi PDF идут от НОВЫХ к СТАРЫМ (09.02.26 → 10.02.25)
     # Для running balance считаем от balance_start (самая ранняя дата) ВПЕРЁД,
-    # т.е. идём по транзакциям в ОБРАТНОМ порядке.
-    reversed_txs = list(reversed(stmt.transactions))
+    # т.е. идём по транзакциям в ОБРАТНОМ порядке. Минимум замеряем на границах
+    # дней (см. min_dayend_balance): внутридневной порядок операций произволен,
+    # и дип в −54 ₸ между дебетами и покрывающими их кредитами ТОГО ЖЕ дня —
+    # не реальный овердрафт, а лишь перестановка внутри даты.
     current_rb = stmt.balance_start
-    min_rb = current_rb
-    for tx in reversed_txs:
+    for tx in reversed(stmt.transactions):
         current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
         tx.new_balance_after = current_rb
-        if current_rb < min_rb:
-            min_rb = current_rb
-    
-    # ── Шаг 3: Если баланс уходит в минус — корректируем ──
-    # ВАЖНО: корректируем только если дефицит ОБЪЯСНЁН разницей индивидуальных транзакций
-    # vs. header. Если в PDF «Поступления со своих счетов» / «Зачисления кредитов»
-    # отображаются в summary, но не представлены как «Пополнение»-тип транзакций,
-    # то individual_expense > individual_income — это НОРМАЛЬНАЯ ситуация в оригинальном
-    # PDF (банк её принял). В таком случае running-balance исправлять бессмысленно:
-    # любое уменьшение salary только усугубит ситуацию.
+    min_rb, _ = min_dayend_balance(stmt.transactions, stmt.balance_start, "new_amount")
+
+    # ── Шаг 3: Если баланс уходит в минус — ПОДНИМАЕМ доход в дефицитном месяце ──
+    # «Горбатый» доход: у выписки есть месяц с очень крупным зарплатным доходом,
+    # который тратится в том же месяце. Плоское выравнивание к цели около
+    # среднего срезает этот месяц ниже, чем нужно для покрытия его же расходов,
+    # и running balance уходит в минус в СЕРЕДИНЕ периода. Расходы трогать
+    # нельзя (банк их сверяет), поэтому единственный способ вернуть баланс в
+    # плюс — ПОДНЯТЬ зарплату в месяце дефицита (и, если нужно, в более ранних).
+    #
+    # РАНЬШЕ здесь была обратная (ошибочная) логика: salary УМЕНЬШАЛИ ×0.97,
+    # что углубляло дефицит, гнало итоговый баланс в глубокий минус и приводило
+    # к ложному floor-отказу (post_check_negative_balance) даже там, где валидный
+    # результат достижим. downscale-модуль всегда поднимал ×1.02 — это и есть
+    # верное направление. Поднятие дохода всегда сходится: лишние деньги дефицит
+    # только закрывают, а на баланс ≥ 0 в остальных точках это не влияет.
+    #
+    # Как и прежде, корректируем только если дефицит СОЗДАН нашим масштабированием
+    # (тождество баланса на уровне транзакций у оригинала сходится). Если оригинал
+    # сам «структурно дефицитен» на уровне транзакций (напр. self-transfer суммы
+    # в шапке, но не в виде «Пополнение»-транзакций) — не вмешиваемся.
     individual_income_total = sum(tx.amount for tx in stmt.transactions if tx.sign == 1)
     individual_expense_total = sum(tx.amount for tx in stmt.transactions if tx.sign == -1)
     original_min_rb_deficit = individual_income_total + stmt.balance_start - individual_expense_total
+    min_rb, neg_date = first_negative_dayend(stmt.transactions, stmt.balance_start, "new_amount")
     if min_rb < 0 and original_min_rb_deficit >= -1.0:
-        # Уменьшение salary поможет (дефицит создан нашим масштабированием)
-        print(f"\n  ⚠️ Баланс уходил в минус: {min_rb:,.2f} ₸")
-        print(f"  Корректируем: немного уменьшаем зарплатные транзакции")
-        
-        # Расходы не трогаем (они оригинальные).
-        # Вместо этого немного уменьшаем зарплатные транзакции в месяцах
-        # с наибольшим превышением, чтобы running balance не уходил в минус.
-        safety_factor = 0.97  # уменьшаем salary на 3% за итерацию
-        for attempt in range(10):
-            for tx in stmt.transactions:
-                if tx.sign == 1 and tx.is_salary and not tx.is_refund:
-                    tx.new_amount = round(tx.new_amount * safety_factor, 2)
-            
-            # Пересчитаем running balance
-            reversed_txs2 = list(reversed(stmt.transactions))
-            current_rb = stmt.balance_start
-            min_rb = current_rb
-            for tx in reversed_txs2:
-                current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
-                tx.new_balance_after = current_rb
-                if current_rb < min_rb:
-                    min_rb = current_rb
-            
-            if min_rb >= 0:
-                print(f"  ✅ Баланс скорректирован за {attempt + 1} итераций, мин: {min_rb:,.2f} ₸")
+        print(f"\n  ⚠️ Баланс уходил в минус: {min_rb:,.2f} ₸ (первый дефицитный день ~{neg_date})")
+        print(f"  Корректируем: поднимаем зарплату на/до точки дефицита")
+        prev_min = None
+        for attempt in range(80):
+            min_rb, neg_date = first_negative_dayend(stmt.transactions, stmt.balance_start, "new_amount")
+            if min_rb >= -0.01:
+                print(f"  ✅ Баланс скорректирован за {attempt} итераций, мин: {min_rb:,.2f} ₸")
                 break
+            # Дефицит на границе дня neg_date можно закрыть ТОЛЬКО доходом,
+            # пришедшим НЕ ПОЗЖЕ этой даты (более поздняя зарплата на эту точку
+            # не влияет). Поднимаем зарплату в МЕСЯЦЕ дефицита, но лишь ту, что
+            # датирована ≤ neg_date (тот самый «горб»); если такой в этом месяце
+            # нет — расширяемся на всю зарплату ≤ neg_date. Ограничение «≤ дата»
+            # критично: без него зарплата, пришедшая ПОСЛЕ дефицита, растёт до
+            # бесконечности, не сдвигая баланс (runaway).
+            neg_mk = _get_month_key(neg_date)
+            neg_key = _date_sort_key(neg_date)
+            eligible = [
+                tx for tx in stmt.transactions
+                if tx.sign == 1 and tx.is_salary and not tx.is_refund
+                and _date_sort_key(tx.date) <= neg_key
+            ]
+            targeted = [tx for tx in eligible if _get_month_key(tx.date) == neg_mk] or eligible
+            if not targeted:
+                # Дефицит без единой зарплатной транзакции до него — поднять
+                # нечего, ниже сработает safety-net (raise IncomeTooLowError).
+                print(f"  ⚠️ Нет зарплаты до точки дефицита {neg_date} — коррекция невозможна")
+                break
+            # _round_to_natural (не round(x, 2)!) — реальные зарплатные суммы
+            # Kaspi Gold всегда целые тенге в «человеческом» шаге (см. её
+            # докстринг); голый round(x, 2) после нескольких итераций ×1.05
+            # оставляет произвольные копейки (проверено на реальном файле:
+            # 100 из 561 зарплатных транзакций получали копейки вроде
+            # "232 682,62 ₸" — визуально выдаёт результат как посчитанный по
+            # формуле, а не настоящую зарплатную проводку).
+            for tx in targeted:
+                tx.new_amount = _round_to_natural(tx.new_amount * 1.05)
+            # Guard от зависания: если минимум не улучшается — прекращаем.
+            if prev_min is not None and min_rb <= prev_min + 0.01:
+                print(f"  ⚠️ Коррекция не сходится (мин застрял на {min_rb:,.2f} ₸) — стоп")
+                break
+            prev_min = min_rb
         else:
-            print(f"  ⚠️ Не удалось полностью скорректировать, мин: {min_rb:,.2f} ₸")
+            print(f"  ⚠️ Коррекция не сошлась за 80 итераций, мин: {min_rb:,.2f} ₸")
+        # Финальный пересчёт running balance после коррекции
+        current_rb = stmt.balance_start
+        for tx in reversed(stmt.transactions):
+            current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
+            tx.new_balance_after = current_rb
     elif min_rb < 0:
         print(f"\n  ℹ️ Running balance минус ({min_rb:,.2f} ₸) — структурная особенность PDF."
               f" Оригинал тоже дефицитен ({original_min_rb_deficit:,.2f} ₸). Не корректируем.")
@@ -985,6 +1313,54 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
     stmt.new_balance_end = round(
         stmt.balance_start + stmt.new_total_income - stmt.total_expense, 2
     )
+
+    # «Доступно на …» в PDF Kaspi Gold обычно пишется БЕЗ знака вовсе (не
+    # «+5 356,25», а просто «5 356,25») — а глиф «-» для BALANCE_END/
+    # TOTAL_INCOME синтезировать негде: у "-" нет CID в CMap ОСНОВНОГО
+    # шрифта (from_unicode строится только из него — см. build_dynamic_cmap),
+    # он существует только в CMap доп. шрифта, использовать чужой CID в
+    # чужом шрифте — риск отрисовать не тот глиф. process_pdf_bytes_raw тогда
+    # молча оставил бы старый (положительный) текст — сумма выглядела бы как
+    # положительная, будучи на самом деле отрицательной (воспроизведено на
+    # реальном файле: near-noop таргет после коррекции running balance,
+    # «Шаг 3» выше, ушёл в -7 990 164,08 ₸, а в PDF осталась исходная
+    # положительная «5 356,25»). Как и в pdf_service_downscale (см. её
+    # докстринг: «никогда не получим отрицательный B_end — архитектурно, а не
+    # патчем cmap»), решаем на уровне пересчёта, а не байт-записи: если после
+    # ВСЕХ коррекций (включая «Шаг 3») баланс всё равно уходит в минус —
+    # запрошенный target для этой выписки небезопасен, поднимаем явную ошибку
+    # вместо тихой записи визуально неверного PDF.
+    if stmt.new_balance_end < 0:
+        from pdf_service_downscale import IncomeTooLowError  # локальный импорт — избегаем цикла
+
+        new_min = max(target_monthly_income, current_monthly_avg) * 1.10
+        raise IncomeTooLowError(
+            min_target_monthly_income=new_min,
+            current_expense=stmt.total_expense,
+            current_monthly_avg=current_monthly_avg,
+            n_months=n_months,
+            reason="post_check_negative_balance",
+            message=(
+                f"Не удалось удержать неотрицательный итоговый баланс при "
+                f"{target_monthly_income:,.0f} ₸/мес "
+                f"(получилось {stmt.new_balance_end:,.0f} ₸). Минимально "
+                f"рекомендуемый доход: {new_min:,.0f} ₸/мес."
+            ),
+        )
+
+    # Шапка стр.1 (cert-формат) физически не вмещает право-выровненное
+    # 10-значное число в своей ячейке «Сумма» (см. HeaderCellOverflowError).
+    # Проверяем ОБА поля, которые в неё пишутся, до тяжёлой записи PDF.
+    for _field_name, _val in (
+        ("total_income", stmt.new_total_income),
+        ("balance_end", stmt.new_balance_end),
+    ):
+        if abs(_val) > _HEADER_CELL_MAX_SAFE_VALUE:
+            raise HeaderCellOverflowError(
+                field_name=_field_name,
+                value=_val,
+                max_safe_value=_HEADER_CELL_MAX_SAFE_VALUE,
+            )
 
     # Расходные категории заголовка: оставляем ОРИГИНАЛЬНЫМИ (не пересчитываем!)
     if stmt.expense_categories:
@@ -1019,6 +1395,7 @@ def recalculate_with_certificate(
     cert: CertificateData,
     stmt: StatementData,
     target_monthly_income: float,
+    recalc_fn=None,
 ) -> Tuple[CertificateData, StatementData]:
     """Согласованный пересчёт: сначала выписка, затем синхронизация справки.
 
@@ -1029,9 +1406,22 @@ def recalculate_with_certificate(
 
     Курсы (rate_usd, rate_eur) сохраняются из оригинальных значений справки —
     это то, как банк зафиксировал курс на момент выдачи справки.
+
+    `recalc_fn` (по умолчанию — recalculate_statement, upscale-движок)
+    позволяет подставить другой движок пересчёта — например,
+    recalculate_statement_downscale из pdf_service_downscale.py. Раньше эта
+    функция ВСЕГДА использовала recalculate_statement напрямую, игнорируя
+    recalc_fn, который process_pdf_bytes_raw принимает как параметр — из-за
+    этого process_downscale() на cert-формате (текущий формат Kaspi Gold,
+    введён в 2026) фактически прогонял downscale-запрос через upscale-движок:
+    ни одна из трёх downscale floor-проверок не срабатывала, а доход не
+    уменьшался (мог даже слегка вырасти) без единой ошибки.
     """
-    # 1) Стандартный движок пересчёта выписки
-    stmt = recalculate_statement(stmt, target_monthly_income)
+    if recalc_fn is None:
+        recalc_fn = recalculate_statement
+
+    # 1) Движок пересчёта выписки (upscale по умолчанию, либо переданный)
+    stmt = recalc_fn(stmt, target_monthly_income)
 
     # 2) Курсы из оригинала
     rate_usd = cert.balance_kzt / cert.balance_usd if cert.balance_usd > 0 else 0.0
@@ -1050,6 +1440,71 @@ def recalculate_with_certificate(
     print(f"  └────────────────────────────────────────────────")
 
     return cert, stmt
+
+
+def build_income_replacement_entries(stmt: StatementData) -> Dict[str, Deque[Tuple[float, str]]]:
+    """Строит очередь замен для ВСЕХ доходных (sign=+1) транзакций — и salary,
+    и refund/self-transfer — в порядке stmt.transactions (совпадает с
+    порядком появления в PDF: Kaspi печатает от новых к старым).
+
+    КРИТИЧНО: каждая sign=+1 транзакция должна зарезервировать РОВНО один
+    слот в очереди, даже если для salary новое значение совпало со старым
+    (new_amount == amount — K_month округлился близко к 1.0 для этого
+    месяца). Раньше такие транзакции слот не резервировали — из-за этого
+    raw-byte сканер при встрече с их оригинальными байтами "съедал" слот,
+    предназначенный для ДРУГОЙ транзакции с тем же текстом суммы, каскадно
+    сдвигая все последующие одинаковые суммы (воспроизведено на реальном
+    файле: 28 из 1334 доходных транзакций получали чужое значение при
+    таргете, где K_month одного из месяцев округлялся к 1.0). Refund-
+    транзакции уже резервировали identity-слот по этой же причине — теперь
+    salary-транзакции с K≈1 делают то же самое.
+    """
+    from collections import deque as _deque
+
+    def _clean(raw: str, prefix: str = "") -> str:
+        s = raw.replace(" ", "").replace("₸", "").replace("\xa0", "")
+        s = s.replace("+", "").replace("-", "")
+        return (prefix + s).strip()
+
+    queue: Dict[str, _deque] = {}
+    for tx in stmt.transactions:
+        if tx.sign != 1:
+            continue
+        value = tx.amount if tx.is_refund else tx.new_amount
+        label = "REFUND_IDENTITY" if tx.is_refund else "TRANSACTION_IN"
+        key = _clean(tx.original_amount_text, prefix="IN:")
+        if key == "IN:":
+            continue
+        if key not in queue:
+            queue[key] = _deque()
+        queue[key].append((value, label))
+    return queue
+
+
+def build_cert_replacement_entries(cert: CertificateData) -> Dict[str, Tuple[float, str]]:
+    """Строит записи для replacement_queue, которые синхронизируют страницу
+    «Справка об остатке» (стр. 0) с новым балансом выписки.
+
+    Ключи ("CERT_KZT:"/"CERT_USD:"/"CERT_EUR:" + голые цифры оригинального
+    текста) должны совпадать с тем, что уже ищет читающий код в
+    process_pdf_bytes_raw (cert_paren_callback и hex-ветка с _key_map) —
+    раньше туда никто ничего не клал, поэтому справка молча оставалась со
+    старым остатком даже после апскейла/даунскейла всей выписки.
+    """
+    entries: Dict[str, Tuple[float, str]] = {}
+    _pairs = (
+        ("CERT_KZT:", cert.balance_kzt_text, cert.balance_kzt, cert.new_balance_kzt),
+        ("CERT_USD:", cert.balance_usd_text, cert.balance_usd, cert.new_balance_usd),
+        ("CERT_EUR:", cert.balance_eur_text, cert.balance_eur, cert.new_balance_eur),
+    )
+    for key_prefix, text, old_val, new_val in _pairs:
+        if not text or old_val <= 0:
+            continue
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if not digits:
+            continue
+        entries[key_prefix + digits] = (new_val, key_prefix.rstrip(":"))
+    return entries
 
 
 def _estimate_months(dates: List[str]) -> int:
@@ -1144,8 +1599,20 @@ def validate_scoring(stmt: StatementData) -> ScoringReport:
 
 
 def process_pdf_bytes(input_bytes: bytes, target_monthly_income: float) -> bytes:
-    """
-    Главная функция. Принимает PDF и целевой месячный доход.
+    """УСТАРЕЛО, НЕ ИСПОЛЬЗОВАТЬ — оставлено только как исторический вариант
+    записи через `doc.update_stream` (см. process_pdf_bytes_raw, который и
+    вызывается из main.py:/process).
+
+    Написана до появления cert-формата и с тех пор не поддерживалась. Проверено
+    на реальном gold_statement.pdf (цель ×10) — три независимые поломки:
+      - сумма на стр.-справке уезжает на x≈4 pt, далеко за левую границу
+        таблицы (в raw-писателе это лечится shift = 0 для cert-потока);
+      - USD/EUR на справке не обновляются вовсе → «справка = баланс выписки»
+        в /verify не сойдётся;
+      - нет логики REFUND_IDENTITY, поэтому часть «+»-ячеек получает чужие
+        значения из общей по номиналу очереди (12 из 593 сумм оказались вне
+        «человеческой» сетки _round_to_natural).
+    Чинить её отдельно смысла нет — правильный путь один, raw.
 
     1. Парсит выписку → StatementData
     2. Пересчитывает математику (K × дисперсия)
@@ -1438,8 +1905,11 @@ def process_pdf_bytes_raw(
         cert = parse_certificate_page(doc)
         # Выписка начинается со стр. 1 (стр. 0 = справка)
         stmt = parse_full_statement(doc, start_page=1)
-        # Согласованный пересчёт: stmt + cert через сохранённый курс валют
-        cert, stmt = recalculate_with_certificate(cert, stmt, target_monthly_income)
+        # Согласованный пересчёт: stmt + cert через сохранённый курс валют.
+        # recalc_fn прокидываем и сюда — иначе downscale-запросы (см.
+        # pdf_service_downscale.process_downscale) на cert-формате всегда
+        # прогонялись бы upscale-движком в обход своих floor-проверок.
+        cert, stmt = recalculate_with_certificate(cert, stmt, target_monthly_income, recalc_fn=recalc_fn)
     else:
         stmt = parse_full_statement(doc)
         stmt = recalc_fn(stmt, target_monthly_income)
@@ -1463,6 +1933,25 @@ def process_pdf_bytes_raw(
           f"допустимых Y (per-page, offset={_Y_OFFSET}±{_Y_TOL}): "
           f"{sum(len(s) for s in page_income_cs_ys.values())}")
 
+    # Тот же Y-фильтр для is_refund-строк (возвраты покупок/переводов И
+    # «Поступление»/«Зачисление» self-transfer). Нужен как НАДЁЖНАЯ замена
+    # y_has_refund_type ниже: тот сканирует тип-слово ("Покупка"/"Поступление"
+    # и т.п.) КАК hex-Tj-токен В ТОМ ЖЕ content-стриме, что и суммы — но на
+    # реальных Kaspi Gold PDF описание/тип строки транзакции физически лежит
+    # в ДРУГОМ объекте (не среди Td/Tj-токенов этого стрима вообще; проверено
+    # на goldformat1.pdf — ни один из ~44 токенов стрима страницы не декодируется
+    # в тип-слово), поэтому y_has_refund_type там всегда остаётся ПУСТЫМ
+    # множеством и ветка ниже никогда не срабатывает. y_pdf_rounded же взят из
+    # высокоуровневого page.get_text("words") (PyMuPDF сам разбирает
+    # XObject/сложную структуру), поэтому page_income_cs_ys для salary уже
+    # работает корректно — используем ТОТ ЖЕ механизм и для refund-строк.
+    page_refund_cs_ys: Dict[int, set] = {}
+    for _tx in stmt.transactions:
+        if _tx.sign == 1 and _tx.is_refund and _tx.y_pdf_rounded > 0:
+            _lo = _tx.y_pdf_rounded - _Y_OFFSET - _Y_TOL
+            _hi = _tx.y_pdf_rounded - _Y_OFFSET + _Y_TOL
+            page_refund_cs_ys.setdefault(_tx.page_num, set()).update(range(_lo, _hi + 1))
+
     # ─── 2. Очередь замен ────────────────────────────────────
     replacement_queue: Dict[str, _deque] = {}
 
@@ -1471,24 +1960,14 @@ def process_pdf_bytes_raw(
         s = s.replace("+", "").replace("-", "")
         return (prefix + s).strip()
 
-    # ВСЕ транзакции sign==+1 идут в IN: очередь в порядке PDF.
-    # Salary: new_amount (масштабированный). Возвраты: amount (оригинал, identity).
-    # Это гарантирует что возврат "съест" свой слот и не украдёт salary-замену.
-    for tx in stmt.transactions:
-        if tx.sign == 1:
-            if tx.is_refund:
-                # Возврат — identity замена (сумма не меняется)
-                key = _clean(tx.original_amount_text, prefix="IN:")
-                if key != "IN:":
-                    if key not in replacement_queue:
-                        replacement_queue[key] = _deque()
-                    replacement_queue[key].append((tx.amount, "REFUND_IDENTITY"))
-            elif tx.is_salary and not tx.is_refund and tx.new_amount != tx.amount:
-                key = _clean(tx.original_amount_text, prefix="IN:")
-                if key != "IN:":
-                    if key not in replacement_queue:
-                        replacement_queue[key] = _deque()
-                    replacement_queue[key].append((tx.new_amount, "TRANSACTION_IN"))
+    # ВСЕ транзакции sign==+1 идут в IN: очередь в порядке PDF (см.
+    # build_income_replacement_entries): salary — new_amount (даже если он
+    # совпал со старым при K_month≈1 — иначе эта транзакция не резервирует
+    # свой слот и раскрадывает чужой), возвраты — amount (identity).
+    for key, entries in build_income_replacement_entries(stmt).items():
+        if key not in replacement_queue:
+            replacement_queue[key] = _deque()
+        replacement_queue[key].extend(entries)
 
     # Расходные транзакции — НЕ масштабируются, НЕ добавляем в очередь
 
@@ -1511,7 +1990,28 @@ def process_pdf_bytes_raw(
                 replacement_queue[key] = _deque()
             replacement_queue[key].append((stmt.new_balance_end, "BALANCE_END"))
 
-    # CERT-балансы (₸/$/€) со страницы справки НЕ меняем — страница остаётся нетронутой.
+    # CERT-балансы (₸/$/€) со страницы справки.
+    #
+    # Раньше этот блок был отключён: включение build_cert_replacement_entries()
+    # вскрывало два независимых бага, найденные и исправленные на реальном
+    # файле (₸212 017,14 → ₸39 959 306,05, справка НЕ обновлялась вовсе):
+    #   1) hex-ветка ниже (cert_prefix_sym / _key_map) искала ключ по
+    #      clean_digits, который (в отличие от build_cert_replacement_entries)
+    #      НЕ вырезает запятую-разделитель дробной части — "CERT_KZT:212017,14"
+    #      никогда не совпадал с "CERT_KZT:21201714", подстановка молча
+    #      пропускалась. См. cert_clean_digits ниже.
+    #   2) parse_certificate_page() делил слова строки на КZT/USD/EUR колонки
+    #      по фиксированным X-порогам (200/360), откалиброванным под короткие
+    #      суммы оригинала; когда апскейл увеличивает разрядность числа,
+    #      writer сдвигает его влево (сохраняя правый край), и на крупных
+    #      суммах сдвиг утаскивает "$"/"€" за фиксированный порог в соседнюю
+    #      колонку — parse_amount() получал чужой нечисловой токен и тихо
+    #      возвращал 0.00. Заменено на кластеризацию по разрывам (см. там же).
+    if fmt == "cert" and cert is not None:
+        for key, (new_val, typ) in build_cert_replacement_entries(cert).items():
+            if key not in replacement_queue:
+                replacement_queue[key] = _deque()
+            replacement_queue[key].append((new_val, typ))
 
     total_planned = sum(len(q) for q in replacement_queue.values())
     print(f"[Raw] Подготовлено {total_planned} замен ({len(replacement_queue)} уникальных ключей)")
@@ -1533,7 +2033,109 @@ def process_pdf_bytes_raw(
         else:
             print(f"[Cert] Ширину символа измерить не удалось, fallback={cert_char_width}")
 
+    # ─── Шрифт-заменитель для недостающих глифов цифр на стр. справки ──────
+    # Субсет-шрифт стр. 0 (F1) может НЕ содержать глиф какой-то цифры, если в
+    # оригинале справки эта цифра нигде не встречалась (реальный файл: ИИН/счёт
+    # без '8' → F1 не включил глиф '8', и пересчитанный баланс с восьмёркой
+    # рисовался пустым квадратом □). На страницах выписки та же цифра рисуется
+    # шрифтом F2 (в его субсете глиф есть). Решение: если F1 не покрывает цифру,
+    # а другой шрифт документа покрывает И совпадает с F1 по CID для остальных
+    # цифр (тот же ArialMT-субсет), подставляем этот шрифт для ячеек справки,
+    # которые он полностью покрывает (KZT: ₸/пробел/запятая/цифры — все есть).
+    # Символы валюты $/€ у F2 обычно отсутствуют, поэтому такие ячейки этот
+    # механизм не трогает (fallback на прежнее поведение). Всё под gate: если у
+    # F1 все цифры на месте (обычный файл) — заменитель не ищется, поведение не
+    # меняется.
+    cert_sub_font_name: Optional[bytes] = None   # напр. b"F2"
+    cert_sub_font_xref: Optional[int] = None
+    cert_sub_chars: set = set()
+    cert_page_font_dict_xref: Optional[int] = None
+    if fmt == "cert":
+        try:
+            def _font_tounicode_cmap(font_xref: int) -> dict:
+                fo = doc.xref_object(font_xref)
+                mm = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", fo)
+                if not mm:
+                    return {}
+                return _parse_cmap_stream(
+                    doc.xref_stream(int(mm.group(1))).decode("latin-1", "ignore")
+                )
+
+            _p0 = doc.xref_object(doc.page_xref(0))
+            _rm = re.search(r"/Resources\s+(\d+)\s+0\s+R", _p0)
+            _res = doc.xref_object(int(_rm.group(1))) if _rm else _p0
+            _fm = re.search(r"/Font\s+(\d+)\s+0\s+R", _res)
+            if _fm:
+                cert_page_font_dict_xref = int(_fm.group(1))
+                _fdict = doc.xref_object(cert_page_font_dict_xref)
+                _page0_fonts = {n: int(x) for n, x in re.findall(r"/(\w+)\s+(\d+)\s+0\s+R", _fdict)}
+                if _page0_fonts:
+                    # Основной шрифт стр.0 = с наибольшим cmap (в нём кириллица).
+                    _prim = max(_page0_fonts, key=lambda n: len(_font_tounicode_cmap(_page0_fonts[n])))
+                    _prim_inv = {v: k for k, v in _font_tounicode_cmap(_page0_fonts[_prim]).items()}
+                    _missing = [d for d in "0123456789" if d not in _prim_inv]
+                    if _missing:
+                        # Кандидаты — все шрифты документа, не на стр.0.
+                        _cand_xrefs = set()
+                        for _pi in range(len(doc)):
+                            for _f in doc[_pi].get_fonts(full=True):
+                                _cand_xrefs.add(_f[0])
+                        for _cx in sorted(_cand_xrefs):
+                            if _cx in _page0_fonts.values():
+                                continue
+                            _cm = _font_tounicode_cmap(_cx)
+                            if not _cm:
+                                continue
+                            _inv = {v: k for k, v in _cm.items()}
+                            if not all(d in _inv for d in "0123456789"):
+                                continue
+                            # CID должны совпадать с F1 для общих цифр.
+                            if not all(_inv[d] == _prim_inv[d] for d in "0123456789" if d in _prim_inv):
+                                continue
+                            cert_sub_font_xref = _cx
+                            cert_sub_chars = set(_cm.values())
+                            _i = 2
+                            while f"F{_i}" in _page0_fonts:
+                                _i += 1
+                            cert_sub_font_name = f"F{_i}".encode()
+                            print(f"[Cert] Шрифт-заменитель для цифр {_missing}: xref={_cx} как /{cert_sub_font_name.decode()}")
+                            break
+        except Exception as _e:
+            cert_sub_font_name = None
+            print(f"[Cert] Поиск шрифта-заменителя не удался: {_e}")
+
     doc.close()
+
+    def _ambient_tf(buf: bytes, pos: int) -> Tuple[Optional[bytes], Optional[bytes]]:
+        """Имя и кегль последнего /Fx N Tf до позиции pos (для восстановления
+        шрифта после числа, набранного шрифтом-заменителем)."""
+        last = None
+        for mm in re.finditer(rb"/(\w+)\s+([\d.]+)\s+Tf", buf[:pos]):
+            last = mm
+        if last:
+            return last.group(1), last.group(2)
+        return None, None
+
+    def _digit_width_at(buf: bytes, pos: int) -> float:
+        """Реальная ширина цифры (pt) в той точке потока, где стоит число.
+
+        Суммы в выписке ПРАВО-выровнены: Td.x — левый край строки, поэтому при
+        росте числа X обязан сдвинуться влево ровно на прирост ширины текста,
+        иначе колонка «Сумма» становится рваной. Ширина берётся из реального
+        кегля (последний `/Fx N Tf` до этой позиции), а не из константы:
+        у ArialMT цифра = _ARIAL_DIGIT_EM em, т.е. 5.28 pt при кегле 9.5
+        (тело выписки) и 5.56 pt при кегле 10 (сводная таблица на стр. 1).
+        """
+        _, size_b = _ambient_tf(buf, pos)
+        size = 0.0
+        if size_b:
+            try:
+                size = float(size_b)
+            except ValueError:
+                size = 0.0
+        if size <= 0:
+            size = _FALLBACK_FONT_SIZE
+        return _ARIAL_DIGIT_EM * size
 
     # ─── 4. Regex для Td/Tj в декомпрессированных стримах ─────
     td_pattern = re.compile(
@@ -1644,9 +2246,24 @@ def process_pdf_bytes_raw(
         # Kaspi PDF позиционирует каждый элемент строки через Tm-reset + Td с
         # абсолютными координатами, поэтому group(2) = абсолютная Y-координата
         # строки и одинакова для суммы, типа, текущего остатка на той же строке.
+        # ВАЖНО: этот набор должен зеркалить is_refund-классификацию из
+        # parse_full_statement (TX_TYPES_EXPENSE | TX_TYPES_SELF_TRANSFER) —
+        # иначе строка «+»-суммы, которую parse_full_statement пометил как
+        # is_refund=True (и поставил в очередь REFUND_IDENTITY, см. ниже), тут
+        # не распознаётся как «строка возврата»: слот REFUND_IDENTITY не
+        # потребляется физической ячейкой (см. ветку has_plus_decoded and
+        # y_str in y_has_refund_type ниже), остаётся «застрявшим» в начале
+        # общей по значению очереди "IN:<сумма>" и достаётся СЛЕДУЮЩЕЙ ячейке
+        # с тем же числом (обычно зарплатной) вместо неё — та получает старое
+        # немасштабированное значение, а её собственная запись в очереди
+        # сдвигает уже ВСЕ последующие ячейки с этим числом на одну позицию.
+        # Воспроизведено на реальной выписке (goldformat1.pdf) после добавления
+        # «Поступление»/«Зачисление» в parse_full_statement: 179 из 536 «+»
+        # ячеек получали чужое значение каскадно от одной незамеченной строки.
         REFUND_TYPE_WORDS = {
             'Покупка', 'Перевод', 'Снятие', 'Оплата',
             'Платёж', 'Платеж', 'Комиссия', 'Возврат', 'Разное',
+            'Поступление', 'Зачисление',
         }
         INCOME_TYPE_WORDS = {'Пополнение'}
         y_has_refund_type: set = set()
@@ -1733,13 +2350,20 @@ def process_pdf_bytes_raw(
                 # либо отдельным Tj — тогда префикс пуст, число встречается само
                 # по себе. Для USD/EUR на справке валюта всегда отдельным глифом.
                 _key_map = {"₸": "CERT_KZT:", "$": "CERT_USD:", "€": "CERT_EUR:"}
+                # CERT-ключи в build_cert_replacement_entries() хранят ТОЛЬКО
+                # цифры (без запятой-разделителя дробной части) — а clean_digits
+                # здесь запятую сохраняет (эта же переменная используется ниже
+                # для обычных IN:/OUT:/HDR: ключей, где запятая обязана
+                # остаться, см. _clean() в build_income_replacement_entries).
+                # Отдельно дочищаем только для CERT-поиска.
+                cert_clean_digits = clean_digits.replace(",", "").replace(".", "")
                 # 1) Если префикс начинается с валюты — берём её.
                 tried_currency = None
                 for _sym in ("₸", "$", "€"):
                     if cert_prefix_sym is None:
                         continue
                     if cert_prefix_sym == _sym:
-                        _q = replacement_queue.get(_key_map[_sym] + clean_digits)
+                        _q = replacement_queue.get(_key_map[_sym] + cert_clean_digits)
                         if _q:
                             queue = _q
                             tried_currency = _sym
@@ -1747,7 +2371,7 @@ def process_pdf_bytes_raw(
                 # 2) Иначе перебираем все три по голому числу.
                 if queue is None:
                     for _sym in ("₸", "$", "€"):
-                        _q = replacement_queue.get(_key_map[_sym] + clean_digits)
+                        _q = replacement_queue.get(_key_map[_sym] + cert_clean_digits)
                         if _q:
                             queue = _q
                             tried_currency = _sym
@@ -1758,10 +2382,22 @@ def process_pdf_bytes_raw(
                 new_val, typ = queue[0]  # peek — одно значение на справку
                 is_hdr = True
             else:
-                # Возврат? (+ на строке с типом Покупка/Перевод/etc) — пропускаем,
-                # но потребляем слот REFUND_IDENTITY чтобы он не перехватил замену
-                # следующей зарплатной транзакции с той же суммой.
-                if has_plus_decoded and y_str in y_has_refund_type:
+                # Возврат/self-transfer? (+ на строке типа Покупка/Перевод/
+                # Поступление/etc) — пропускаем, но потребляем слот
+                # REFUND_IDENTITY, чтобы он не перехватил замену следующей
+                # зарплатной транзакции с той же суммой. y_has_refund_type
+                # (сканирование тип-слова В ЭТОМ ЖЕ content-стриме) на части
+                # реальных Kaspi Gold PDF всегда пуст — тип/описание строки
+                # физически не лежит среди Td/Tj-токенов этого стрима — тогда
+                # полагаемся на page_refund_cs_ys (Y из page.get_text("words"),
+                # см. комментарий у его построения выше), который работает
+                # независимо от структуры content-стрима.
+                _y_int = round(float(y_str))
+                _page_refund_ys = page_refund_cs_ys.get(page_num)
+                _is_refund_row = (y_str in y_has_refund_type) or (
+                    _page_refund_ys is not None and _y_int in _page_refund_ys
+                )
+                if has_plus_decoded and _is_refund_row:
                     _ref_q = replacement_queue.get("IN:" + clean_digits)
                     if _ref_q and _ref_q[0][1] == "REFUND_IDENTITY":
                         _ref_q.popleft()
@@ -1828,7 +2464,16 @@ def process_pdf_bytes_raw(
             # X-координату подстраиваем под разницу длин строк.
             # Cert-страница использует более крупный шрифт → ширина символа больше.
             # cert_char_width измеряется из оригинального PDF (см. выше).
-            avg_char_width = cert_char_width if is_cert_stream else 4.0
+            # Для тела выписки ширина цифры берётся из фактического кегля в этом
+            # месте потока (_digit_width_at). Раньше тут стояла константа 4.0 pt
+            # — это лишь ~76% реальной ширины цифры (5.28 pt при кегле 9.5), из-за
+            # чего сдвиг X недобирал ~24% прироста, и чем сильнее выросло число,
+            # тем дальше вправо от своей колонки уезжал его правый край: на
+            # реальном файле gold_statement.pdf правые края «Суммы» разъезжались
+            # на 187.5/188.1/189.4 вместо общей для колонки 190.9, а итоговый
+            # остаток в сводной таблице пересекал правую границу ячейки.
+            avg_char_width = (cert_char_width if is_cert_stream
+                              else _digit_width_at(decompressed, match.start()))
 
             def get_weighted_length(text):
                 weights = {
@@ -1840,15 +2485,54 @@ def process_pdf_bytes_raw(
                     length += 1.0 if char.isdigit() else weights.get(char, 1.0)
                 return length
 
-            len_old = get_weighted_length(original_text)
-            len_new = get_weighted_length(new_text)
+            # .strip() обязателен на ОБЕИХ строках: original_text уже обрезан
+            # (см. выше), а new_text собран из сырых prefix/suffix и сохраняет
+            # хвостовые пробелы ячейки («+ 6 500,00 ₸   »). Без него хвост
+            # считался только в len_new и давал постоянный лишний сдвиг влево
+            # (3 пробела × 0.5 × ширина цифры ≈ 8 pt) поверх основной ошибки.
+            len_old = get_weighted_length(original_text.strip())
+            len_new = get_weighted_length(new_text.strip())
             original_pixel_w = avg_char_width * len_old
-            shift = (len_new - len_old) * avg_char_width
+            if is_cert_stream:
+                # Ячейки на справке ЛЕВО-выровненные — исходный Td.x суммы
+                # совпадает с Td.x заголовка её колонки ("Сумма на счете...").
+                # Формула ниже (сдвиг влево на разницу ширин) верна для
+                # ПРАВО-выровненного макета сумм в самой выписке — на справке
+                # она уводит короткий оригинал далеко влево при сильном росте
+                # цифр (воспроизведено на реальном файле: «1 898,08» →
+                # «11 148 074,08» вылезло за левую границу таблицы). Справа
+                # до следующей колонки достаточно места — X не трогаем.
+                shift = 0.0
+            else:
+                shift = (len_new - len_old) * avg_char_width
             new_x = current_x - shift
 
             print(f"  [🎯 {typ}] {original_text} → {new_text}")
 
             total_replaced += 1
+
+            # Если это ячейка справки, а основной шрифт стр.0 не содержит какой-то
+            # цифры — набираем ЦИФРЫ шрифтом-заменителем (в нём глиф есть), а
+            # префикс (валюта ₸/$/€ + пробелы) оставляем прежним шрифтом (в
+            # заменителе может не быть глифа валюты). После Tj позиция сама
+            # сдвигается на ширину текста, поэтому второй Tj встаёт вплотную —
+            # ширину префикса вычислять не нужно. В конце возвращаем прежний
+            # шрифт, чтобы не сломать последующий текст на странице.
+            if is_cert_stream and cert_sub_font_name is not None:
+                _amb, _amb_sz = _ambient_tf(decompressed, match.start())
+                # Цифровая часть + суффикс должны быть покрыты заменителем.
+                _rest_chars = formatted_num + suffix_text
+                if _amb is not None and all(c in cert_sub_chars for c in _rest_chars):
+                    _prefix_hex = "".join(hex_blocks[:first_digit])
+                    _rest_hex = new_num_hex + "".join(hex_blocks[last_digit + 1:])
+                    _sub = cert_sub_font_name.decode()
+                    _an = _amb.decode()
+                    _sz = _amb_sz.decode()
+                    _out = f"{new_x:.5f} {y_str} Td ".encode("ascii")
+                    if _prefix_hex:
+                        _out += f"/{_an} {_sz} Tf <{_prefix_hex}> Tj ".encode("ascii")
+                    _out += f"/{_sub} {_sz} Tf <{_rest_hex}> Tj /{_an} {_sz} Tf".encode("ascii")
+                    return _out
 
             return f"{new_x:.5f} {y_str} Td <{new_hex}> Tj".encode("ascii")
 
@@ -1872,8 +2556,12 @@ def process_pdf_bytes_raw(
             def paren_encode(text: str) -> bytes:
                 out = bytearray()
                 for ch in text:
-                    code = FROM_UNICODE.get(ch, "\x00\x00")
-                    # FROM_UNICODE дают 4-hex строку — конвертируем в 2 байта
+                    # Дефолт "0000" (hex-строка нулевого CID), НЕ "\x00\x00"
+                    # (сырые байты): int("\x00\x00", 16) падал ValueError'ом на
+                    # символе вне CMap. "0000" даёт 2 нулевых байта, которые
+                    # ловит guard в cert_paren_callback (см. ниже) и пропускает
+                    # замену, а не роняет всю обработку.
+                    code = FROM_UNICODE.get(ch, "0000")
                     c = int(code, 16)
                     out.append((c >> 8) & 0xFF)
                     out.append(c & 0xFF)
@@ -1953,20 +2641,46 @@ def process_pdf_bytes_raw(
                 # Решение: сохраняем prefix/suffix байты как есть, кодируем только цифры.
                 prefix_raw = unescaped_bytes[:first_d * 2]   # 2 байта на символ BigEndian
                 suffix_raw = unescaped_bytes[(last_d + 1) * 2:]
-                new_num_encoded = paren_encode(formatted_num)  # только цифры/пробелы/запятая — всё есть в CMap
+                new_num_encoded = paren_encode(formatted_num)
+                # Если какой-то символ числа не нашёлся в CMap (paren_encode дал
+                # нулевой CID \x00\x00) — не пишем битый глиф, пропускаем замену
+                # (то же, что делает hex-ветка выше при "0000"). После добора
+                # цифр в build_dynamic_cmap этого не должно случаться, но guard
+                # оставляем как страховку от нецифрового символа вне карты.
+                if b"\x00\x00" in new_num_encoded:
+                    return m.group(0)
                 new_encoded = prefix_raw + new_num_encoded + suffix_raw
 
-                # X-сдвиг для выравнивания в ячейке (используем измеренную ширину)
-                num_len_old = (last_d - first_d + 1)
-                num_len_new = len(formatted_num)
-                x_shift = (num_len_new - num_len_old) * cert_char_width
-                try:
-                    new_x_paren = float(x_str) - x_shift
-                except Exception:
-                    new_x_paren = float(x_str)
+                # Ячейки справки лево-выровнены (см. docstring в hex-ветке
+                # replace_callback выше) — X не сдвигаем, иначе короткий
+                # оригинал при сильном росте числа уезжает за левую границу
+                # таблицы. current_x уже провалидирован как float выше.
+                new_x_paren = current_x
 
                 print(f"  [CERT_P {typ}] {original_text!r} -> {new_text!r}")
                 total_replaced += 1
+
+                def _esc(b: bytes) -> bytes:
+                    return b.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+
+                # Ячейка справки: цифры набираем шрифтом-заменителем (в основном
+                # шрифте стр.0 может не быть глифа '8'), префикс валюты — прежним
+                # шрифтом (в заменителе нет $/€). Второй Tj встаёт вплотную к
+                # первому (позиция сдвигается сама на ширину префикса).
+                if cert_sub_font_name is not None:
+                    _amb, _amb_sz = _ambient_tf(new_decompressed, m.start())
+                    _rest_chars = formatted_num + suffix_p
+                    if _amb is not None and all(c in cert_sub_chars for c in _rest_chars):
+                        _sub = cert_sub_font_name.decode()
+                        _an = _amb.decode()
+                        _sz = _amb_sz.decode()
+                        _rest_bytes = new_num_encoded + suffix_raw
+                        _out = f"{new_x_paren:.5f} {y_str2} Td ".encode("ascii")
+                        if prefix_raw:
+                            _out += f"/{_an} {_sz} Tf (".encode("ascii") + _esc(prefix_raw) + b") Tj "
+                        _out += f"/{_sub} {_sz} Tf (".encode("ascii") + _esc(_rest_bytes) + b") Tj "
+                        _out += f"/{_an} {_sz} Tf".encode("ascii")
+                        return _out
 
                 # Заменяем только внутренность скобок
                 return (
@@ -2019,13 +2733,31 @@ def process_pdf_bytes_raw(
     print(f"\n[Raw] Произведено замен: {total_replaced}")
     print(f"[Raw] Суммарный сдвиг: {cumulative_offset} байт")
 
+    # ─── Регистрируем шрифт-заменитель в /Font стр.0 ──────────────────────
+    # Если хоть одна ячейка справки была набрана шрифтом-заменителем (см.
+    # cert_sub_font_name), его имя обязано присутствовать в словаре /Font
+    # страницы 0 — иначе оператор "/F2 .. Tf" ссылается на неизвестный ресурс.
+    # Вставляем "/F2 <xref> 0 R" перед закрывающим ">>" словаря шрифтов стр.0.
+    if (cert_sub_font_name is not None and cert_sub_font_xref is not None
+            and cert_page_font_dict_xref is not None):
+        _obj_pat = re.compile(rb"(?<![0-9])" + str(cert_page_font_dict_xref).encode() + rb"\s+0\s+obj")
+        _om = _obj_pat.search(raw)
+        if _om:
+            _dict_open = raw.find(b"<<", _om.end())
+            _dict_close = raw.find(b">>", _dict_open)
+            _entry = b" /" + cert_sub_font_name + b" " + str(cert_sub_font_xref).encode() + b" 0 R"
+            if _dict_open >= 0 and _dict_close > _dict_open and _entry.strip() not in raw[_dict_open:_dict_close]:
+                raw[_dict_close:_dict_close] = _entry
+                cumulative_offset += len(_entry)
+                print(f"[Cert] /{cert_sub_font_name.decode()} {cert_sub_font_xref} 0 R добавлен в /Font стр.0")
+
     # ─── 6. Обновляем xref таблицу ────────────────────────────
     # Находим xref таблицу и обновляем offsets
     result = bytes(raw)
-    
+
     if cumulative_offset != 0:
         result = _rebuild_xref_table(result)
-    
+
     return result
 
 
@@ -2040,9 +2772,7 @@ def _rebuild_xref_table(pdf_bytes: bytes) -> bytes:
     raw = bytearray(pdf_bytes)
 
     # ─── Находим xref таблицу по паттерну ─────────────────
-    xref_match = re.search(rb"xref\r\n(\d+)\s+(\d+)\r\n", raw)
-    if not xref_match:
-        xref_match = re.search(rb"xref\n(\d+)\s+(\d+)\n", raw)
+    xref_match = re.search(rb"xref\r?\n(\d+)\s+(\d+)\r?\n", raw)
     if not xref_match:
         print("[WARN] xref таблица не найдена")
         return bytes(raw)

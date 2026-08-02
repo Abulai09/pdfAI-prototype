@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# PyInstaller build output
+build/
+dist/
+*.manifest
+
+# Runtime data (SQLite journal, logs) — генерируется при запуске
+journal.db
+*.log
+
+# Реальные PDF-выписки для тестов: никогда не коммитим
+tests/fixtures/
+
+# Сгенерированный граф знаний
+graphify-out/
+
+# Локальные настройки Claude Code
+.claude/
+
+# Артефакт Windows-редиректа (`> nul`)
+nul

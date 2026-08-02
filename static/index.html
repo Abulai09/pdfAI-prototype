@@ -163,6 +163,15 @@
         .verdict-bar.pass { background: var(--green-bg); color: var(--green); border-top: 1px solid rgba(34,197,94,.15); }
         .verdict-bar.fail { background: var(--red-bg); color: var(--red); border-top: 1px solid rgba(239,68,68,.15); }
         .issues-list { margin-top: .3rem; font-weight: 400; font-size: .72rem; line-height: 1.6; }
+        .verify-summary { border-top: 1px solid var(--border); padding: .6rem .75rem .5rem; }
+        .vs-title { font-size: .72rem; font-weight: 600; color: var(--text-2); text-transform: uppercase; letter-spacing: .04em; margin-bottom: .4rem; }
+        .vs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .15rem .5rem; }
+        .vs-row { display: flex; justify-content: space-between; font-size: .75rem; padding: .18rem 0; border-bottom: 1px solid rgba(255,255,255,.04); }
+        .vs-row:last-child { border-bottom: none; }
+        .vs-label { color: var(--text-2); }
+        .vs-val { color: var(--text-0); font-weight: 500; }
+        .vs-min .vs-label { color: var(--accent); font-weight: 600; }
+        .vs-min .vs-val { color: var(--accent); font-weight: 700; }
         /* SPINNER */
         .spinner {
             display: inline-block; width: 14px; height: 14px;
@@ -632,6 +641,35 @@ function renderVerifyResults(data) {
         html += '<div class="issues-list">' + data.issues.join('<br>') + '</div>';
     }
     html += '</div>';
+
+    // Summary block
+    const s = data.summary;
+    if (s) {
+        const fmt = v => (v != null ? Number(v).toLocaleString('ru-RU', {minimumFractionDigits:2, maximumFractionDigits:2}) + ' ₸' : '—');
+        html += '<div class="verify-summary">';
+        html += '<div class="vs-title">Сводка по документу</div>';
+        html += '<div class="vs-grid">';
+        if (s.avg_monthly_income != null)
+            html += `<div class="vs-row"><span class="vs-label">Средний доход / мес</span><span class="vs-val">${fmt(s.avg_monthly_income)}</span></div>`;
+        if (s.suggested_min != null)
+            html += `<div class="vs-row vs-min"><span class="vs-label">Минимум для скоринга</span><span class="vs-val">${fmt(s.suggested_min)}</span></div>`;
+        if (s.balance_start != null)
+            html += `<div class="vs-row"><span class="vs-label">Входящий остаток</span><span class="vs-val">${fmt(s.balance_start)}</span></div>`;
+        if (s.balance_end != null)
+            html += `<div class="vs-row"><span class="vs-label">Исходящий остаток</span><span class="vs-val">${fmt(s.balance_end)}</span></div>`;
+        if (s.total_income != null)
+            html += `<div class="vs-row"><span class="vs-label">Итого приход</span><span class="vs-val">${fmt(s.total_income)}</span></div>`;
+        if (s.total_expense != null)
+            html += `<div class="vs-row"><span class="vs-label">Итого расход</span><span class="vs-val">${fmt(s.total_expense)}</span></div>`;
+        if (s.transactions != null)
+            html += `<div class="vs-row"><span class="vs-label">Транзакций</span><span class="vs-val">${s.transactions}</span></div>`;
+        if (s.months != null)
+            html += `<div class="vs-row"><span class="vs-label">Месяцев</span><span class="vs-val">${s.months}</span></div>`;
+        if (s.isi != null)
+            html += `<div class="vs-row"><span class="vs-label">ISI</span><span class="vs-val">${Number(s.isi).toFixed(4)}</span></div>`;
+        html += '</div></div>';
+    }
+
     box.innerHTML = html;
     box.classList.add('visible');
 }

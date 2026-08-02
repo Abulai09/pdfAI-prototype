@@ -140,6 +140,7 @@ def main():
                     result = self._window.create_file_dialog(
                         webview.SAVE_DIALOG,
                         save_filename=safe_name,
+                        file_types=("PDF files (*.pdf)",),
                     )
                     if not result:
                         return {"ok": False}
@@ -151,6 +152,20 @@ def main():
 
                     if not path:
                         return {"ok": False}
+
+                    # ОС-диалог "Сохранить как" позволяет пользователю стереть
+                    # или изменить расширение прямо в поле имени файла — даже
+                    # с фильтром file_types это не гарантия (диалог просто
+                    # предлагает *.pdf, но не запрещает ввести своё имя без
+                    # расширения). Без этой проверки итоговый файл на диске
+                    # мог остаться вообще без расширения после переименования
+                    # пользователем, независимо от формата выписки (Kaspi
+                    # Gold / Halyk / Kaspi ИП/бизнес — все идут через этот
+                    # единственный save_pdf). Форсируем ".pdf" на РЕАЛЬНОМ
+                    # выбранном пути, а не только на предложенном имени.
+                    if not path.lower().endswith(".pdf"):
+                        path += ".pdf"
+
                     with open(path, "wb") as f:
                         f.write(base64.b64decode(data_b64))
                     _log("saved PDF -> " + path)
