@@ -1,5 +1,6 @@
 import fitz
 import re
+import copy
 import random
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -11,6 +12,79 @@ from typing import List, Dict, Deque, Optional, Tuple
 # и сохранить право-выравнивание колонки «Сумма».
 _ARIAL_DIGIT_EM = 0.556   # ширина цифры; пробел/запятая ровно вдвое уже (0.278)
 _FALLBACK_FONT_SIZE = 9.5  # кегль тела выписки — если /Tf не удалось прочитать
+
+
+# ---------------------------------------------------------------------------
+#  Стиль сериализации операторов (общий для всех трёх писателей)
+# ---------------------------------------------------------------------------
+#
+#  Форензик-разбор 11 результатов против 3 оригиналов (02/08/2026) не нашёл ни
+#  одного привычного признака вмешательства: /Producer, /Creator, /CreationDate,
+#  /ModDate, /ID, версия PDF, число объектов — идентичны; xref и /Length
+#  пересчитаны корректно; инкрементального обновления нет. Разошёлся ТОЛЬКО
+#  почерк записи операторов в тех объектах, где стоят суммы, — и разошёлся
+#  полностью: 0 таких строк в каждом оригинале против 102…247 в каждом
+#  результате. Однородный документ с маленькой группой строк чужого стиля,
+#  размер которой равен числу изменённых сумм, — это и есть след.
+#
+#  Обе функции ниже меняют ТОЛЬКО БАЙТЫ ЗАПИСИ, не геометрию: точность
+#  округления координаты прежняя (5 знаков), а пробел, перевод строки и их
+#  отсутствие — эквивалентные разделители токенов в content-стриме PDF.
+#  Поэтому критерий качества 2 (позиционирование) не затрагивается:
+#  check_column_alignment()/find_line_overlaps() видят те же координаты.
+#
+#  Halyk и Kaspi ИП импортируют их отсюда — тем же путём, что и уже общие
+#  build_dynamic_cmap()/_rebuild_xref_table().
+
+def _fmt_coord(value: float) -> str:
+    """
+    Записать координату так, как её пишет генератор оригинала: «42.5», «211»,
+    «219.31» — без незначащих нулей.
+
+    Прежний `f"{x:.5f}"` давал «42.50000», «211.00000» — признак 1 разбора
+    (163 таких числа в результате против 0 в оригинале). Точность не
+    уменьшаем: у оригинала тоже встречается 5 знаков («510.94995»), а
+    урезание разрядов сдвинуло бы сумму в колонке.
+    """
+    out = f"{value:.5f}"
+    if "." in out:
+        out = out.rstrip("0").rstrip(".")
+    # «-0» после обрезки нулей — сам по себе машинный артефакт, оригинал так
+    # не пишет; пустая строка невозможна, но обрабатывается как 0 для
+    # надёжности (её попадание в поток сломало бы оператор).
+    if out in ("", "-", "-0"):
+        out = "0"
+    return out
+
+
+# Разделители вокруг строки-аргумента последнего Tj в найденном токене:
+# (то, что стоит вплотную ПЕРЕД «<»/«(», то, что стоит между «>»/«)» и «Tj»).
+# Якорь на конец строки — в токене может быть несколько Tj подряд (подмена
+# шрифта на cert-странице), значимы разделители последнего.
+_OP_SEPARATORS_RE = re.compile(
+    rb"([ \t\r\n]*)(?:<[0-9A-Fa-f]*>|\([^)]*\))([ \t\r\n]*)Tj[ \t\r\n]*$"
+)
+
+
+def _op_separators(matched: bytes) -> Tuple[bytes, bytes]:
+    """
+    Достать из ОРИГИНАЛЬНОГО матча его собственные разделители, чтобы
+    переписанный токен лёг в том же почерке, что и весь остальной документ.
+
+    Так снимаются признаки 2 и 3 разбора сразу для всех форматов и без
+    хардкода «для gold — перевод строки, для Выписки — вплотную»: формат
+    gold_statement всегда пишет «Td\\n<hex> Tj» (писатель склеивал в одну
+    строку — 247 строк чужого стиля), формат «Выписка по счету» — «)Tj»
+    вплотную (писатель вставлял пробел — 104 строки). Правило «повторить то,
+    что было» верно для обоих и для форматов, которых мы ещё не видели.
+
+    Фолбэк — одиночный пробел, т.е. прежнее поведение: молча вернуть
+    сломанный разделитель хуже, чем вернуть прежний рабочий.
+    """
+    m = _OP_SEPARATORS_RE.search(matched)
+    if m is None:
+        return (b" ", b" ")
+    return (m.group(1), m.group(2))
 
 
 # ---------------------------------------------------------------------------
@@ -413,15 +487,38 @@ def format_amount(value: float, with_sign: bool = False, with_currency: bool = F
     return f"{prefix}{formatted}{suffix}"
 
 
-def _round_to_natural(val: float) -> float:
+
+# Кандидаты шага округления, крупнее → мельче. Каждый — точный делитель
+# следующего за ним (50|100|500|1000|5000|...), поэтому результат,
+# округлённый до ЛЮБОГО из них, всегда лежит и на базовой сетке по
+# величине (см. _round_to_natural ниже) — существующая проверка
+# `_round_to_natural(x) == x` в verify_gold_file.py не ломается.
+_NATURAL_STEP_CANDIDATES = (
+    1_000_000, 500_000, 100_000, 50_000, 10_000, 5_000, 1_000, 500, 100, 50,
+)
+
+
+def _round_to_natural(val: float, original: Optional[float] = None) -> float:
     """Округляет сумму до «человеческого» шага без лишних копеек.
 
     Зарплатные пополнения в Kaspi Gold всегда целые тенге (нет тиынов),
-    а последние 2-3 знака обычно круглые. Шаги:
+    а последние 2-3 знака обычно круглые. Базовые шаги (по величине val):
       ≥ 500 000 ₸ → кратно 1 000
       ≥  50 000 ₸ → кратно   500
       ≥  10 000 ₸ → кратно   100
              иначе → кратно    50
+
+    Если передан `original` (сумма ДО масштабирования) — шаг может стать
+    КРУПНЕЕ базового, если сам original уже был кратен более крупному
+    "человеческому" числу. Без этого умножение очень круглой суммы на
+    дробный коэффициент (напр. K≈2.33) даёт результат, формально попадающий
+    в базовый шаг по СВОЕЙ величине, но не похожий на реальный перевод:
+    найдено на реальном файле (2026-08-03) — 15 000 ₸ → 34 500 ₸,
+    3 000 ₸ → 7 150 ₸, 1 000 ₸ → 2 300 ₸ — все технически кратны базовому
+    шагу (100/50), но настоящие Kaspi P2P-переводы почти всегда кратны как
+    минимум 500-1000 ₸ независимо от суммы. С original=original шаг
+    подтягивается к его собственной "круглости" (1000 → минимум 1000,
+    5000 → минимум 5000 и т.д.), никогда не становясь МЕЛЬЧЕ базового.
     """
     if val >= 500_000:
         unit = 1_000
@@ -431,6 +528,15 @@ def _round_to_natural(val: float) -> float:
         unit = 100
     else:
         unit = 50
+
+    if original and original > 0:
+        for cand in _NATURAL_STEP_CANDIDATES:
+            if cand <= unit:
+                break
+            if original % cand < 0.01 or cand - (original % cand) < 0.01:
+                unit = cand
+                break
+
     return float(round(val / unit) * unit)
 
 
@@ -1089,12 +1195,16 @@ def first_negative_dayend(
 
 def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> StatementData:
     """
-    Пересчитывает выписку с помесячным выравниванием:
-    
+    Пересчитывает выписку с единым коэффициентом на весь период:
+
     1. Группирует SALARY транзакции (Пополнение) по месяцам
-    2. Для каждого месяца: K_month = target / month_salary_income
-    3. Применяет K_month × (1 ± ε) к каждой зарплатной транзакции
-    4. Масштабирует расходы (sign=-1) через K_exp = K^0.7 (закон Энгеля)
+    2. Единый K = target_monthly_income / текущий_ср._доход_мес, применяется
+       РАВНОМЕРНО ко всем месяцам — сохраняет естественную помесячную
+       неравномерность реального файла (не K_month = target/доход_месяца,
+       которое выравнивало бы каждый месяц к одной и той же сумме)
+    3. Применяет K × (1 ± ε) к каждой зарплатной транзакции
+    4. Расходы (sign=-1) НЕ масштабируются (K_exp = 1.0) — банк сверяет
+       расходные категории с собственной базой Kaspi
     5. Возвраты (is_refund=True, sign=+1) НЕ масштабируются
     6. Пересчитывает running balance по цепочке
     
@@ -1143,7 +1253,7 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
         global_K = 1.0
 
     print(f"\n{'═' * 60}")
-    print(f"  ДВИЖОК ПЕРЕСЧЁТА (помесячное выравнивание)")
+    print(f"  ДВИЖОК ПЕРЕСЧЁТА (единый K, разброс по месяцам сохраняется)")
     print(f"{'═' * 60}")
     print(f"  Текущий ср. зарплатный/мес: {current_monthly_avg:>14,.2f} ₸")
     print(f"  Целевой доход/мес:          {target_monthly_income:>14,.2f} ₸")
@@ -1153,24 +1263,29 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
     print(f"  Возвратов (не масштабируем): {len(refund_transactions)} (Σ={current_refund_total:,.2f} ₸)")
     print(f"{'═' * 60}")
     
-    # ── Помесячные K-коэффициенты ──
-    # Для каждого месяца: K_month = target / month_income
-    # Это выравнивает месяцы к одному уровню → высокий ISI
-    # Если global_K = 1.0 (цель ниже текущего), клипуем каждый месяц тоже до 1.0,
-    # чтобы не уменьшать высокие месяцы ниже оригинала.
-    _clip_k_to_one = (global_K <= 1.0)
-    print(f"\n  Помесячные коэффициенты:")
+    # ── Единый K на весь период (НЕ помесячный) ──
+    # РАНЬШЕ здесь считался K_month = target / month_income для КАЖДОГО
+    # месяца отдельно — это гарантированно выравнивало все месяцы к одному
+    # уровню (K_month × month_income == target для любого месяца), убивая
+    # естественную помесячную неравномерность реального файла: любая
+    # настоящая выписка «прыгает» по месяцам (где-то густо, где-то пусто), а
+    # плоское выравнивание превращало это в подозрительно одинаковую сумму
+    # каждый месяц — визуальный tell того же класса, что и «круглые/
+    # реалистичные цифры» (см. критерий 3 в CLAUDE.md). ISI в Kaspi Gold —
+    # мягкий сигнал (не блокирует passed, см. main._verify_pdf), поэтому
+    # здесь безопасно применять ОДИН и тот же K ко всем месяцам сразу:
+    # пропорции между месяцами остаются ТЕ ЖЕ, что и в реальном оригинале,
+    # просто равномерно масштабированные к целевому среднему. global_K уже
+    # заранее клипнут к минимуму 1.0 (см. выше), поэтому ни один месяц не
+    # может уменьшиться относительно оригинала при равномерном применении —
+    # старая помесячная защита _clip_k_to_one больше не нужна.
+    print(f"\n  Единый K на весь период: {global_K:.4f} (без помесячного выравнивания)")
     month_K: Dict[str, float] = {}
     for mk in sorted(monthly_income.keys()):
-        if mk == "unknown":
-            month_K[mk] = global_K
-            continue
-        mi = monthly_income[mk]
-        k = target_monthly_income / mi if mi > 0 else global_K
-        if _clip_k_to_one:
-            k = max(k, 1.0)
-        month_K[mk] = k
-        print(f"    {mk}: доход {mi:>14,.2f} → K = {k:.4f}")
+        month_K[mk] = global_K
+        if mk != "unknown":
+            mi = monthly_income[mk]
+            print(f"    {mk}: доход {mi:>14,.2f} → ×{global_K:.4f} ≈ {mi * global_K:>14,.2f}")
 
     # ── Расходы: НЕ масштабируем ──
     # Банк (Отбасы) верифицирует расходные категории с базой Kaspi.
@@ -1193,7 +1308,7 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
             mk = _get_month_key(tx.date) or "unknown"
             k = month_K.get(mk, global_K)
             epsilon = random.uniform(-0.03, 0.03)
-            tx.new_amount = _round_to_natural(tx.amount * k * (1 + epsilon))
+            tx.new_amount = _round_to_natural(tx.amount * k * (1 + epsilon), original=tx.amount)
         else:
             # Возвраты, расходы, non-salary income — без изменений
             tx.new_amount = tx.amount
@@ -1271,7 +1386,10 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
             # "232 682,62 ₸" — визуально выдаёт результат как посчитанный по
             # формуле, а не настоящую зарплатную проводку).
             for tx in targeted:
-                tx.new_amount = _round_to_natural(tx.new_amount * 1.05)
+                # original=tx.amount (истинный оригинал, не уже округлённый
+                # tx.new_amount с прошлой итерации) — иначе шаг «съезжает» с
+                # реальной круглости исходной суммы на каждой итерации ×1.05.
+                tx.new_amount = _round_to_natural(tx.new_amount * 1.05, original=tx.amount)
             # Guard от зависания: если минимум не улучшается — прекращаем.
             if prev_min is not None and min_rb <= prev_min + 0.01:
                 print(f"  ⚠️ Коррекция не сходится (мин застрял на {min_rb:,.2f} ₸) — стоп")
@@ -1440,6 +1558,118 @@ def recalculate_with_certificate(
     print(f"  └────────────────────────────────────────────────")
 
     return cert, stmt
+
+
+# Сколько раз перевыбрать шум пересчёта, пытаясь получить суммы справки без
+# отсутствующего глифа. Один пересчёт стоит 0.03-0.06 c (парсинг делается
+# один раз, дальше только deepcopy), так что даже полный перебор укладывается
+# в пару секунд. Замерено на реальном gold_6 (нет глифа «8»): доля «грязных»
+# попыток 42% при x1.05 и 100% при x2 — на больших суммах разрядов много и
+# восьмёрка почти всегда куда-нибудь попадает, поэтому лимит щедрый.
+_CERT_GLYPH_RETRIES = 60
+
+
+def _cert_page_missing_digits(doc) -> set:
+    """Цифры, которых нет в subset'е основного шрифта страницы справки.
+
+    Тот же способ определения, что и при поиске шрифта-заменителя в
+    process_pdf_bytes_raw (основной шрифт = с самой большой ToUnicode-картой),
+    но без побочных эффектов — нужен ДО пересчёта, чтобы успеть подобрать
+    сумму, в которой такой цифры нет.
+    """
+    try:
+        _p0 = doc.xref_object(doc.page_xref(0))
+        _rm = re.search(r"/Resources\s+(\d+)\s+0\s+R", _p0)
+        _res = doc.xref_object(int(_rm.group(1))) if _rm else _p0
+        _fm = re.search(r"/Font\s+(\d+)\s+0\s+R", _res)
+        if not _fm:
+            return set()
+        _fdict = doc.xref_object(int(_fm.group(1)))
+        _fonts = {n: int(x) for n, x in re.findall(r"/(\w+)\s+(\d+)\s+0\s+R", _fdict)}
+        if not _fonts:
+            return set()
+
+        def _chars(font_xref: int) -> set:
+            fo = doc.xref_object(font_xref)
+            mm = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", fo)
+            if not mm:
+                return set()
+            cm = _parse_cmap_stream(
+                doc.xref_stream(int(mm.group(1))).decode("latin-1", "ignore")
+            )
+            return set(cm.values())
+
+        prim = max(_fonts, key=lambda n: len(_chars(_fonts[n])))
+        have = _chars(_fonts[prim])
+        return {d for d in "0123456789" if d not in have}
+    except Exception as e:  # noqa: BLE001 — диагностика, не повод падать
+        print(f"[Cert] Не удалось определить недостающие цифры стр.0: {e}")
+        return set()
+
+
+def _recalc_cert_avoiding_missing_glyphs(
+    doc,
+    cert: CertificateData,
+    stmt: StatementData,
+    target_monthly_income: float,
+    recalc_fn=None,
+) -> Tuple[CertificateData, StatementData]:
+    """Пересчёт справки с подбором суммы, которую стр.0 умеет нарисовать.
+
+    Зачем. Если subset шрифта справки неполон (реальный случай: нет глифа
+    «8», потому что в оригинале справки восьмёрка нигде не встречалась), то
+    новую сумму с этой цифрой нечем набрать. Писатель умеет подмешать второй
+    шрифт документа, но такая подмена добавляет /F2 в /Resources стр.0 и
+    расщепляет один Tj на два — в оригинале страница ссылается на ОДИН шрифт,
+    в результате на два, и это ровно тот же класс следа, что признаки 1-3
+    (критерий 4 в CLAUDE.md).
+
+    Шум пересчёта (±3%) и так случаен, поэтому вместо подмены просто
+    перевыбираем его, пока все три суммы справки (₸/$/€) не окажутся из
+    доступных цифр. Каждая попытка — самостоятельный корректный пересчёт, ни
+    одна не «подгоняет» математику: меняется только то, какой из равноправных
+    вариантов шума взят.
+
+    Если за _CERT_GLYPH_RETRIES попыток чистого варианта нет (бывает: у
+    больших сумм разрядов столько, что нужная цифра почти неизбежна) —
+    возвращаем последний и оставляем работу подмене шрифта. Отказ был бы
+    хуже: файл корректен во всём остальном, а сумма без подмены отрисовалась
+    бы пустым квадратом.
+
+    Исключения движка (IncomeTooLowError, HeaderCellOverflowError) намеренно
+    не перехватываются: это отказы по существу цели, их не «переберёшь».
+    """
+    missing = _cert_page_missing_digits(doc)
+    if not missing:
+        return recalculate_with_certificate(
+            cert, stmt, target_monthly_income, recalc_fn=recalc_fn
+        )
+
+    print(f"[Cert] В шрифте стр.0 нет цифр {sorted(missing)} — "
+          f"подбираем сумму без них (до {_CERT_GLYPH_RETRIES} попыток)")
+
+    def _clean(c: CertificateData) -> bool:
+        for value in (c.new_balance_kzt, c.new_balance_usd, c.new_balance_eur):
+            if any(ch in missing for ch in format_amount(value)):
+                return False
+        return True
+
+    last: Optional[Tuple[CertificateData, StatementData]] = None
+    for attempt in range(1, _CERT_GLYPH_RETRIES + 1):
+        c_try = copy.deepcopy(cert)
+        s_try = copy.deepcopy(stmt)
+        c_try, s_try = recalculate_with_certificate(
+            c_try, s_try, target_monthly_income, recalc_fn=recalc_fn
+        )
+        last = (c_try, s_try)
+        if _clean(c_try):
+            print(f"[Cert] Подошла попытка {attempt}: "
+                  f"₸ {format_amount(c_try.new_balance_kzt)} — цифр {sorted(missing)} нет")
+            return c_try, s_try
+
+    print(f"[Cert] ⚠️ За {_CERT_GLYPH_RETRIES} попыток сумма без {sorted(missing)} "
+          f"не найдена — включится подмена шрифта (стр.0 получит второй /F)")
+    return last  # type: ignore[return-value]
 
 
 def build_income_replacement_entries(stmt: StatementData) -> Dict[str, Deque[Tuple[float, str]]]:
@@ -1909,7 +2139,9 @@ def process_pdf_bytes_raw(
         # recalc_fn прокидываем и сюда — иначе downscale-запросы (см.
         # pdf_service_downscale.process_downscale) на cert-формате всегда
         # прогонялись бы upscale-движком в обход своих floor-проверок.
-        cert, stmt = recalculate_with_certificate(cert, stmt, target_monthly_income, recalc_fn=recalc_fn)
+        cert, stmt = _recalc_cert_avoiding_missing_glyphs(
+            doc, cert, stmt, target_monthly_income, recalc_fn
+        )
     else:
         stmt = parse_full_statement(doc)
         stmt = recalc_fn(stmt, target_monthly_income)
@@ -2049,7 +2281,27 @@ def process_pdf_bytes_raw(
     cert_sub_font_name: Optional[bytes] = None   # напр. b"F2"
     cert_sub_font_xref: Optional[int] = None
     cert_sub_chars: set = set()
+    # Цифры, которых у основного шрифта стр.0 реально НЕТ. Подмена включается
+    # только для ячеек, где такая цифра действительно появилась: расщепление
+    # одного Tj на три (Tf/Tj/Tf/Tj/Tf) — это лишний токен и лишний шрифт в
+    # /Resources стр.0, то есть ровно тот же признак чужого почерка, что и
+    # признаки 1-3 (см. критерий 4 в CLAUDE.md). Раньше условием было «шрифт-
+    # заменитель покрывает всю строку», из-за чего расщеплялась КАЖДАЯ сумма на
+    # справке, даже если ни одной отсутствующей цифры в ней нет. Поймано
+    # батареей на реальных gold_6/gold5/gold7 (у них нет только глифа «8»):
+    # «) Tj» через пробел 11745 → 11746 на каждой цели.
+    cert_missing_digits: set = set()
+    # Карты «символ → CID» основного шрифта стр.0 и заменителя. Если для всех
+    # символов ячейки CID совпадают, всю её можно набрать ОДНИМ Tj шрифтом-
+    # заменителем вместо расщепления на два (префикс валюты прежним шрифтом +
+    # цифры заменителем). Байты строки при этом те же самые — расходится только
+    # имя шрифта, а лишнего Tj-токена не появляется.
+    cert_prim_inv: Dict[str, str] = {}
+    cert_sub_inv: Dict[str, str] = {}
     cert_page_font_dict_xref: Optional[int] = None
+    # Флаг «подмена реально применена» — список, чтобы писать из вложенных
+    # колбэков. По нему решается, дописывать ли /F2 в /Resources стр.0.
+    cert_sub_used = [False]
     if fmt == "cert":
         try:
             def _font_tounicode_cmap(font_xref: int) -> dict:
@@ -2094,6 +2346,9 @@ def process_pdf_bytes_raw(
                                 continue
                             cert_sub_font_xref = _cx
                             cert_sub_chars = set(_cm.values())
+                            cert_missing_digits = set(_missing)
+                            cert_prim_inv = dict(_prim_inv)
+                            cert_sub_inv = dict(_inv)
                             _i = 2
                             while f"F{_i}" in _page0_fonts:
                                 _i += 1
@@ -2103,6 +2358,29 @@ def process_pdf_bytes_raw(
         except Exception as _e:
             cert_sub_font_name = None
             print(f"[Cert] Поиск шрифта-заменителя не удался: {_e}")
+
+    def _cert_sub_covers_whole_cell(text: str) -> bool:
+        """Можно ли набрать ВСЮ ячейку одним Tj шрифтом-заменителем.
+
+        Требуется два условия: заменитель умеет рисовать каждый символ строки
+        (включая префикс валюты ₸/$/€ и пробелы) И для каждого общего символа
+        его CID совпадает с CID основного шрифта. Второе обязательно, потому
+        что hex строки собирается по карте основного шрифта (text_to_hex): при
+        расхождении CID тот же байт нарисовал бы в заменителе другой глиф.
+
+        Если условие держится, замена стоит документу ровно двух Tf-токенов и
+        не добавляет лишнего Tj — иначе один Tj пришлось бы расщепить на два,
+        и счётчик Tj разошёлся бы с оригиналом (критерий 4).
+        """
+        if not cert_sub_chars:
+            return False
+        for ch in text:
+            if ch not in cert_sub_chars:
+                return False
+            prim_cid = cert_prim_inv.get(ch)
+            if prim_cid is not None and cert_sub_inv.get(ch) != prim_cid:
+                return False
+        return True
 
     doc.close()
 
@@ -2518,23 +2796,54 @@ def process_pdf_bytes_raw(
             # сдвигается на ширину текста, поэтому второй Tj встаёт вплотную —
             # ширину префикса вычислять не нужно. В конце возвращаем прежний
             # шрифт, чтобы не сломать последующий текст на странице.
+            # Разделители берём из самого оригинала: этот формат разносит Td и
+            # Tj по разным строкам, и склейка их в одну была признаком 2
+            # форензик-разбора (247 строк чужого стиля на файл). См. _op_separators.
+            _so, _sc = _op_separators(match.group(0))
+
             if is_cert_stream and cert_sub_font_name is not None:
                 _amb, _amb_sz = _ambient_tf(decompressed, match.start())
                 # Цифровая часть + суффикс должны быть покрыты заменителем.
                 _rest_chars = formatted_num + suffix_text
-                if _amb is not None and all(c in cert_sub_chars for c in _rest_chars):
-                    _prefix_hex = "".join(hex_blocks[:first_digit])
-                    _rest_hex = new_num_hex + "".join(hex_blocks[last_digit + 1:])
+                _needs_sub = any(c in cert_missing_digits for c in _rest_chars)
+                if (_needs_sub and _amb is not None
+                        and _cert_sub_covers_whole_cell(new_text)):
+                    # Вся ячейка (включая префикс валюты) кодируется в
+                    # заменителе теми же CID — значит хватит ОДНОГО Tj, и
+                    # число Tj-токенов в документе не изменится. Расщепление
+                    # ниже оставлено фолбэком на случай, когда у заменителя
+                    # нет глифа валюты или его CID расходится с основным.
+                    cert_sub_used[0] = True
                     _sub = cert_sub_font_name.decode()
                     _an = _amb.decode()
                     _sz = _amb_sz.decode()
-                    _out = f"{new_x:.5f} {y_str} Td ".encode("ascii")
+                    return (
+                        f"{_fmt_coord(new_x)} {y_str} Td /{_sub} {_sz} Tf".encode("ascii")
+                        + _so + f"<{new_hex}>".encode("ascii") + _sc
+                        + f"Tj /{_an} {_sz} Tf".encode("ascii")
+                    )
+                if (_needs_sub and _amb is not None
+                        and all(c in cert_sub_chars for c in _rest_chars)):
+                    _prefix_hex = "".join(hex_blocks[:first_digit])
+                    _rest_hex = new_num_hex + "".join(hex_blocks[last_digit + 1:])
+                    cert_sub_used[0] = True
+                    _sub = cert_sub_font_name.decode()
+                    _an = _amb.decode()
+                    _sz = _amb_sz.decode()
+                    # Пробел после Td здесь обязателен: за ним идёт оператор
+                    # /Fx Tf, а не строка-аргумент. Почерк оригинала повторяем
+                    # там, где он и разошёлся — вокруг самих <hex> и Tj.
+                    _out = f"{_fmt_coord(new_x)} {y_str} Td ".encode("ascii")
                     if _prefix_hex:
-                        _out += f"/{_an} {_sz} Tf <{_prefix_hex}> Tj ".encode("ascii")
-                    _out += f"/{_sub} {_sz} Tf <{_rest_hex}> Tj /{_an} {_sz} Tf".encode("ascii")
+                        _out += (f"/{_an} {_sz} Tf".encode("ascii") + _so
+                                 + f"<{_prefix_hex}>".encode("ascii") + _sc + b"Tj ")
+                    _out += (f"/{_sub} {_sz} Tf".encode("ascii") + _so
+                             + f"<{_rest_hex}>".encode("ascii") + _sc
+                             + f"Tj /{_an} {_sz} Tf".encode("ascii"))
                     return _out
 
-            return f"{new_x:.5f} {y_str} Td <{new_hex}> Tj".encode("ascii")
+            return (f"{_fmt_coord(new_x)} {y_str} Td".encode("ascii") + _so
+                    + f"<{new_hex}>".encode("ascii") + _sc + b"Tj")
 
         new_decompressed = td_pattern.sub(replace_callback, decompressed)
 
@@ -2667,26 +2976,46 @@ def process_pdf_bytes_raw(
                 # шрифте стр.0 может не быть глифа '8'), префикс валюты — прежним
                 # шрифтом (в заменителе нет $/€). Второй Tj встаёт вплотную к
                 # первому (позиция сдвигается сама на ширину префикса).
+                # Разделители — из оригинала (признаки 2 и 3 разбора).
+                _so, _sc = _op_separators(m.group(0))
+
                 if cert_sub_font_name is not None:
                     _amb, _amb_sz = _ambient_tf(new_decompressed, m.start())
                     _rest_chars = formatted_num + suffix_p
-                    if _amb is not None and all(c in cert_sub_chars for c in _rest_chars):
+                    _needs_sub = any(c in cert_missing_digits for c in _rest_chars)
+                    if (_needs_sub and _amb is not None
+                            and _cert_sub_covers_whole_cell(new_text)):
+                        # Один Tj целиком заменителем — см. одноимённую ветку
+                        # в hex-писателе выше.
+                        cert_sub_used[0] = True
+                        _sub = cert_sub_font_name.decode()
+                        _an = _amb.decode()
+                        _sz = _amb_sz.decode()
+                        return (
+                            f"{_fmt_coord(new_x_paren)} {y_str2} Td /{_sub} {_sz} Tf".encode("ascii")
+                            + _so + b"(" + new_encoded + b")" + _sc
+                            + f"Tj /{_an} {_sz} Tf".encode("ascii")
+                        )
+                    if (_needs_sub and _amb is not None
+                            and all(c in cert_sub_chars for c in _rest_chars)):
+                        cert_sub_used[0] = True
                         _sub = cert_sub_font_name.decode()
                         _an = _amb.decode()
                         _sz = _amb_sz.decode()
                         _rest_bytes = new_num_encoded + suffix_raw
-                        _out = f"{new_x_paren:.5f} {y_str2} Td ".encode("ascii")
+                        _out = f"{_fmt_coord(new_x_paren)} {y_str2} Td ".encode("ascii")
                         if prefix_raw:
-                            _out += f"/{_an} {_sz} Tf (".encode("ascii") + _esc(prefix_raw) + b") Tj "
-                        _out += f"/{_sub} {_sz} Tf (".encode("ascii") + _esc(_rest_bytes) + b") Tj "
+                            _out += (f"/{_an} {_sz} Tf".encode("ascii") + _so
+                                     + b"(" + _esc(prefix_raw) + b")" + _sc + b"Tj ")
+                        _out += (f"/{_sub} {_sz} Tf".encode("ascii") + _so
+                                 + b"(" + _esc(_rest_bytes) + b")" + _sc + b"Tj ")
                         _out += f"/{_an} {_sz} Tf".encode("ascii")
                         return _out
 
                 # Заменяем только внутренность скобок
                 return (
-                    f"{new_x_paren:.5f} {y_str2} Td (".encode("ascii")
-                    + new_encoded
-                    + b") Tj"
+                    f"{_fmt_coord(new_x_paren)} {y_str2} Td".encode("ascii")
+                    + _so + b"(" + new_encoded + b")" + _sc + b"Tj"
                 )
 
             new_decompressed = paren_pat.sub(cert_paren_callback, new_decompressed)
@@ -2738,8 +3067,14 @@ def process_pdf_bytes_raw(
     # cert_sub_font_name), его имя обязано присутствовать в словаре /Font
     # страницы 0 — иначе оператор "/F2 .. Tf" ссылается на неизвестный ресурс.
     # Вставляем "/F2 <xref> 0 R" перед закрывающим ">>" словаря шрифтов стр.0.
+    # Гейт `cert_sub_used`: словарь шрифтов правится ТОЛЬКО если подмена
+    # действительно попала в поток. Раньше /F2 вписывался всегда, когда
+    # заменитель просто НАЙДЕН, — и стр.0 получала второй шрифт в /Resources
+    # даже там, где сумма прекрасно рисовалась основным. Для сравнения с
+    # оригиналом это такой же след, как лишний Tj (критерий 4): у оригинала
+    # страница ссылается на один шрифт.
     if (cert_sub_font_name is not None and cert_sub_font_xref is not None
-            and cert_page_font_dict_xref is not None):
+            and cert_page_font_dict_xref is not None and cert_sub_used[0]):
         _obj_pat = re.compile(rb"(?<![0-9])" + str(cert_page_font_dict_xref).encode() + rb"\s+0\s+obj")
         _om = _obj_pat.search(raw)
         if _om:

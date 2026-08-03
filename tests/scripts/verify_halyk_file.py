@@ -100,6 +100,50 @@ def _font_sizes(pdf_bytes: bytes) -> Counter:
     return sizes
 
 
+# ── Признаки стиля сериализации (форензик-разбор 02/08/2026) ──────────────
+# Копия проверки из verify_gold_file.py — по той же конвенции, что и
+# find_line_overlaps(): одна копия на формат. Оригинал однороден на 100%,
+# а писатель раньше оставлял группу строк чужого почерка ровно по числу
+# изменённых сумм. Подробности — в CLAUDE.md, признаки 1–3.
+_RE_REDUNDANT_ZEROS = re.compile(rb"(?<![\d.])\d+\.\d*0(?![\d])")
+_RE_TD_TJ_SAME_LINE = re.compile(rb"(?:Td|Tm)[^\r\n]*?Tj")
+_RE_PAREN_SPACE_TJ = re.compile(rb"\)[ \t]+Tj")
+_RE_PAREN_TIGHT_TJ = re.compile(rb"\)Tj")
+
+_STYLE_METRICS = {
+    "чисел с избыточными нулями": _RE_REDUNDANT_ZEROS,
+    "склеенных «Td … Tj»": _RE_TD_TJ_SAME_LINE,
+    "«) Tj» через пробел": _RE_PAREN_SPACE_TJ,
+    "«)Tj» вплотную": _RE_PAREN_TIGHT_TJ,
+}
+
+
+def _content_blob(pdf_bytes: bytes) -> bytes:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    parts = []
+    for xref in range(1, doc.xref_length()):
+        try:
+            data = doc.xref_stream(xref)
+        except Exception:
+            continue
+        if data and (b"Tj" in data or b"Td" in data or b"Tm" in data):
+            parts.append(data)
+    doc.close()
+    return b"\n".join(parts)
+
+
+def style_check(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Почерк записи операторов обязан совпасть с оригиналом ТОЧНО —
+    расхождение в любую сторону — след (см. verify_gold_file.py)."""
+    blob_o, blob_n = _content_blob(orig_bytes), _content_blob(out_bytes)
+    issues = []
+    for label, rx in _STYLE_METRICS.items():
+        n_o, n_n = len(rx.findall(blob_o)), len(rx.findall(blob_n))
+        if n_o != n_n:
+            issues.append(f"стиль сериализации: {label} — было {n_o}, стало {n_n}")
+    return issues
+
+
 def font_check(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
     """Шрифт результата не должен использовать новых имён и не должен быть
     ужат сильнее допустимого относительно базового кегля этого имени."""
@@ -169,7 +213,7 @@ def run_one(path: Path, multipliers: list[float], out_dir: Path, render: bool) -
 
         verify = hal.validate_halyk(out_bytes)
         math_ok = verify["passed"]
-        geo_issues = geometry_check(out_bytes)
+        geo_issues = geometry_check(out_bytes) + style_check(raw, out_bytes)
         geo_ok = len(geo_issues) == 0
         font_issues = font_check(raw, out_bytes)
         font_ok = len(font_issues) == 0

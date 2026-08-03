@@ -12,7 +12,13 @@ from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 
-from pdf_service import build_dynamic_cmap, _rebuild_xref_table, _round_to_natural
+from pdf_service import (
+    build_dynamic_cmap,
+    _rebuild_xref_table,
+    _round_to_natural,
+    _fmt_coord,
+    _op_separators,
+)
 from pdf_service_downscale import IncomeTooLowError
 
 # ─── Помощник: running balance на границах дней, не после каждой транзакции ──
@@ -1306,6 +1312,12 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
             # Кумулятивный абсолютный X (по оригинальным tx) — origin текущего токена.
             _abs_x_orig[0] += current_x
 
+            # Почерк оригинала: координата без хвостовых нулей и его же
+            # разделители вокруг <hex> и Tj — см. _fmt_coord/_op_separators
+            # в pdf_service.py и форензик-разбор 02/08/2026. Действует на все
+            # ветки возврата ниже.
+            _so, _sc = _op_separators(match.group(0))
+
             # Этот токен идёт сразу за числом, которое мы перенесли на новую строку
             # (см. wrap ниже) — ставим его на ту же новую строку вплотную за числом
             # (dy=0), а не уводим ниже его собственным Td-переносом. _line_shift уже
@@ -1314,9 +1326,10 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
                 dx = _absorb[0]
                 _absorb[0] = None
                 _pending_x_shift[0] = 0.0
+                _head = f"{_fmt_coord(dx)} 0 Td".encode("ascii")
                 if _inline_tf_raw:
-                    return f"{dx:.5f} 0 Td {_inline_tf_raw.decode('ascii').strip()} <{full_hex}> Tj".encode("ascii")
-                return f"{dx:.5f} 0 Td <{full_hex}> Tj".encode("ascii")
+                    _head += b" " + _inline_tf_raw.decode("ascii").strip().encode("ascii")
+                return _head + _so + f"<{full_hex}>".encode("ascii") + _sc + b"Tj"
 
             is_same_line = float(y_str) == 0.0
             if is_same_line:
@@ -1340,10 +1353,10 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
                     if is_same_line:
                         _line_shift[0] += x_adjust
                     use_hex = hex_override if hex_override is not None else full_hex
+                    _head = f"{_fmt_coord(current_x + x_adjust)} {y_str} Td".encode("ascii")
                     if _inline_tf_raw:
-                        _itf = _inline_tf_raw.decode("ascii").strip()
-                        return f"{current_x + x_adjust:.5f} {y_str} Td {_itf} <{use_hex}> Tj".encode("ascii")
-                    return f"{current_x + x_adjust:.5f} {y_str} Td <{use_hex}> Tj".encode("ascii")
+                        _head += b" " + _inline_tf_raw.decode("ascii").strip().encode("ascii")
+                    return _head + _so + f"<{use_hex}>".encode("ascii") + _sc + b"Tj"
                 return match.group(0)
 
             # Декодируем hex
@@ -1811,7 +1824,14 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
 
             # При переносе (wrap) у числа своя dy≠0 (уходит на строку ниже);
             # иначе — исходная dy строки/ячейки.
-            emit_dy = f"{_wrap_dy:.5f}" if _wrap_dy is not None else y_str
+            emit_dy = _fmt_coord(_wrap_dy) if _wrap_dy is not None else y_str
+
+            # Голова токена всегда «X Y Td [+ своя смена шрифта]»; хвост
+            # «<hex> Tj» приклеивается разделителями оригинала (_so/_sc), а не
+            # жёстким пробелом — иначе Td и Tj склеиваются в одну строку там,
+            # где документ их разносит (признак 2 форензик-разбора).
+            _head = f"{_fmt_coord(new_x)} {emit_dy} Td".encode("ascii")
+            _tail = _so + f"<{new_hex}>".encode("ascii") + _sc + b"Tj"
 
             if needs_switch:
                 # Bold-контекст: подменяем шрифт на Regular (у него есть глиф '4')
@@ -1819,24 +1839,26 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
                 # исходный Bold-кегль после.
                 _sw_size = f"{float(_ctx_fsize) * _font_scale:.3f}" if _font_scale < 1.0 else _ctx_fsize
                 return (
-                    f"{new_x:.5f} {emit_dy} Td /{regular_f_name} {_sw_size} Tf"
-                    f" <{new_hex}> Tj /{_ctx_fname} {_ctx_fsize} Tf"
-                ).encode("ascii")
+                    _head + f" /{regular_f_name} {_sw_size} Tf".encode("ascii")
+                    + _tail + f" /{_ctx_fname} {_ctx_fsize} Tf".encode("ascii")
+                )
             if _font_scale < 1.0 and _active_fsize and _active_fname:
                 # Ужимаем кегль числа, чтобы правый край влез в лист, и тут же
                 # восстанавливаем окружающий кегль (Tf действует до следующего Tf).
                 return (
-                    f"{new_x:.5f} {emit_dy} Td /{_active_fname} {_active_fsize * _font_scale:.3f} Tf"
-                    f" <{new_hex}> Tj /{_active_fname} {_active_fsize:g} Tf"
-                ).encode("ascii")
+                    _head
+                    + f" /{_active_fname} {_active_fsize * _font_scale:.3f} Tf".encode("ascii")
+                    + _tail
+                    + f" /{_active_fname} {_active_fsize:g} Tf".encode("ascii")
+                )
             if _inline_tf_raw:
                 # Сохраняем встроенную смену шрифта/кегля этого токена (см.
                 # _inline_fname выше) — иначе после замены он рисовался бы
                 # уже АМБИЕНТНЫМ шрифтом, действовавшим ДО этого Td, а не
                 # тем, что явно указан прямо в этом Tj-вызове.
                 _inline_tf_str = _inline_tf_raw.decode("ascii").strip()
-                return f"{new_x:.5f} {emit_dy} Td {_inline_tf_str} <{new_hex}> Tj".encode("ascii")
-            return f"{new_x:.5f} {emit_dy} Td <{new_hex}> Tj".encode("ascii")
+                return _head + b" " + _inline_tf_str.encode("ascii") + _tail
+            return _head + _tail
 
         new_decompressed = td_pattern.sub(replace_callback, decompressed)
 

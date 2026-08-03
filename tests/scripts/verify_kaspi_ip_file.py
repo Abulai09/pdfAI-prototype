@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -94,6 +95,50 @@ def header_matches_body(pdf_bytes: bytes) -> list[str]:
         issues.append(f"Кредит шапка/тело: {s.total_credit:,.2f} vs Σстрок {body_credit:,.2f} (Δ={s.total_credit-body_credit:+,.2f})")
     if abs(body_debit - s.total_debit) > 1.0:
         issues.append(f"Дебет шапка/тело: {s.total_debit:,.2f} vs Σстрок {body_debit:,.2f} (Δ={s.total_debit-body_debit:+,.2f})")
+    return issues
+
+
+# ── Признаки стиля сериализации (форензик-разбор 02/08/2026) ──────────────
+# Копия проверки из verify_gold_file.py — одна копия на формат, по той же
+# конвенции, что и find_line_overlaps(). Именно на этом формате был найден
+# признак 3: оригинал пишет «)Tj» вплотную (1669 раз, 0 исключений), а
+# писатель вставлял пробел ровно в 102–104 строках — по числу правок.
+_RE_REDUNDANT_ZEROS = re.compile(rb"(?<![\d.])\d+\.\d*0(?![\d])")
+_RE_TD_TJ_SAME_LINE = re.compile(rb"(?:Td|Tm)[^\r\n]*?Tj")
+_RE_PAREN_SPACE_TJ = re.compile(rb"\)[ \t]+Tj")
+_RE_PAREN_TIGHT_TJ = re.compile(rb"\)Tj")
+
+_STYLE_METRICS = {
+    "чисел с избыточными нулями": _RE_REDUNDANT_ZEROS,
+    "склеенных «Td … Tj»": _RE_TD_TJ_SAME_LINE,
+    "«) Tj» через пробел": _RE_PAREN_SPACE_TJ,
+    "«)Tj» вплотную": _RE_PAREN_TIGHT_TJ,
+}
+
+
+def _content_blob(pdf_bytes: bytes) -> bytes:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    parts = []
+    for xref in range(1, doc.xref_length()):
+        try:
+            data = doc.xref_stream(xref)
+        except Exception:
+            continue
+        if data and (b"Tj" in data or b"Td" in data or b"Tm" in data):
+            parts.append(data)
+    doc.close()
+    return b"\n".join(parts)
+
+
+def style_check(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Почерк записи операторов обязан совпасть с оригиналом ТОЧНО —
+    расхождение в любую сторону — след (см. verify_gold_file.py)."""
+    blob_o, blob_n = _content_blob(orig_bytes), _content_blob(out_bytes)
+    issues = []
+    for label, rx in _STYLE_METRICS.items():
+        n_o, n_n = len(rx.findall(blob_o)), len(rx.findall(blob_n))
+        if n_o != n_n:
+            issues.append(f"стиль сериализации: {label} — было {n_o}, стало {n_n}")
     return issues
 
 
@@ -163,7 +208,8 @@ def run_one(path: Path, multipliers: list[float], out_dir: Path, render: bool) -
         math_ok = len(math_issues) == 0
         hdr_issues = header_matches_body(out_bytes)
         hdr_ok = len(hdr_issues) == 0
-        geo_issues = geometry_check(out_bytes, sample_pages=[1, 2])
+        geo_issues = (geometry_check(out_bytes, sample_pages=[1, 2])
+                      + style_check(raw, out_bytes))
         geo_ok = len(geo_issues) == 0
 
         (out_dir / f"{path.stem}_{label}.pdf").write_bytes(out_bytes)

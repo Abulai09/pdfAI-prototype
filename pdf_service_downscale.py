@@ -238,17 +238,19 @@ def recalculate_statement_downscale(
     print(f"  Aggressive floor (30%):     {floor_aggressive:>14,.2f} ₸")
     print(f"{'═' * 60}")
 
-    # ── Помесячные K-коэффициенты ──
-    print(f"\n  Помесячные коэффициенты:")
+    # ── Единый K на весь период (НЕ помесячный) ──
+    # Раньше здесь считался K_month = target / доход_месяца для каждого
+    # месяца отдельно, что выравнивало все месяцы к одной и той же сумме —
+    # тот же баг, что и в pdf_service.recalculate_statement (см. CLAUDE.md,
+    # "Исправлено 2026-08-03"). Единый K сохраняет естественный помесячный
+    # разброс оригинала, только равномерно масштабированный к цели.
+    print(f"\n  Единый K на весь период: {global_K:.4f} (без помесячного выравнивания)")
     month_K: Dict[str, float] = {}
     for mk in sorted(monthly_income.keys()):
-        if mk == "unknown":
-            month_K[mk] = global_K
-            continue
-        mi = monthly_income[mk]
-        k = target_monthly_income / mi if mi > 0 else global_K
-        month_K[mk] = k
-        print(f"    {mk}: доход {mi:>14,.2f} → K = {k:.4f}")
+        month_K[mk] = global_K
+        if mk != "unknown":
+            mi = monthly_income[mk]
+            print(f"    {mk}: доход {mi:>14,.2f} → ×{global_K:.4f} ≈ {mi * global_K:>14,.2f}")
 
     # ── Расходы НЕ масштабируем ──
     print(f"\n  K_exp (расходы):  1.0000 (расходы НЕ масштабируются)")
@@ -260,7 +262,7 @@ def recalculate_statement_downscale(
             mk = _get_month_key(tx.date) or "unknown"
             k = month_K.get(mk, global_K)
             epsilon = random.uniform(-0.03, 0.03)
-            tx.new_amount = _round_to_natural(tx.amount * k * (1 + epsilon))
+            tx.new_amount = _round_to_natural(tx.amount * k * (1 + epsilon), original=tx.amount)
         else:
             tx.new_amount = tx.amount
 
@@ -288,7 +290,7 @@ def recalculate_statement_downscale(
                     # round(x, 2) после нескольких итераций ×1.02 оставляет
                     # произвольные копейки (тот же класс проблемы, что и в
                     # recalculate_statement's Шаг 3 — см. её комментарий).
-                    tx.new_amount = _round_to_natural(tx.new_amount * 1.02)
+                    tx.new_amount = _round_to_natural(tx.new_amount * 1.02, original=tx.amount)
             current_rb = stmt.balance_start
             for tx in reversed(stmt.transactions):
                 current_rb = round(current_rb + tx.sign * tx.new_amount, 2)

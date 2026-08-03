@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -222,6 +223,76 @@ def check_natural_rounding(out: "fitz.Document", start_page: int) -> list[str]:
     return issues
 
 
+# ── Признаки стиля сериализации (форензик-разбор 02/08/2026) ──────────────
+# Оригинал однороден на 100%: 0 чисел с избыточными нулями, 0 склеенных
+# «Td … Tj» в одну строку, единый способ примыкания Tj к строке-аргументу.
+# Писатель раньше добавлял группу строк чужого почерка, размер которой равен
+# числу изменённых сумм (102…247 на файл) — при полностью совпадающих
+# метаданных, датах, /ID и корректном xref это был единственный след.
+_RE_REDUNDANT_ZEROS = re.compile(rb"(?<![\d.])\d+\.\d*0(?![\d])")
+_RE_TD_TJ_SAME_LINE = re.compile(rb"(?:Td|Tm)[^\r\n]*?Tj")
+_RE_PAREN_SPACE_TJ = re.compile(rb"\)[ \t]+Tj")
+_RE_PAREN_TIGHT_TJ = re.compile(rb"\)Tj")
+
+_STYLE_METRICS = {
+    "чисел с избыточными нулями": _RE_REDUNDANT_ZEROS,
+    "склеенных «Td … Tj»": _RE_TD_TJ_SAME_LINE,
+    "«) Tj» через пробел": _RE_PAREN_SPACE_TJ,
+    "«)Tj» вплотную": _RE_PAREN_TIGHT_TJ,
+}
+
+
+def _content_blob(doc: "fitz.Document") -> bytes:
+    """Все распакованные content-стримы документа одним куском."""
+    parts = []
+    for xref in range(1, doc.xref_length()):
+        try:
+            data = doc.xref_stream(xref)
+        except Exception:
+            continue
+        if data and (b"Tj" in data or b"Td" in data or b"Tm" in data):
+            parts.append(data)
+    return b"\n".join(parts)
+
+
+def check_serialization_style(orig: "fitz.Document", out: "fitz.Document") -> list[str]:
+    """Почерк записи операторов обязан совпасть с оригиналом ТОЧНО.
+
+    Сравнение двустороннее, а не «не больше, чем было». Расхождение в любую
+    сторону — след: если формат, которого мы ещё не видели, сам пишет
+    координаты с фиксированной точностью («42.50000»), то компактная запись
+    _fmt_coord даст ровно такую же выделяющуюся группу строк, только
+    зеркальную. Такой файл должен упасть здесь громко, а не уехать заказчику.
+    """
+    blob_o, blob_n = _content_blob(orig), _content_blob(out)
+    issues = []
+    for label, rx in _STYLE_METRICS.items():
+        n_o, n_n = len(rx.findall(blob_o)), len(rx.findall(blob_n))
+        if n_o != n_n:
+            issues.append(f"стиль сериализации: {label} — было {n_o}, стало {n_n}")
+    return issues
+
+
+def _substitution_unavoidable(orig: "fitz.Document", out: "fitz.Document") -> bool:
+    """Пришлось ли подмешать второй шрифт на стр.0 по объективной причине.
+
+    Да — если в записанных суммах справки есть цифра, отсутствующая в subset'е
+    шрифта стр.0. Движок сперва пытается подобрать сумму без неё (перевыбор
+    шума пересчёта), и добирается сюда только когда такой суммы на этой цели
+    не существует — например, цифра стоит в старшем разряде.
+    """
+    try:
+        missing = p._cert_page_missing_digits(orig)
+        if not missing:
+            return False
+        cert = p.parse_certificate_page(out)
+        written = [p.format_amount(v) for v in
+                   (cert.balance_kzt, cert.balance_usd, cert.balance_eur)]
+        return any(ch in missing for t in written for ch in t)
+    except Exception:
+        return False
+
+
 def check_cert_left_alignment(doc: "fitz.Document", tolerance: float = 1.0) -> list[str]:
     """Сумма на cert-справке не должна уезжать левее заголовка своей колонки.
 
@@ -297,6 +368,18 @@ def geometry_check(pdf_bytes: bytes, orig_bytes: bytes) -> list[str]:
     issues.extend(check_column_alignment(orig, doc, start_page))
     issues.extend(check_fonts(orig, doc))
     issues.extend(check_natural_rounding(doc, start_page))
+
+    # Стиль сериализации. Единственное расхождение, которое здесь НЕ считается
+    # провалом, — лишний Tj от вынужденной подмены шрифта на стр.0: у части
+    # реальных справок subset шрифта неполон (нет глифа какой-то цифры), и если
+    # эта цифра стоит в старшем разряде, её не убрать перевыбором шума —
+    # порядок величины задан целью. Подробности и замеры: CLAUDE.md, критерий 4.
+    _style = check_serialization_style(orig, doc)
+    if _style and _substitution_unavoidable(orig, doc):
+        print("  [Cert] подмена шрифта вынужденная — расхождение стиля "
+              f"({'; '.join(_style)}) не считается провалом")
+        _style = []
+    issues.extend(_style)
     orig.close()
     doc.close()
     return issues

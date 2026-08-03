@@ -11,6 +11,8 @@ a = Analysis(
         ('pdf_service.py', '.'),
         ('pdf_service_downscale.py', '.'),
         ('business_pdf_service.py', '.'),
+        ('halyk_pdf_service.py', '.'),
+        ('kaspi_ip_pdf_service.py', '.'),
     ],
     hiddenimports=[
         'uvicorn.logging',

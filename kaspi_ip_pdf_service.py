@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
-from pdf_service import build_dynamic_cmap, _rebuild_xref_table
+from pdf_service import build_dynamic_cmap, _rebuild_xref_table, _fmt_coord, _op_separators
 from pdf_service_downscale import IncomeTooLowError
 
 # ─── Константы ─────────────────────────────────────────────────────────────
@@ -1272,11 +1272,17 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
 
             print(f"  [IP] стр.{_pg} {old_num.strip()!r} → {new_txt!r}")
             total_replaced += 1
+            # Разделитель перед Tj берём из оригинала: этот формат пишет
+            # «)Tj» вплотную, а писатель вставлял пробел — признак 3
+            # форензик-разбора (104 строки чужого стиля против 0 в оригинале).
+            # Переводы строк после Tm и Tf почерку оригинала уже отвечают
+            # (разбор их и не отметил), поэтому остаются как есть.
+            _so, _sc = _op_separators(match.group(0))
             return (
-                b"1 0 0 1 " + f"{new_x:.5f}".encode("ascii") +
+                b"1 0 0 1 " + _fmt_coord(new_x).encode("ascii") +
                 b" " + y_str.encode("ascii") + b" Tm\n" +
-                font_bytes + b"\n" +
-                b"(" + new_bytes + b") Tj"
+                font_bytes + _so +
+                b"(" + new_bytes + b")" + _sc + b"Tj"
             )
 
         new_decompressed = tm_pat.sub(replace_tm, decompressed)
