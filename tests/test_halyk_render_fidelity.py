@@ -132,7 +132,14 @@ class TestBoldRowUniform:
         for path in HALYK_FILES:
             for mult, raw, out in _outputs(path):
                 issues = _quiet(vhal.check_bold_row_uniform, raw, out)
-                hard = [i for i in issues if not i.startswith("[guard]")]
+                # «[glyph-patched]» (Task 5) — не провал, а информационная
+                # пометка о том, что недостающие глифы были физически вшиты
+                # в Bold-subset и подмена шрифта не потребовалась вовсе;
+                # `verify_halyk_file.py` фильтрует её тем же способом.
+                hard = [
+                    i for i in issues
+                    if not i.startswith("[guard]") and not i.startswith("[glyph-patched]")
+                ]
                 assert not hard, f"{path.name} x{mult}: {hard}"
 
     @requires_corpus

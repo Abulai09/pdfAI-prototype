@@ -1060,14 +1060,22 @@ def _try_patch_bold_digit_glyphs(
 
 # ─── Сырая замена байт ─────────────────────────────────────────────────────
 
-def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) -> Tuple[bytes, int]:
-    """Один проход обработки. Возвращает (результат, число подмен шрифта).
+def _process_halyk_pdf_once(
+    input_bytes: bytes, target_monthly_income: float
+) -> Tuple[bytes, int, Dict[int, Dict[str, float]]]:
+    """Один проход обработки. Возвращает (результат, число подмен шрифта,
+    вшитые глифы).
 
     Второй элемент — сколько раз пришлось нарисовать число ЧУЖИМ (Regular)
     шрифтом вместо жирного, потому что в жирном subset'е не оказалось нужного
     глифа (см. `needs_switch` ниже). Вызывающая обёртка `process_halyk_pdf`
     использует его, чтобы перебрать шум и по возможности получить результат
     вообще без подмен.
+
+    Третий элемент — {cid_xref: {cid_hex: width}} для Bold-шрифтов, в которые
+    реально были вшиты недостающие глифы цифр в этом прогоне (Task 3/4) —
+    используется только для отчётности автотестов (LAST_RUN_INFO), не
+    прод-логикой.
     """
     from collections import deque as _deque
 
@@ -2272,7 +2280,7 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
     if cumulative_offset != 0 or _newly_available_cids:
         result = _rebuild_xref_table(result)
 
-    return result, font_substitutions
+    return result, font_substitutions, _newly_available_cids
 
 
 # Сколько раз перебрать ±3% шум, пытаясь получить итоги без «недостающих» цифр.
@@ -2326,21 +2334,23 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
     файла из-за этого было бы хуже: всё остальное в нём корректно.
     """
     LAST_RUN_INFO.clear()
-    result, subs = _process_halyk_pdf_once(input_bytes, target_monthly_income)
+    result, subs, glyphs_patched = _process_halyk_pdf_once(input_bytes, target_monthly_income)
     attempts = 1
     if subs == 0:
-        LAST_RUN_INFO.update(attempts=1, min_substitutions=0, unavoidable=False)
+        LAST_RUN_INFO.update(attempts=1, min_substitutions=0, unavoidable=False,
+                              glyphs_patched=glyphs_patched)
         return result
     for attempt in range(2, _BOLD_GLYPH_RETRIES + 1):
-        cand, cand_subs = _process_halyk_pdf_once(input_bytes, target_monthly_income)
+        cand, cand_subs, cand_glyphs_patched = _process_halyk_pdf_once(input_bytes, target_monthly_income)
         attempts = attempt
         if cand_subs == 0:
             print(f"[Halyk] Подмена шрифта в строке итогов не понадобилась "
                   f"(попытка {attempt} из {_BOLD_GLYPH_RETRIES})")
-            LAST_RUN_INFO.update(attempts=attempt, min_substitutions=0, unavoidable=False)
+            LAST_RUN_INFO.update(attempts=attempt, min_substitutions=0, unavoidable=False,
+                                  glyphs_patched=cand_glyphs_patched)
             return cand
         if cand_subs < subs:
-            result, subs = cand, cand_subs
+            result, subs, glyphs_patched = cand, cand_subs, cand_glyphs_patched
     # Ни одна из попыток не дала чистого варианта — это и есть ДОКАЗАТЕЛЬСТВО
     # неизбежности, полученное измерением, а не рассуждением «в числе есть
     # недостающая цифра» (последнее верно всегда и потому ничего не значит).
@@ -2359,6 +2369,7 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
         attempts=attempts,
         min_substitutions=subs,
         unavoidable=attempts >= _MIN_ATTEMPTS_TO_PROVE,
+        glyphs_patched=glyphs_patched,
     )
     print(f"[Halyk] ⚠️ Не удалось избежать подмены шрифта за {_BOLD_GLYPH_RETRIES} "
           f"попыток: осталось {subs} — в жирном subset'е нет нужных цифр, и "
