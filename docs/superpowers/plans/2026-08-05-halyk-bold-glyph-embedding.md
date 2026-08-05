@@ -435,10 +435,27 @@ print('OK, numGlyphs=', tt2['maxp'].numGlyphs)
 ```
 Expected: `OK, numGlyphs= 4101` без исключений (уже проверено при подготовке этого плана — должно воспроизвестись один в один).
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Добавить `fonttools` в `requirements-dev.txt`**
+
+Текущее содержимое `requirements-dev.txt`:
+```
+-r requirements.txt
+pytest>=8.0.0
+```
+
+Добавить третью строку:
+```
+-r requirements.txt
+pytest>=8.0.0
+fonttools>=4.63.0
+```
+
+(`fonttools` уже установлен в этом окружении командой `pip install fonttools` при подготовке плана — версия 4.63.0. Используется только тестами этого и последующих задач, не рантайм-кодом.)
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add pdf_service.py tests/test_truetype_glyph_patch.py
+git add pdf_service.py tests/test_truetype_glyph_patch.py requirements-dev.txt
 git commit -m "feat(halyk): add low-level TrueType glyf/loca patcher (no fontTools at runtime)"
 ```
 
