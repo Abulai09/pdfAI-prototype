@@ -5,6 +5,7 @@ import re
 import zlib
 import random
 import math
+import struct
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,8 +19,11 @@ from pdf_service import (
     _round_to_natural,
     _fmt_coord,
     _op_separators,
+    _read_truetype_glyph,
+    _patch_truetype_glyphs,
 )
 from pdf_service_downscale import IncomeTooLowError
+from halyk_bold_digits import DIGIT_GLYPHS, DIGIT_WIDTH_1000, SOURCE_UNITS_PER_EM
 
 # ─── Помощник: running balance на границах дней, не после каждой транзакции ──
 
@@ -974,6 +978,85 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
     print(f"[Halyk] Кіріс қалдығы: {stmt.opening_balance:,.2f} → {stmt.new_opening_balance:,.2f}")
     print(f"[Halyk] Шығыс қалдығы: {stmt.closing_balance:,.2f} → {stmt.new_closing_balance:,.2f}")
     return stmt
+
+
+# ─── Вшивание недостающих глифов цифр в Bold-subset шрифт ──────────────────
+# См. docs/superpowers/specs/2026-08-05-halyk-bold-glyph-embedding-design.md.
+# Заменяет собой (частично) необходимость подмены Bold->Regular в
+# replace_callback ниже: если патч удаётся, avail_cids_map после него уже
+# содержит нужный CID, и needs_switch там просто не сработает — остальной
+# код (needs_switch, retry-перебор шума, [guard]-репортинг) не меняется и
+# остаётся страховкой на случай отказа gate'а.
+
+
+def _try_patch_bold_digit_glyphs(
+    ff2_bytes: bytes,
+    digit_cids: Dict[str, str],
+) -> Optional[Tuple[bytes, Dict[str, float]]]:
+    """Пытается вписать в Bold-subset шрифт недостающие глифы цифр 0-9.
+
+    digit_cids — {цифра: CID в виде 4-символьного hex}, тот же формат, что
+    ключи avail_cids_map (обычно {'0': '0013', ..., '9': '001C'}, но
+    вычисляется вызывающей стороной из FROM_UNICODE, а не жёстко здесь).
+
+    Возвращает (новые байты FontFile2, {cid_hex: 500.0}) для реально
+    допатченных цифр, либо None — если патчить нечего, или "gate" не
+    позволяет доверять зашитым эталонным глифам для ЭТОГО конкретного
+    файла (см. ниже). None означает «ничего не меняли», вызывающая сторона
+    не отклоняется от старого поведения.
+    """
+    try:
+        # unitsPerEm — сверяем через head-таблицу тем же способом, что и
+        # низкоуровневые функции (переиспользуем их разбор directory).
+        num_tables = struct.unpack(">H", ff2_bytes[4:6])[0]
+        head_offset = None
+        for i in range(num_tables):
+            off = 12 + i * 16
+            tag, _cs, offset, _length = struct.unpack(">4sLLL", ff2_bytes[off:off + 16])
+            if tag == b"head":
+                head_offset = offset
+                break
+        if head_offset is None:
+            return None
+        units_per_em = struct.unpack(">H", ff2_bytes[head_offset + 18:head_offset + 20])[0]
+        if units_per_em != SOURCE_UNITS_PER_EM:
+            return None
+
+        missing_digits = []
+        verified_match = False
+
+        for digit in "0123456789":
+            cid_hex = digit_cids.get(digit)
+            if cid_hex is None:
+                continue
+            gid = int(cid_hex, 16)
+            existing = _read_truetype_glyph(ff2_bytes, gid)
+            baked = DIGIT_GLYPHS[digit]
+            if existing == b"":
+                missing_digits.append(digit)
+                continue
+            # Present digit — сверяем с эталоном как gate ("сначала проверь,
+            # потом доверяй"): existing может быть на 1 байт длиннее (паддинг
+            # до чётной длины внутри glyf-таблицы), поэтому сравниваем по
+            # префиксу и требуем, чтобы хвост был нулевым, а не точное
+            # совпадение длины.
+            n = len(baked)
+            if existing[:n] == baked and all(b == 0 for b in existing[n:]):
+                verified_match = True
+            else:
+                return None  # другой мастер-шрифт — не доверяем НИЧЕМУ
+
+        if not verified_match or not missing_digits:
+            return None
+
+        glyph_patches = {int(digit_cids[d], 16): DIGIT_GLYPHS[d] for d in missing_digits}
+        patched = _patch_truetype_glyphs(ff2_bytes, glyph_patches)
+        added_widths = {digit_cids[d]: DIGIT_WIDTH_1000 for d in missing_digits}
+        return patched, added_widths
+    except Exception as exc:  # noqa: BLE001 — любой сбой здесь ЧИСТО fallback, не проброс
+        print(f"[Halyk] Патч глифов Bold не применён ({exc.__class__.__name__}: {exc}) "
+              f"— используется старое поведение (подмена шрифта/перебор шума).")
+        return None
 
 
 # ─── Сырая замена байт ─────────────────────────────────────────────────────
