@@ -17,7 +17,8 @@ import traceback
 import webbrowser
 
 # ── Пути ──────────────────────────────────────────────────────────
-# PyInstaller помещает бандл в _MEIPASS; при обычном запуске
+# PyInstaller помещает банд
+# л в _MEIPASS; при обычном запуске
 # используем директорию скрипта.
 EXE_DIR = os.path.dirname(sys.executable)
 BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))

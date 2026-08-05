@@ -611,9 +611,11 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
     """
     Масштабирует зарплатные поступления до target_monthly_income.
 
-    Для каждого месяца вычисляет K = target / month_salary.
-    Судебные изъятия («Оплата картотеки») того же дня масштабируются
-    пропорционально тому же коэффициенту.
+    Единый K на весь период (global_K) с адаптивным коридором вокруг него —
+    НЕ чистое помесячное K_month = target/доход_месяца (см. комментарий
+    ниже, у блока "K-коэффициент на месяц"). Судебные изъятия («Оплата
+    картотеки») того же дня масштабируются пропорционально тому же
+    коэффициенту.
     """
     # ── Контракт: new_* ВСЕГДА осмысленны, «ничего не менять» = копия оригинала.
     # Поля new_kiri_s/new_shyghys имеют дефолт 0.0, а писатель ставит ячейку в
@@ -655,8 +657,8 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
         for tx in stmt.transactions if tx.is_salary and tx.kiri_s > 0
     )
 
-    def _realistic_round(val: float) -> float:
-        return round(val, 2) if _salary_has_cents else _round_to_natural(val)
+    def _realistic_round(val: float, original: Optional[float] = None) -> float:
+        return round(val, 2) if _salary_has_cents else _round_to_natural(val, original=original)
 
     if not month_salary:
         # Возвращать выписку без изменений нельзя: снаружи это неотличимо от
@@ -726,13 +728,66 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
                 ),
             )
 
-    # K-коэффициент на месяц
+    # K-коэффициент на месяц — адаптивный коридор вокруг единого global_K,
+    # НЕ чистое помесячное K_month = target/доход_месяца (как было раньше).
+    # Чистое помесячное K гарантированно выравнивает каждый месяц ровно к
+    # target — тот же баг, что был в Kaspi Gold (см. CLAUDE.md, "Исправлено
+    # 2026-08-03: помесячное выравнивание убивало естественный разброс
+    # дохода") — но здесь ISI ЖЁСТКАЯ проверка (validate_halyk, порог 0.75,
+    # выше чем 0.60 у Kaspi ИП), и чистый единый K (без коридора вообще)
+    # рискует не пройти её на выписке с большим естественным разбросом —
+    # именно это и произошло у Kaspi ИП на реальном файле (ISI упал до
+    # 0.1987 при чистом едином K). Вместо жёстко подобранной константы вроде
+    # _MAX_MONTH_K_SPREAD=3.5 в kaspi_ip_pdf_service (откалибрована на ОДНОМ
+    # конкретном файле) — здесь коридор подбирается АДАПТИВНО под каждую
+    # конкретную выписку: пробуем от минимального выравнивания (spread=1.0,
+    # чистый global_K, максимум реализма) и расширяем его, пока прогнозный
+    # ISI (без шума ±3%, только по помесячным суммам) не пройдёт порог с
+    # запасом. Гарантированно сходится: при очень большом spread коридор
+    # перестаёт что-либо ограничивать → чистое помесячное выравнивание, тот
+    # же ISI≈1, что и в старом поведении.
+    # НЕ проверено на реальном Halyk-файле (в этом чекауте фикстур нет,
+    # tests/fixtures/ гитигнорено) — при появлении реального файла прогнать
+    # validate_halyk и, если фактический ISI после шума ближе к порогу, чем
+    # прогноз, увеличить _ISI_SAFETY_MARGIN.
+    _ISI_TARGET = 0.75
+    _ISI_SAFETY_MARGIN = 0.03
+    _SPREAD_CANDIDATES = (1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 10.0, 20.0, 50.0, 1e6)
+
+    def _predicted_isi(spread: float) -> float:
+        vals = []
+        for mk, total in month_salary.items():
+            if total <= 0:
+                vals.append(target_monthly_income)
+                continue
+            raw_k = target_monthly_income / total
+            lo, hi = global_K / spread, global_K * spread
+            vals.append(total * max(lo, min(hi, raw_k)))
+        mu = sum(vals) / len(vals)
+        if mu <= 0:
+            return 1.0
+        sigma = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5
+        return max(0.0, 1.0 - sigma / mu)
+
+    global_K = target_monthly_income / current_monthly_avg
+    chosen_spread = _SPREAD_CANDIDATES[-1]
+    for _s in _SPREAD_CANDIDATES:
+        if _predicted_isi(_s) >= _ISI_TARGET + _ISI_SAFETY_MARGIN:
+            chosen_spread = _s
+            break
+    print(
+        f"[Halyk] Коридор K: global_K={global_K:.4f}, подобран spread=±{chosen_spread:g} "
+        f"(прогноз ISI={_predicted_isi(chosen_spread):.4f}, порог {_ISI_TARGET})"
+    )
+
     month_k: Dict[str, float] = {}
     for month_key, total in month_salary.items():
         if total > 0:
-            month_k[month_key] = target_monthly_income / total
+            raw_k = target_monthly_income / total
+            lo, hi = global_K / chosen_spread, global_K * chosen_spread
+            month_k[month_key] = max(lo, min(hi, raw_k))
         else:
-            month_k[month_key] = 1.0
+            month_k[month_key] = global_K
 
     print("[Halyk] Коэффициенты по месяцам:")
     for m, k in sorted(month_k.items()):
@@ -746,7 +801,7 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
             month_key = tx.op_date[3:]
             k = month_k.get(month_key, 1.0)
             noise = random.uniform(-_NOISE, _NOISE)
-            new_val = _realistic_round(tx.kiri_s * k * (1 + noise))
+            new_val = _realistic_round(tx.kiri_s * k * (1 + noise), original=tx.kiri_s)
             tx.new_kiri_s = new_val
             date_k[tx.op_date] = k  # последний K для этой даты
             print(f"  [SAL] {tx.op_date} {tx.kiri_s:,.2f} → {new_val:,.2f} (K={k:.4f})")
@@ -757,7 +812,7 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
         if tx.is_seizure and tx.shyghys < 0:
             k = date_k.get(tx.op_date, month_k.get(tx.op_date[3:], 1.0))
             noise = random.uniform(-_NOISE, _NOISE)
-            new_val = -_realistic_round(abs(tx.shyghys) * k * (1 + noise))
+            new_val = -_realistic_round(abs(tx.shyghys) * k * (1 + noise), original=abs(tx.shyghys))
             tx.new_shyghys = new_val
             print(f"  [SEIZ] {tx.op_date} {tx.shyghys:,.2f} → {new_val:,.2f} (K={k:.4f})")
         elif (
@@ -866,7 +921,11 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
         for attempt in range(5):
             for tx in stmt.transactions:
                 if tx.is_salary and tx.kiri_s > 0:
-                    tx.new_kiri_s = _realistic_round(tx.new_kiri_s * 1.02)
+                    # original=tx.kiri_s (истинный оригинал) — не уже
+                    # округлённый tx.new_kiri_s с прошлой итерации, иначе
+                    # шаг «сползал» бы с реальной круглости на каждой
+                    # итерации ×1.02 (тот же класс фикса, что в Kaspi Gold).
+                    tx.new_kiri_s = _realistic_round(tx.new_kiri_s * 1.02, original=tx.kiri_s)
             min_rb = _min_running_balance(use_scaled=True)
             if min_rb >= -1.0:
                 print(f"[Halyk] ✅ Скорректировано за {attempt + 1} итераций, min_rb={min_rb:,.2f}")
@@ -919,12 +978,14 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
 
 # ─── Сырая замена байт ─────────────────────────────────────────────────────
 
-def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes:
-    """
-    Обрабатывает Halyk PDF напрямую на уровне raw bytes.
+def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) -> Tuple[bytes, int]:
+    """Один проход обработки. Возвращает (результат, число подмен шрифта).
 
-    Использует тот же механизм hex-замены (<XXXX>Tj), что и process_pdf_bytes_raw,
-    но адаптирован под структуру выписки Halyk Bank.
+    Второй элемент — сколько раз пришлось нарисовать число ЧУЖИМ (Regular)
+    шрифтом вместо жирного, потому что в жирном subset'е не оказалось нужного
+    глифа (см. `needs_switch` ниже). Вызывающая обёртка `process_halyk_pdf`
+    использует его, чтобы перебрать шум и по возможности получить результат
+    вообще без подмен.
     """
     from collections import deque as _deque
 
@@ -1157,6 +1218,7 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
     # ── Обработка raw bytes ───────────────────────────────────────────────
     raw = bytearray(input_bytes)
     total_replaced = 0
+    font_substitutions = 0
     cumulative_offset = 0
 
     all_content_xrefs: set = set()
@@ -1278,7 +1340,7 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
         _absorb = [None]
 
         def replace_callback(match):
-            nonlocal total_replaced
+            nonlocal total_replaced, font_substitutions
             x_str = match.group(1).decode("ascii")
             y_str = match.group(2).decode("ascii")
             _inline_tf_raw = match.group(3)  # b"/F0 8 Tf " или None
@@ -1596,8 +1658,18 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
                         w += 4.0 / 3.0
                 return w
             width_delta = _hw(formatted_num) - _hw(old_num_text)
-            # Масштаб шрифта этого токена — 1.0 (не ужимаем). Ужатие — лишь
-            # запасной вариант, если число выезжает за край и перенести некуда.
+            # Кегль числа НИКОГДА не меняется — всегда 1.0.
+            #
+            # Раньше при нехватке места кегль ужимался (до 0.6, а в ветке
+            # центрирования до `_MIN_FONT_SCALE`). Замер на всех 6 реальных
+            # файлах (2026-08-04): каждый оригинал верстает документ РОВНО
+            # одним кеглем 8.0 pt без единого исключения (718/4207/1249/…
+            # фрагментов), а в результатах появлялись одиночные 7.425/7.504/
+            # 7.866/7.962 — то есть на весь документ несколько чисел набраны
+            # заметно мельче соседей. Это самостоятельный признак правки, и
+            # человеку он виден лучше, чем небольшой перехлёст числа в
+            # соседнюю колонку. Ровно этот же вывод уже зафиксирован в
+            # process_kaspi_ip_pdf («Кегль (Tf) здесь больше не трогаем»).
             _font_scale = 1.0
             # Перенос числа на следующую строку (dy≠0): выставляются, если число
             # не влезает по ширине и следующий токен — перенос строки (см. ниже).
@@ -1681,12 +1753,13 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
                         # advance box, реальные чернила глифа (особенно запятой/
                         # последней цифры) визуально съедают часть отступа; без
                         # запаса число упирается прямо в линию колонки.
+                        # Раньше здесь кегль ужимался под ширину колонки. Больше
+                        # не ужимаем — см. пояснение у `_font_scale = 1.0` выше:
+                        # уменьшенный кегль сам по себе признак правки.
                         _col_gap = 2.0 * _active_fsize
                         _col_max_right = _next_abs_x - _col_gap
                         _col_avail = _col_max_right - emitted_left
                         _col_num_w = _hw(formatted_num)
-                        if _col_avail > 0 and _col_num_w > _col_avail:
-                            _font_scale = max(0.6, min(1.0, _col_avail / _col_num_w))
 
                     if not _next_is_row_cell and emitted_left + new_num_w > max_right and new_num_w > 0:
                         _can_wrap = (
@@ -1712,12 +1785,10 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
                             _absorb[0] = new_num_w + gap
                             _line_shift[0] = new_num_w + gap
                             _pending_x_shift[0] = 0.0
-                        else:
-                            # Перенести некуда (число не в конце визуальной строки)
-                            # — как запасной вариант ужимаем кегль под ширину листа.
-                            avail = max_right - emitted_left
-                            if avail > 0:
-                                _font_scale = max(0.6, min(1.0, avail / new_num_w))
+                        # Перенести некуда (число не в конце визуальной строки) —
+                        # раньше здесь ужимался кегль под ширину листа. Больше
+                        # не ужимаем: небольшой перехлёст правой кромки менее
+                        # заметен, чем единственная строка другим кеглем.
             else:
                 # Токен на СОБСТВЕННОЙ (dy≠0) позиции. Тут два разных случая,
                 # которые надо различать — иначе широкое число уедет не туда:
@@ -1763,16 +1834,11 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
                     _sib_gap = 0.30 * _active_fsize
                     _pending_x_shift[0] = (_hw(formatted_num) + _sib_gap) - _sib_orig_dx
                 else:
-                    # (A) Ячейка таблицы — ЦЕНТРИРОВАНИЕ. Если новое число
-                    # заметно шире старого, симметричное центрирование
-                    # выталкивает его за обе границы узкой колонки
-                    # (см. _COLUMN_SAFETY_RATIO) — вместо наезда на соседние
-                    # колонки ужимаем кегль, сохраняя центр на месте.
-                    if _active_fsize and _old_half > 0:
-                        _safe_half = _old_half * _COLUMN_SAFETY_RATIO
-                        if _new_half > _safe_half:
-                            _font_scale = max(_MIN_FONT_SCALE, min(1.0, _safe_half / _new_half))
-                            _new_half = _new_half * _font_scale
+                    # (A) Ячейка таблицы — ЦЕНТРИРОВАНИЕ. Раньше широкое число
+                    # ужималось по кеглю, чтобы вписаться в узкую колонку
+                    # (_COLUMN_SAFETY_RATIO). Больше не ужимаем — центр
+                    # сохраняется, а перехлёст в соседнюю колонку принимается
+                    # как меньшее зло (см. `_font_scale = 1.0` выше).
                     new_x = current_x + x_adjust + _old_half - _new_half
                     # Правый край числа сдвигается на разницу новой и старой
                     # половины ширины (учитывает и центрирование, и ужатие кегля).
@@ -1834,6 +1900,7 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
             _tail = _so + f"<{new_hex}>".encode("ascii") + _sc + b"Tj"
 
             if needs_switch:
+                font_substitutions += 1
                 # Bold-контекст: подменяем шрифт на Regular (у него есть глиф '4')
                 # и, если нужно, ужимаем кегль под ширину листа, восстанавливая
                 # исходный Bold-кегль после.
@@ -1891,6 +1958,97 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
     if cumulative_offset != 0:
         result = _rebuild_xref_table(result)
 
+    return result, font_substitutions
+
+
+# Сколько раз перебрать ±3% шум, пытаясь получить итоги без «недостающих» цифр.
+# Один проход стоит 0.02–0.14 с на затронутых файлах (замер 2026-08-04:
+# h6 0.050, HALYKformat1 0.068, HALYKformat3 0.111, hformat5 0.139 с), то есть
+# худший случай перебора — около 3 с и только там, где он реально нужен.
+_BOLD_GLYPH_RETRIES = 24
+
+# Диагностика ПОСЛЕДНЕГО вызова process_halyk_pdf в этом процессе. Нужна
+# автотестам, чтобы отличить «перебор не справился, потому что задача
+# неразрешима» от «перебор сломался»: из одних только байт результата эти два
+# случая неразличимы, а разница принципиальная. Заполняется всегда, читается
+# только проверками (`verify_halyk_file.check_bold_row_uniform`); прод-логика
+# на неё не опирается и опираться не должна — это не потокобезопасное
+# состояние, а сведения о последнем прогоне.
+LAST_RUN_INFO: Dict[str, object] = {}
+
+# Сколько попыток минимум нужно, чтобы вообще иметь право назвать оставшуюся
+# подмену неустранимой. Замер 2026-08-04 (по 100 попыток на связку): там, где
+# чистый вариант достижим, он выпадает в пределах первых нескольких попыток;
+# там, где нет, — не выпадает ни разу из 100.
+_MIN_ATTEMPTS_TO_PROVE = 8
+
+
+def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes:
+    """
+    Обрабатывает Halyk PDF напрямую на уровне raw bytes.
+
+    Использует тот же механизм hex-замены (<XXXX>Tj), что и process_pdf_bytes_raw,
+    но адаптирован под структуру выписки Halyk Bank.
+
+    **Избегаем подмены шрифта вместо того, чтобы её рисовать.** Строка итогов
+    «Барлығы» целиком набрана жирным, но жирный subset содержит только те
+    глифы, что печатались жирным в ОРИГИНАЛЕ, — замер на реальных файлах
+    (2026-08-04): у `HALYKformat1` и `hformat5` в жирном нет цифры «4», у
+    `HALYKformat3` — «3», у `h6` — сразу «1», «5» и «7». Если новая сумма
+    содержит такую цифру, писатель вынужден нарисовать её Regular-шрифтом
+    (`needs_switch`), и строка итогов становится разнородной: часть жирная,
+    часть нет, а минус физически отделяется в свой текстовый прогон (из-за
+    чего заодно уезжает центр колонки). В оригиналах таких строк нет ни одной.
+
+    Поэтому ±3% шум пересчёта переразыгрывается до `_BOLD_GLYPH_RETRIES` раз,
+    пока не выпадет вариант, где подмена не нужна вовсе. Каждая попытка —
+    самостоятельно корректный пересчёт (ничего не «подгоняется», просто из
+    нескольких одинаково законных розыгрышей берётся тот, что не требует
+    чужого шрифта). Тот же приём и та же оговорка, что у
+    `pdf_service._recalc_cert_avoiding_missing_glyphs` (Kaspi Gold): перебор
+    выигрывает не всегда — у `h6` недостающих цифр три, и вероятность обойти
+    все три в 7-значном итоге мала, — поэтому при исчерпании попыток
+    возвращается последний результат С подменой. Отказывать в обработке
+    файла из-за этого было бы хуже: всё остальное в нём корректно.
+    """
+    LAST_RUN_INFO.clear()
+    result, subs = _process_halyk_pdf_once(input_bytes, target_monthly_income)
+    attempts = 1
+    if subs == 0:
+        LAST_RUN_INFO.update(attempts=1, min_substitutions=0, unavoidable=False)
+        return result
+    for attempt in range(2, _BOLD_GLYPH_RETRIES + 1):
+        cand, cand_subs = _process_halyk_pdf_once(input_bytes, target_monthly_income)
+        attempts = attempt
+        if cand_subs == 0:
+            print(f"[Halyk] Подмена шрифта в строке итогов не понадобилась "
+                  f"(попытка {attempt} из {_BOLD_GLYPH_RETRIES})")
+            LAST_RUN_INFO.update(attempts=attempt, min_substitutions=0, unavoidable=False)
+            return cand
+        if cand_subs < subs:
+            result, subs = cand, cand_subs
+    # Ни одна из попыток не дала чистого варианта — это и есть ДОКАЗАТЕЛЬСТВО
+    # неизбежности, полученное измерением, а не рассуждением «в числе есть
+    # недостающая цифра» (последнее верно всегда и потому ничего не значит).
+    # Замер 2026-08-04 на реальных файлах, по 100 попыток: у h6 итог расхода
+    # «859 800,00» выпадал в 100 из 100 (он не масштабируется целью, шум его
+    # не двигает), у HALYKformat1 при ×5 недостающая «4» стоит в СТАРШЕМ
+    # разряде суммы ≈4,1 млн, зафиксированном порядком величины цели, — тот
+    # же случай, что задокументирован для Kaspi Gold («EUR balance is always
+    # 8X XXX … cannot be moved by noise»).
+    # «Неизбежно» вправе утверждать только достаточно длинный перебор: при
+    # искусственно урезанном бюджете (напр. _BOLD_GLYPH_RETRIES=1 в
+    # мутационном тесте) одна неудачная попытка ничего не доказывает, и
+    # выдавать по ней поблажку — значит снова получить проверку, которая
+    # не умеет краснеть.
+    LAST_RUN_INFO.update(
+        attempts=attempts,
+        min_substitutions=subs,
+        unavoidable=attempts >= _MIN_ATTEMPTS_TO_PROVE,
+    )
+    print(f"[Halyk] ⚠️ Не удалось избежать подмены шрифта за {_BOLD_GLYPH_RETRIES} "
+          f"попыток: осталось {subs} — в жирном subset'е нет нужных цифр, и "
+          f"итоговые суммы этой цели их не обходят ни при одном розыгрыше.")
     return result
 
 

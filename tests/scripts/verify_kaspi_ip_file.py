@@ -157,6 +157,123 @@ def geometry_check(pdf_bytes: bytes, sample_pages: list[int]) -> list[str]:
     return issues
 
 
+def check_isi_floor(out_bytes: bytes, threshold: float = 0.60, tolerance: float = 0.02) -> list[str]:
+    """Критерий (добавлен 2026-08-03): жёсткий ISI-порог (0.60) должен реально
+    держаться в РЕЗУЛЬТАТЕ — пересчитано НЕЗАВИСИМО от `validate_kaspi_ip`'s
+    "issues" (напрямую из помесячных сумм кредита, разобранных из выходного
+    PDF), а не просто переиспользует её вердикт. Коридор ±`_MAX_MONTH_K_SPREAD`
+    в `recalculate_kaspi_ip` обязан гарантировать именно это.
+    """
+    stmt = kip.parse_kaspi_ip_statement(fitz.open(stream=out_bytes, filetype="pdf"))
+    monthly: dict[str, float] = {}
+    for t in stmt.transactions:
+        if t.is_credit:
+            mk = t.date[3:]
+            monthly[mk] = monthly.get(mk, 0) + t.amount
+    vals = list(monthly.values())
+    if len(vals) < 2:
+        return []
+    mu = sum(vals) / len(vals)
+    if mu <= 0:
+        return []
+    sigma = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5
+    isi = max(0.0, 1.0 - sigma / mu)
+    if isi < threshold - tolerance:
+        return [f"ISI фактического результата = {isi:.4f} < порога {threshold} (допуск {tolerance}) — коридор не удержал жёсткую проверку"]
+    return []
+
+
+def check_rounding_escalation(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Критерий (добавлен 2026-08-03): если оригинальный кредит кратен крупному
+    «человеческому» числу (5 000/.../1 000 000), результат должен остаться
+    кратным ЕМУ ЖЕ, а не просесть до базового шага в 1000 (см. CLAUDE.md,
+    "`_round_amount` didn't preserve the original amount's own roundness class").
+    Строки с `amount_in_purpose=True` (сумма продублирована в назначении
+    платежа, не масштабируется) пропускаются.
+    """
+    orig_stmt = kip.parse_kaspi_ip_statement(fitz.open(stream=orig_bytes, filetype="pdf"))
+    out_stmt = kip.parse_kaspi_ip_statement(fitz.open(stream=out_bytes, filetype="pdf"))
+    o_cr = [t for t in orig_stmt.transactions if t.is_credit and not t.amount_in_purpose]
+    n_cr = [t for t in out_stmt.transactions if t.is_credit and not t.amount_in_purpose]
+    if len(o_cr) != len(n_cr):
+        return []
+    candidates = (1_000_000.0, 500_000.0, 100_000.0, 50_000.0, 10_000.0, 5_000.0, 1_000.0)
+    issues = []
+    for ot, nt in zip(o_cr, n_cr):
+        oa, na = ot.amount, nt.amount
+        if oa <= 0:
+            continue
+        for cand in candidates:
+            if oa % cand < 0.01 or cand - (oa % cand) < 0.01:
+                if na % cand > 0.01 and cand - (na % cand) > 0.01:
+                    issues.append(f"{ot.date}: оригинал {oa:,.0f} кратен {cand:,.0f}, но результат {na:,.0f} — нет")
+                break
+    return issues[:10]
+
+
+# Разделитель разрядов или копейки обязательны: без них под «сумму» подпадают
+# 3-значные коды КНП (по одному на транзакцию, все на одном крае — они и
+# становились модальным краем ЧУЖОЙ колонки) и 8-значные номера документов.
+_MONEY_SPAN = re.compile(r"^\d{1,3}(?:[  ]\d{3})+(?:,\d{2})?$|^\d{1,3},\d{2}$")
+
+
+def _money_span_edges(doc: "fitz.Document") -> dict[float, int]:
+    """Правые края денежных Tj-ранов, в системе координат ПОВЁРНУТОЙ страницы.
+
+    Страница Kaspi ИП повёрнута на 90°, поэтому колонка — это полоса по X, а
+    текст внутри строки идёт по УБЫВАЮЩЕЙ Y: конец числа (его правый край в
+    визуальном смысле) — это `y0` спана, а не `x1`. Меряем по spans, то есть
+    настоящими метриками шрифта из PyMuPDF, а не моделью ширины символа: у
+    писателя своя модель, и проверять его же моделью — значит согласиться с
+    его ошибкой по построению.
+    """
+    edges: dict[float, int] = {}
+    for pn in range(doc.page_count):
+        for blk in doc[pn].get_text("dict").get("blocks", []):
+            for line in blk.get("lines", []):
+                for sp in line.get("spans", []):
+                    t = sp["text"].strip()
+                    if len(t.replace(" ", "")) >= 3 and _MONEY_SPAN.match(t):
+                        k = round(sp["bbox"][1], 2)
+                        edges[k] = edges.get(k, 0) + 1
+    return edges
+
+
+def check_column_alignment(orig_bytes: bytes, out_bytes: bytes, window: float = 1.0) -> list[str]:
+    """Право-выровненная колонка «Дебет» обязана сохранить общий правый край.
+
+    Копия по смыслу с `verify_gold_file.check_column_alignment` (одна копия на
+    формат, конвенция та же, что и у `find_line_overlaps`), но проверять «весь
+    набор краёв» здесь нельзя: колонка «Кредит» в этом формате ЛЕВО-выровнена
+    (см. комментарий в `process_kaspi_ip_pdf`), поэтому её правый край законно
+    едет вместе с длиной числа и дал бы ложные срабатывания. Поэтому берём
+    только модальный край оригинала (это и есть «Дебет» — сотни строк на одном
+    значении) и требуем, чтобы рядом с ним в результате не появилось НИ ОДНОГО
+    другого края: равномерный сдвиг всей колонки не создаёт ни одного
+    наложения слов, поэтому `find_line_overlaps` этот класс дефекта не видит
+    вообще.
+    """
+    orig = fitz.open(stream=orig_bytes, filetype="pdf")
+    out = fitz.open(stream=out_bytes, filetype="pdf")
+    try:
+        a, b = _money_span_edges(orig), _money_span_edges(out)
+    finally:
+        orig.close()
+        out.close()
+    if not a:
+        return []
+    anchor = max(a, key=lambda k: a[k])
+    drifted = {e: n for e, n in b.items() if e != anchor and abs(e - anchor) <= window}
+    if not drifted:
+        return []
+    total = sum(drifted.values())
+    sample = sorted(drifted)[:6]
+    return [
+        f"колонка «Дебет» разъехалась: {total} сумм встали на новые правые края "
+        f"{sample} вместо единственного {anchor} (в оригинале на нём {a[anchor]} сумм)"
+    ]
+
+
 def render_pages(pdf_bytes: bytes, out_dir: Path, label: str, pages: list[int], dpi: int = 150) -> None:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     for pn in pages:
@@ -208,8 +325,13 @@ def run_one(path: Path, multipliers: list[float], out_dir: Path, render: bool) -
         math_ok = len(math_issues) == 0
         hdr_issues = header_matches_body(out_bytes)
         hdr_ok = len(hdr_issues) == 0
-        geo_issues = (geometry_check(out_bytes, sample_pages=[1, 2])
-                      + style_check(raw, out_bytes))
+        geo_issues = (
+            geometry_check(out_bytes, sample_pages=[1, 2])
+            + style_check(raw, out_bytes)
+            + check_isi_floor(out_bytes)
+            + check_rounding_escalation(raw, out_bytes)
+            + check_column_alignment(raw, out_bytes)
+        )
         geo_ok = len(geo_issues) == 0
 
         (out_dir / f"{path.stem}_{label}.pdf").write_bytes(out_bytes)

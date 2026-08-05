@@ -10,7 +10,14 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
-from pdf_service import build_dynamic_cmap, _rebuild_xref_table, _fmt_coord, _op_separators
+from pdf_service import (
+    build_dynamic_cmap,
+    _rebuild_xref_table,
+    _fmt_coord,
+    _op_separators,
+    _ARIAL_DIGIT_EM,
+    _find_primary_font_tounicode_xref,
+)
 from pdf_service_downscale import IncomeTooLowError
 
 # ─── Константы ─────────────────────────────────────────────────────────────
@@ -79,8 +86,13 @@ def _fmt(val: float) -> str:
 
 _ROUND_UNIT = 1000.0
 
+# Как _NATURAL_STEP_CANDIDATES в pdf_service.py (Kaspi Gold, "Исправлено
+# 2026-08-03") — каждое кандидатное число точный делитель следующего, поэтому
+# шаг никогда не выходит МЕЛЬЧЕ базовой тысячи.
+_NATURAL_STEP_CANDIDATES_IP = (1_000_000.0, 500_000.0, 100_000.0, 50_000.0, 10_000.0, 5_000.0, 1_000.0)
 
-def _round_amount(val: float) -> float:
+
+def _round_amount(val: float, original: Optional[float] = None) -> float:
     """
     Округляет масштабированную сумму до ближайшей тысячи — реальные счета ИП
     (Оплата за услуги, Перевод собственных средств и т.д.) почти всегда
@@ -88,9 +100,60 @@ def _round_amount(val: float) -> float:
     даёт произвольные дробные числа ("47 126,38"), что визуально выделяется
     на фоне остального документа. Минимум 1 тысяча, чтобы сильное занижение
     не обнуляло сумму целиком.
+
+    Если передан `original` (сумма ДО масштабирования) и он сам кратен более
+    крупному «человеческому» числу (5 000/10 000/.../1 000 000), шаг
+    округления результата подтягивается к нему — иначе круглый оригинал
+    («100 000») × дробный K даёт формально кратное тысяче, но не похожее на
+    реальный платёж число («233 000» вместо «230 000»/«250 000»), тот же
+    класс фикса, что и `pdf_service._round_to_natural(val, original=...)`.
     """
-    rounded = round(val / _ROUND_UNIT) * _ROUND_UNIT
-    return rounded if rounded > 0 else _ROUND_UNIT
+    if original and original > 0:
+        unit = None
+        for cand in _NATURAL_STEP_CANDIDATES_IP:
+            if original % cand < 0.01 or cand - (original % cand) < 0.01:
+                unit = cand
+                break
+        if unit is None:
+            # Оригинал не кратен даже тысяче — он «точный» (комиссия 35,15 ₸,
+            # поступление 49 676 ₸). Округлять его результат до тысяч нельзя:
+            # это меняет сам характер документа. На реальных файлах (IP2/IP3 —
+            # процессинговые счета, где кратны 1000 всего 6.0% и 5.8% сумм
+            # кредита) прежняя безусловная сетка давала 99.8% круглых — то
+            # есть распределение, противоположное оригинальному. Решение
+            # принимается по КАЖДОЙ сумме отдельно, поэтому файлы вроде IP4
+            # (98.6% круглых) не меняются вовсе.
+            #
+            # Копейки наследуются так же, как и кратность. Это не косметика:
+            # ячейка печатается в форме СВОЕГО оригинала (см.
+            # `_format_amount_cell`, `had_decimal`), поэтому дробный результат
+            # в ячейке без копеек молча теряет дробную часть при печати, а
+            # шапка считается по неокруглённым числам — на IP2 это давало
+            # расхождение шапка/тело в 1.67…4.18 ₸.
+            return round(val, 2) if original % 1 else float(round(val))
+        rounded = round(val / unit) * unit
+        if rounded <= 0 and unit > _ROUND_UNIT:
+            # Занижение увело сумму ниже её же укрупнённого шага (оригинал
+            # 50 000 ₸ → 23 253 ₸ при шаге 50 000). Эскалация шага работает
+            # только ВВЕРХ от базовой тысячи, поэтому здесь просто
+            # возвращаемся к ней, а не отдаём число с копейками: оригинал был
+            # круглым, результат обязан выглядеть так же.
+            unit = _ROUND_UNIT
+            rounded = round(val / unit) * unit
+        if rounded > 0:
+            return rounded
+        # Сумма меньше половины тысячи. Прежний код возвращал здесь `unit`,
+        # то есть ровно 1 000 ₸, и это выталкивало в 1 000 ₸ КАЖДУЮ мелкую
+        # сумму: на IP2 значение «1 000,00» встречалось 304 раза подряд в
+        # колонке дебета (в оригинале — ни одной такой серии), а комиссия в
+        # 35 ₸ превращалась в тысячу, раздувая расход.
+        if val <= 0:
+            return unit
+        return round(val, 2) if original % 1 else float(round(val))
+
+    unit = _ROUND_UNIT
+    rounded = round(val / unit) * unit
+    return rounded if rounded > 0 else unit
 
 
 def _clean_digits(text: str) -> str:
@@ -677,12 +740,27 @@ def recalculate_kaspi_ip(stmt: KaspiIPStatementData, target_monthly_income: floa
     # случай — обычно нужно всего несколько сотен ₸) "съедаются" округлением,
     # и коррекция не сходится за 8 итераций (см. отладку — min_rb зависает
     # на -767₸ вместо схождения к ≥0).
+    # Шум разыгрывается ОДИН РАЗ НА РАЗЛИЧНОЕ ЗНАЧЕНИЕ, а не на строку.
+    # В реальной выписке ИП одна и та же сумма повторяется десятками строк
+    # (20 переводов ровно по 100 000 ₸ — обычное дело для регулярного
+    # платежа), и это заметная структура документа. Независимый розыгрыш на
+    # каждую строку её уничтожал: у IP4 число различных значений кредита
+    # росло 72 → 114 (×2) → 161 (×5) → 221 (×20), то есть почти каждая
+    # строка становилась уникальной — след пересчёта, которого в настоящей
+    # выписке быть не может. Ключ включает месяц, потому что коридор
+    # `_MAX_MONTH_K_SPREAD` даёт разным месяцам разный K: две одинаковые
+    # суммы из разных месяцев обязаны разойтись, но это законное
+    # масштабирование, а не шум.
+    noise_by_value: Dict[Tuple[str, float], float] = {}
     for tx in stmt.transactions:
         if not tx.is_scaleable:
             continue
-        k = month_k.get(tx.date[3:], global_k)
-        noise = random.uniform(-_NOISE, _NOISE)
-        new_val = tx.amount * k * (1 + noise)
+        mk = tx.date[3:]
+        k = month_k.get(mk, global_k)
+        nkey = (mk, round(tx.amount, 2))
+        if nkey not in noise_by_value:
+            noise_by_value[nkey] = random.uniform(-_NOISE, _NOISE)
+        new_val = tx.amount * k * (1 + noise_by_value[nkey])
         tx.new_amount = new_val
         print(f"  [{'CR' if tx.is_credit else 'DR'}] {tx.date} {tx.amount:,.2f} → {new_val:,.2f} | {tx.purpose[:50]}")
 
@@ -784,7 +862,7 @@ def recalculate_kaspi_ip(stmt: KaspiIPStatementData, target_monthly_income: floa
     # подтверждён неотрицательным на полной точности (см. комментарий выше).
     for tx in stmt.transactions:
         if tx.is_scaleable:
-            tx.new_amount = _round_amount(tx.new_amount)
+            tx.new_amount = _round_amount(tx.new_amount, original=tx.amount)
 
     # Округление могло сдвинуть min_rb обратно в лёгкий минус (ошибка
     # округления до ±500₸ на транзакцию). Вместо повторного умножения ВСЕХ
@@ -857,6 +935,106 @@ def recalculate_kaspi_ip(stmt: KaspiIPStatementData, target_monthly_income: floa
 
 # ─── Замена через raw bytes (paren-формат BigEndian CID) ─────────────────────
 
+def _fmt_coord_debet(value: float) -> str:
+    """X-координата право-выровненной колонки «Дебет» — ВСЕГДА ровно 2 знака.
+
+    Найдено 2026-08-04 на реальных файлах (`testpdf/kaspiPay`): в отличие от
+    Kaspi Gold (`pdf_service._fmt_coord`, где генератор сам пишет переменную
+    точность — «42.5», «211», «510.94995», и обрезка незначащих нулей
+    корректна), эта колонка в оригинале печатает X с фиксированными двумя
+    знаками на КАЖДОЙ денежной ячейке без исключений (6707 из 6707, все 4
+    файла). Общий `_fmt_coord` на пересчитанном (`right_edge - w_new`,
+    плавающая точка) X почти никогда не оканчивается на ноль, поэтому
+    обрезать нечего — «207.392» вместо «207.39». `:.2f` не обрезает и не
+    добавляет: оно и есть сама конвенция этого формата, а не приближение.
+    """
+    out = f"{value:.2f}"
+    return "0.00" if out == "-0.00" else out
+
+
+def _parse_cid_widths(w_body: str) -> Dict[int, float]:
+    """Разбор массива /W CID-шрифта: формы «c [w1 w2 …]» и «c_first c_last w»."""
+    widths: Dict[int, float] = {}
+    for m in re.finditer(r"(\d+)\s*\[([\d\s.]+)\]", w_body):
+        start = int(m.group(1))
+        for i, w in enumerate(m.group(2).split()):
+            widths[start + i] = float(w)
+    # Диапазонная форма — только вне уже разобранных скобок.
+    for m in re.finditer(r"(?<![\[\d])(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)(?!\s*[\d\[])", w_body):
+        lo, hi, w = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        if 0 <= lo <= hi and hi - lo < 65536:
+            for c in range(lo, hi + 1):
+                widths.setdefault(c, w)
+    return widths
+
+
+def _primary_glyph_advances(doc, from_unicode: Dict[str, str]) -> Dict[str, float]:
+    """char → ширина глифа в долях em, из /W РЕАЛЬНОГО шрифта документа.
+
+    Зачем не константа. Правый край колонки «Дебет» держится тем, что при
+    смене числа X сдвигается ровно на изменение ширины строки, поэтому ширина
+    обязана совпадать с той, которой считал сам генератор, до сотых пункта.
+    Приближения не годятся: сперва здесь стояло `avg_w = 4.44` вместо
+    4.448 (0.556 em × кегль 8), а после его исправления остался второй,
+    более тонкий слой той же ошибки — модель «пробел и запятая ровно вдвое
+    уже цифры». В этом шрифте цифра = 556, а пробел и запятая = **277**, а не
+    278, и разницы в 1/1000 em хватало, чтобы 280 сумм из 1738 встали на
+    соседний правый край. Ширины берём из /W дескендант-шрифта — тогда
+    формула точна для любого набора символов и любого шрифта, а не только
+    для цифр ArialMT.
+
+    Пустой словарь = не удалось разобрать; вызывающий код откатывается на
+    прежнюю приближённую модель.
+    """
+    try:
+        primary = _find_primary_font_tounicode_xref(doc)
+    except Exception:  # noqa: BLE001
+        primary = None
+
+    descendants: List[int] = []
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref)
+        except Exception:  # noqa: BLE001
+            continue
+        if "/Type0" not in obj:
+            continue
+        dm = re.search(r"/DescendantFonts\s*\[?\s*(\d+)\s+0\s+R", obj)
+        if not dm:
+            continue
+        tm = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", obj)
+        is_primary = primary is not None and tm is not None and int(tm.group(1)) == primary
+        if is_primary:
+            descendants.insert(0, int(dm.group(1)))
+        else:
+            descendants.append(int(dm.group(1)))
+
+    for desc in descendants:
+        try:
+            obj = doc.xref_object(desc)
+        except Exception:  # noqa: BLE001
+            continue
+        wm = re.search(r"/W\s*\[(.*?)\]\s*(?:/|>>)", obj, re.S)
+        if not wm:
+            continue
+        widths = _parse_cid_widths(wm.group(1))
+        if not widths:
+            continue
+        dwm = re.search(r"/DW\s+(\d+(?:\.\d+)?)", obj)
+        default_w = float(dwm.group(1)) if dwm else 1000.0
+        adv: Dict[str, float] = {}
+        for ch, code in from_unicode.items():
+            try:
+                cid = int(code, 16)
+            except (TypeError, ValueError):
+                continue
+            adv[ch] = widths.get(cid, default_w) / 1000.0
+        # Цифры обязаны найтись — иначе это не тот шрифт, которым набраны суммы.
+        if all(c in adv for c in "0123456789"):
+            return adv
+    return {}
+
+
 def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes:
     """
     Масштабирует доходы в IP-выписке Kaspi Bank через raw bytes замену.
@@ -877,6 +1055,8 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
         FROM_UNICODE[','] = '000F'
         FROM_UNICODE[' '] = '0003'
         FROM_UNICODE['.'] = '0011'
+
+    GLYPH_EM = _primary_glyph_advances(doc, FROM_UNICODE)
 
     stmt = parse_kaspi_ip_statement(doc)
     stmt = recalculate_kaspi_ip(stmt, target_monthly_income)
@@ -1223,9 +1403,27 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
             if b'\x00\x00' in new_bytes:
                 return match.group(0)
 
-            avg_w = 4.44
-            len_old = sum(0.5 if c in (" ", ",", ".") else 1.0 for c in old_num)
-            len_new = sum(0.5 if c in (" ", ",", ".") else 1.0 for c in new_txt)
+            # Ширина цифры берётся из РЕАЛЬНОГО кегля этого же Tj-рана, а не из
+            # константы: у ArialMT цифра = _ARIAL_DIGIT_EM em, т.е. ровно
+            # 4.448 pt при кегле 8 (весь этот формат набран восьмым). Раньше
+            # здесь стояло 4.44 — приближение, которое занижает ширину на
+            # 0.008 pt на символ, из-за чего право-выровненная колонка «Дебет»
+            # уезжала ровно на 0.008 × (длина_новая − длина_старая): в
+            # оригинале все суммы делят один правый край, а в результате их
+            # края расползались на 610.13/610.14/610.16 при эталонном 610.15
+            # (замер настоящими метриками шрифта, не этой моделью). Тот же
+            # класс дефекта и то же лечение, что и `_digit_width_at` в
+            # pdf_service.py (Kaspi Gold) — см. критерий 2 в CLAUDE.md.
+            avg_w = _ARIAL_DIGIT_EM * orig_size
+
+            def _adv(text: str, _sz=orig_size) -> float:
+                """Ширина строки в пунктах. Реальные /W, если их удалось прочесть."""
+                if GLYPH_EM:
+                    return sum(GLYPH_EM.get(c, _ARIAL_DIGIT_EM) for c in text) * _sz
+                return sum(0.5 if c in (" ", ",", ".") else 1.0 for c in text) * avg_w
+
+            w_old = _adv(old_num)
+            w_new = _adv(new_txt)
             font_bytes = font_name + b" " + font_size_str.encode("ascii") + b" Tf"
 
             if is_summary or is_credit_cell:
@@ -1252,6 +1450,7 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
                 # с Дебет). Поэтому для Кредит, как и для summary-полей,
                 # X не трогаем вообще — число просто растёт вправо.
                 new_x = current_x
+                x_recomputed = False
             else:
                 # Колонка "Дебет" в таблице транзакций фиксированной ширины
                 # и выровнена по ПРАВОМУ краю (замер X по многим строкам
@@ -1267,8 +1466,27 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
                 # проверена и не вызывает жалоб). Небольшой перехлёст в
                 # соседнюю колонку при экстремальном росте числа —
                 # приемлемый компромисс, нечитаемый/мелкий шрифт — нет.
-                right_edge = current_x + len_old * avg_w
-                new_x = right_edge - len_new * avg_w
+                # `right_edge` округляется ДО вычитания w_new, а не после
+                # всей арифметики (см. `_fmt_coord_debet` ниже) — иначе две
+                # источника суб-0.01pt погрешности накапливаются: (1) w_old
+                # (сумма ширин цифр/разделителей по /W, кратных 0.001pt, а не
+                # 0.01pt) сдвигает right_edge на несколько тысячных от
+                # «чистого» табличного края; (2) финальное округление new_x
+                # добавляет свою погрешность до ±0.005pt. По отдельности
+                # каждая безобидна, но их СУММА на части ячеек превышала
+                # 0.005pt и переносила измеренный правый край на соседнее
+                # значение сетки (610.14/610.16 вместо 610.15) — найдено
+                # 2026-08-04 инструментированием реального прогона (IP4 ×2):
+                # без этой правки 29 из 179 ячеек «Дебет» имели остаток
+                # округления −0.004, что в сумме с оставшейся неточностью
+                # current_x/w_old давало измеренный дрейф до +0.006pt.
+                # Округление right_edge СРАЗУ убирает источник (1), оставляя
+                # только источник (2) — единственный настоящий шаг округления
+                # до 2 знаков, максимум ±0.005pt, чего всегда достаточно,
+                # чтобы измеренный край остался в той же ячейке сетки 0.01pt.
+                right_edge = round(current_x + w_old, 2)
+                new_x = right_edge - w_new
+                x_recomputed = True
 
             print(f"  [IP] стр.{_pg} {old_num.strip()!r} → {new_txt!r}")
             total_replaced += 1
@@ -1278,8 +1496,26 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
             # Переводы строк после Tm и Tf почерку оригинала уже отвечают
             # (разбор их и не отметил), поэтому остаются как есть.
             _so, _sc = _op_separators(match.group(0))
+            # X-координата форматируется по-разному в зависимости от того,
+            # пересчитан ли X. Когда он НЕ пересчитан («Кредит», summary —
+            # new_x is current_x, тот же float, что и в оригинале), общий
+            # `_fmt_coord` (переменная точность, обрезка нулей) воспроизводит
+            # исходную запись байт-в-байт — замерено на реальных файлах, эта
+            # ветка уже 100% совпадает с оригиналом, трогать не нужно. Когда X
+            # пересчитан («Дебет», право-выровненная колонка), тот же
+            # `_fmt_coord` почти всегда даёт 3 знака вместо 2 (после
+            # вычитания ширины строки в плавающей точке результат почти
+            # никогда не оканчивается на ноль, обрезать нечего) — а этот
+            # формат, в отличие от Kaspi Gold, пишет РОВНО 2 знака на каждой
+            # ячейке таблицы без исключений (замерено: 6707 из 6707 денежных
+            # ячеек «Дебет» на 4 реальных файлах). `_fmt_coord_debet` — тот
+            # же класс фикса, что и `_op_separators`/`_fmt_coord` в целом
+            # (критерий 4, CLAUDE.md): почерк записи обязан быть неотличим от
+            # оригинала, только здесь конвенция формата ФИКСИРОВАННАЯ, а не
+            # «повторить, что было», поэтому формататор жёстко на 2 знака.
+            x_out = _fmt_coord_debet(new_x) if x_recomputed else _fmt_coord(new_x)
             return (
-                b"1 0 0 1 " + _fmt_coord(new_x).encode("ascii") +
+                b"1 0 0 1 " + x_out.encode("ascii") +
                 b" " + y_str.encode("ascii") + b" Tm\n" +
                 font_bytes + _so +
                 b"(" + new_bytes + b")" + _sc + b"Tj"
