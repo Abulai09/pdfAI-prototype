@@ -1347,6 +1347,16 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
     _newly_available_cids: Dict[int, Dict[str, float]] = {}  # cid_xref -> {cid_hex: width}
     _cid_to_digit_char = {_v: _k for _k, _v in _digit_cids.items()}  # cid_hex -> '0'..'9'
     for _cid_xref, _ff2_xref, _tu_xref in _bold_font_pairs:
+        # ── Резолвим и готовим ВСЕ ТРИ правки (FontFile2, /W, ToUnicode) из
+        # ОДНОГО снимка `raw` — ни одной записи в `raw` до этого момента.
+        # Так гарантируется настоящая, а не «в основном верная», атомарность:
+        # либо все три позиции разрешились и патч применяется целиком, либо
+        # НИ ОДНА запись не происходит вовсе (см. код-ревью Task 4 — прежняя
+        # версия делала свежий raw.find() для ToUnicode ПОСЛЕ того, как
+        # FontFile2/W уже были записаны в raw, и на невозможность найти
+        # ToUnicode в этот момент реагировала предупреждением, а не отменой
+        # уже применённых правок — оставляя ровно то частично пропатченное
+        # состояние, которого весь этот блок должен избегать).
         _ff2_pattern = f"{_ff2_xref} 0 obj".encode()
         _ff2_pos = raw.find(_ff2_pattern)
         if _ff2_pos < 0:
@@ -1374,85 +1384,22 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
             continue
         _patched_ff2, _added_widths = _result
 
-        # ── Готовим правку /ToUnicode ДО применения чего-либо в raw. Глиф
-        # без записи в ToUnicode CMap Type0-обёртки рисуется корректно
-        # ВИЗУАЛЬНО, но для текстового слоя (fitz.get_text — извлечение
-        # текста/копипаст/поиск, и КАЖДАЯ проверка этого проекта, читающая
-        # PDF именно так, включая её же check_totals_match_rows) этот CID
-        # остаётся непривязанным ни к какому символу и извлекается пустым.
-        # Найдено смоук-тестом на h6.pdf: без этого блока «859 800,00»
-        # реэкстрактился как «89 800,00» — CID новой «5» рисовался, но не
-        # читался как текст. Поэтому ToUnicode готовится и валидируется
-        # ЗАРАНЕЕ (dry run, raw ещё не тронут для этого шрифта) — если
-        # что-то из этого не удаётся, патч для ЭТОГО шрифта пропускается
-        # ЦЕЛИКОМ (как отказ gate'а), а не применяется частично.
-        _tu_entries = [
-            (_cid, _cid_to_digit_char[_cid]) for _cid in _added_widths if _cid in _cid_to_digit_char
-        ]
-        if _tu_xref is None or not _tu_entries:
-            continue
-        _tu_pos0 = raw.find(f"{_tu_xref} 0 obj".encode())
-        if _tu_pos0 < 0:
-            continue
-        _tu_stream_kw0 = raw.find(b"stream", _tu_pos0)
-        _tu_data_start0 = _tu_stream_kw0 + len(b"stream")
-        if raw[_tu_data_start0:_tu_data_start0 + 2] == b"\r\n":
-            _tu_data_start0 += 2
-        elif raw[_tu_data_start0:_tu_data_start0 + 1] == b"\n":
-            _tu_data_start0 += 1
-        _tu_endstream_pos0 = raw.find(b"endstream", _tu_data_start0)
-        _tu_header0 = bytes(raw[_tu_pos0:_tu_stream_kw0])
-        _tu_len_m0 = re.search(rb"/Length\s+(\d+)", _tu_header0)
-        if not _tu_len_m0:
-            continue
-        _tu_old_length0 = int(_tu_len_m0.group(1))
-        _tu_compressed0 = bytes(raw[_tu_data_start0:_tu_data_start0 + _tu_old_length0])
-        _tu_is_flate = b"/FlateDecode" in _tu_header0
-        try:
-            _tu_body0 = zlib.decompress(_tu_compressed0) if _tu_is_flate else bytes(_tu_compressed0)
-        except zlib.error:
-            continue
-        _endcmap_idx = _tu_body0.rfind(b"endcmap")
-        if _endcmap_idx < 0:
-            continue
-        # Отдельный beginbfchar/endbfchar блок перед endcmap — не трогаем
-        # уже существующий bfrange-блок (не нужно пересчитывать его счётчик
-        # диапазонов), несколько bfchar/bfrange блоков в одном CMap валидны
-        # по спецификации (ISO 32000).
-        _bfchar_block = (
-            f"{len(_tu_entries)} beginbfchar\n".encode("ascii")
-            + b"".join(
-                f"<{_cid}> <{ord(_ch):04X}>\n".encode("ascii") for _cid, _ch in _tu_entries
-            )
-            + b"endbfchar\n"
-        )
-        _new_tu_body = _tu_body0[:_endcmap_idx] + _bfchar_block + _tu_body0[_endcmap_idx:]
-        _new_tu_compressed = zlib.compress(_new_tu_body) if _tu_is_flate else _new_tu_body
-        _new_tu_header_template = re.sub(
-            rb"/Length\s+\d+", f"/Length {len(_new_tu_compressed)}".encode(), _tu_header0
-        )
-
-        # ── Применение: FontFile2 → /W → ToUnicode. Каждый шаг делает
-        # свежий raw.find() для СВОЕГО объекта — предыдущие splice'ы сдвигают
-        # все байты после точки правки, кэшированные позиции стали бы
-        # неверны, но precomputed СОДЕРЖИМОЕ правок (заголовки/сжатые байты
-        # выше) от позиции не зависит.
+        # Готовим содержимое правки FontFile2 (ничего в raw ещё не пишем).
         _new_compressed = zlib.compress(_patched_ff2)
         _new_length = len(_new_compressed)
         _new_length1 = len(_patched_ff2)
         _new_header = re.sub(rb"/Length\s+\d+", f"/Length {_new_length}".encode(), _header)
         _new_header = re.sub(rb"/Length1\s+\d+", f"/Length1 {_new_length1}".encode(), _new_header)
-
         # Разделитель между "stream" и телом ("\r\n" или "\n") — берём из
         # оригинала, не хардкодим, тот же приём, что _op_separators для
         # content-стримов.
         _stream_sep = bytes(raw[_stream_kw + len(b"stream"):_data_start])
         _trailing = bytes(raw[_data_start + _old_length:_endstream_pos])
-        raw[_ff2_pos:_endstream_pos] = _new_header + b"stream" + _stream_sep + _new_compressed + _trailing
+        _ff2_replacement = _new_header + b"stream" + _stream_sep + _new_compressed + _trailing
 
         # /W-массив CIDFont-словаря — дописываем новые CID без пробелов,
         # тем же форматом, что и соседние записи оригинала (сверено на h6.pdf:
-        # "19[500]21[500]..." — без единого пробела).
+        # "19[500]21[500]..." — без единого пробела). Ничего не пишем в raw.
         _cid_pattern = f"{_cid_xref} 0 obj".encode()
         _cid_pos = raw.find(_cid_pattern)
         if _cid_pos < 0:
@@ -1481,30 +1428,89 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
             for _cid, _w in _added_widths.items()
         )
         _new_cidobj_bytes = _cidobj_bytes[:_close_idx] + _new_entries + _cidobj_bytes[_close_idx:]
-        raw[_cid_pos:_endobj_pos] = _new_cidobj_bytes
 
-        # ToUnicode CMap Type0-обёртки — свежий find (позиции сдвинулись
-        # после двух splice выше, если ToUnicode физически лежит после них).
+        # ── /ToUnicode CMap Type0-обёртки. Глиф без записи в ToUnicode
+        # рисуется корректно ВИЗУАЛЬНО, но для текстового слоя (fitz.get_text
+        # — извлечение текста/копипаст/поиск, и КАЖДАЯ проверка этого
+        # проекта, читающая PDF именно так, включая её же
+        # check_totals_match_rows) этот CID остаётся непривязанным ни к
+        # какому символу и извлекается пустым. Найдено смоук-тестом на
+        # h6.pdf: без этого блока «859 800,00» реэкстрактился как «89
+        # 800,00» — CID новой «5» рисовался, но не читался как текст.
+        # Позиция и содержимое правки резолвятся здесь же, из того же
+        # снимка `raw`, что и FontFile2/W выше — ничего не пишем в raw.
+        _tu_entries = [
+            (_cid, _cid_to_digit_char[_cid]) for _cid in _added_widths if _cid in _cid_to_digit_char
+        ]
+        if _tu_xref is None or not _tu_entries:
+            continue
         _tu_pos = raw.find(f"{_tu_xref} 0 obj".encode())
         if _tu_pos < 0:
-            # Неожиданно (объект был найден чуть выше в этой же итерации) —
-            # FontFile2/W уже применены; лучше недописать текстовый слой,
-            # чем откатывать уже применённые правки посреди цикла.
-            print(f"[Halyk] ⚠️ ToUnicode-объект (xref {_tu_xref}) пропал после патча "
-                  f"FontFile2/W — текстовый слой для новых цифр НЕ дополнен.")
-        else:
-            _tu_stream_kw = raw.find(b"stream", _tu_pos)
-            _tu_data_start = _tu_stream_kw + len(b"stream")
-            if raw[_tu_data_start:_tu_data_start + 2] == b"\r\n":
-                _tu_data_start += 2
-            elif raw[_tu_data_start:_tu_data_start + 1] == b"\n":
-                _tu_data_start += 1
-            _tu_endstream_pos = raw.find(b"endstream", _tu_data_start)
-            _tu_stream_sep = bytes(raw[_tu_stream_kw + len(b"stream"):_tu_data_start])
-            _tu_trailing = bytes(raw[_tu_data_start + _tu_old_length0:_tu_endstream_pos])
-            raw[_tu_pos:_tu_endstream_pos] = (
-                _new_tu_header_template + b"stream" + _tu_stream_sep + _new_tu_compressed + _tu_trailing
+            continue
+        _tu_stream_kw = raw.find(b"stream", _tu_pos)
+        _tu_data_start = _tu_stream_kw + len(b"stream")
+        if raw[_tu_data_start:_tu_data_start + 2] == b"\r\n":
+            _tu_data_start += 2
+        elif raw[_tu_data_start:_tu_data_start + 1] == b"\n":
+            _tu_data_start += 1
+        _tu_endstream_pos = raw.find(b"endstream", _tu_data_start)
+        _tu_header = bytes(raw[_tu_pos:_tu_stream_kw])
+        _tu_len_m = re.search(rb"/Length\s+(\d+)", _tu_header)
+        if not _tu_len_m:
+            continue
+        _tu_old_length = int(_tu_len_m.group(1))
+        _tu_compressed = bytes(raw[_tu_data_start:_tu_data_start + _tu_old_length])
+        _tu_is_flate = b"/FlateDecode" in _tu_header
+        try:
+            _tu_body = zlib.decompress(_tu_compressed) if _tu_is_flate else bytes(_tu_compressed)
+        except zlib.error:
+            continue
+        _endcmap_idx = _tu_body.rfind(b"endcmap")
+        if _endcmap_idx < 0:
+            continue
+        # Отдельный beginbfchar/endbfchar блок перед endcmap — не трогаем
+        # уже существующий bfrange-блок (не нужно пересчитывать его счётчик
+        # диапазонов), несколько bfchar/bfrange блоков в одном CMap валидны
+        # по спецификации (ISO 32000).
+        _bfchar_block = (
+            f"{len(_tu_entries)} beginbfchar\n".encode("ascii")
+            + b"".join(
+                f"<{_cid}> <{ord(_ch):04X}>\n".encode("ascii") for _cid, _ch in _tu_entries
             )
+            + b"endbfchar\n"
+        )
+        _new_tu_body = _tu_body[:_endcmap_idx] + _bfchar_block + _tu_body[_endcmap_idx:]
+        _new_tu_compressed = zlib.compress(_new_tu_body) if _tu_is_flate else _new_tu_body
+        _new_tu_header = re.sub(
+            rb"/Length\s+\d+", f"/Length {len(_new_tu_compressed)}".encode(), _tu_header
+        )
+        _tu_stream_sep = bytes(raw[_tu_stream_kw + len(b"stream"):_tu_data_start])
+        _tu_trailing = bytes(raw[_tu_data_start + _tu_old_length:_tu_endstream_pos])
+        _tu_replacement = _new_tu_header + b"stream" + _tu_stream_sep + _new_tu_compressed + _tu_trailing
+
+        # ── Применение: все три позиции уже разрешены из одного снимка
+        # `raw` выше — теперь пишем. Три индирект-объекта физически не
+        # пересекаются по построению PDF (это отдельные "N 0 obj"..."endobj"
+        # блоки), но на всякий случай проверяем это явно перед записью —
+        # если бы регионы пересеклись, применение в убывающем порядке start
+        # могло бы записать поверх ещё не применённой правки. Затем пишем
+        # от КОНЦА файла к НАЧАЛУ: splice в bytearray сдвигает все байты
+        # ПОСЛЕ точки правки, поэтому запись в более позднюю (по смещению)
+        # область никогда не портит start/end ещё не применённой более
+        # ранней области.
+        _regions = sorted(
+            [
+                (_ff2_pos, _endstream_pos, _ff2_replacement),
+                (_cid_pos, _endobj_pos, _new_cidobj_bytes),
+                (_tu_pos, _tu_endstream_pos, _tu_replacement),
+            ],
+            key=lambda r: r[0],
+            reverse=True,
+        )
+        if any(_regions[_k][0] < _regions[_k + 1][1] for _k in range(len(_regions) - 1)):
+            continue  # региона пересеклись — не должно случаться, но не пишем ничего
+        for _start, _end, _new_bytes in _regions:
+            raw[_start:_end] = _new_bytes
 
         print(f"[Halyk] Вшиты недостающие цифры в Bold-шрифт (xref {_ff2_xref}), "
               f"дополнена ToUnicode-карта (xref {_tu_xref}): {sorted(_added_widths.keys())}")
