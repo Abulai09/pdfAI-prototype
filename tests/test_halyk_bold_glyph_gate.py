@@ -59,3 +59,29 @@ def test_gate_returns_none_when_nothing_missing():
 
 def test_gate_swallows_structural_errors_returns_none():
     assert _try_patch_bold_digit_glyphs(b"not a font at all", _digit_cids_0x13()) is None
+
+
+def test_gate_rejects_too_long_padding():
+    # Present digit matches baked reference but has >1 byte of trailing zeros.
+    # This indicates structural anomaly (font not from same master), gate should refuse.
+    glyphs = [b""] * 0x1D
+    # Baked reference + 5 extra zero bytes (too much padding for same-master sanity)
+    glyphs[0x15] = DIGIT_GLYPHS["2"] + b"\x00" * 5
+    font = build_synthetic_ttf(glyphs)
+    assert _try_patch_bold_digit_glyphs(font, _digit_cids_0x13()) is None
+
+
+def test_gate_accepts_exactly_one_byte_padding():
+    # Present digit matches baked reference + exactly 1 zero byte (legal padding),
+    # gate should pass and patch missing digits.
+    glyphs = [b""] * 0x1D
+    glyphs[0x15] = DIGIT_GLYPHS["2"] + b"\x00"
+    font = build_synthetic_ttf(glyphs)
+
+    result = _try_patch_bold_digit_glyphs(font, _digit_cids_0x13())
+    assert result is not None
+    patched_bytes, added_widths = result
+    assert added_widths.get("0014") == 500.0  # digit '1' at gid 0x14 was patched
+
+    from pdf_service import _read_truetype_glyph
+    assert _read_truetype_glyph(patched_bytes, 0x14) != b""

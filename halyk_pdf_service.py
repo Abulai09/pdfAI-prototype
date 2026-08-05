@@ -21,6 +21,7 @@ from pdf_service import (
     _op_separators,
     _read_truetype_glyph,
     _patch_truetype_glyphs,
+    _ttf_table_dir,
 )
 from pdf_service_downscale import IncomeTooLowError
 from halyk_bold_digits import DIGIT_GLYPHS, DIGIT_WIDTH_1000, SOURCE_UNITS_PER_EM
@@ -1006,18 +1007,12 @@ def _try_patch_bold_digit_glyphs(
     не отклоняется от старого поведения.
     """
     try:
-        # unitsPerEm — сверяем через head-таблицу тем же способом, что и
-        # низкоуровневые функции (переиспользуем их разбор directory).
-        num_tables = struct.unpack(">H", ff2_bytes[4:6])[0]
-        head_offset = None
-        for i in range(num_tables):
-            off = 12 + i * 16
-            tag, _cs, offset, _length = struct.unpack(">4sLLL", ff2_bytes[off:off + 16])
-            if tag == b"head":
-                head_offset = offset
-                break
-        if head_offset is None:
+        # unitsPerEm — сверяем через head-таблицу, переиспользуя разбор directory
+        # из pdf_service._ttf_table_dir (избегаем дублирования).
+        table_dir = _ttf_table_dir(ff2_bytes)
+        if "head" not in table_dir:
             return None
+        head_offset, _ = table_dir["head"]
         units_per_em = struct.unpack(">H", ff2_bytes[head_offset + 18:head_offset + 20])[0]
         if units_per_em != SOURCE_UNITS_PER_EM:
             return None
@@ -1038,10 +1033,14 @@ def _try_patch_bold_digit_glyphs(
             # Present digit — сверяем с эталоном как gate ("сначала проверь,
             # потом доверяй"): existing может быть на 1 байт длиннее (паддинг
             # до чётной длины внутри glyf-таблицы), поэтому сравниваем по
-            # префиксу и требуем, чтобы хвост был нулевым, а не точное
-            # совпадение длины.
+            # префиксу и требуем, чтобы хвост был нулевым И длина delta ≤ 1.
             n = len(baked)
-            if existing[:n] == baked and all(b == 0 for b in existing[n:]):
+            len_delta = len(existing) - n
+            if (
+                len_delta in (0, 1)
+                and existing[:n] == baked
+                and all(b == 0 for b in existing[n:])
+            ):
                 verified_match = True
             else:
                 return None  # другой мастер-шрифт — не доверяем НИЧЕМУ
