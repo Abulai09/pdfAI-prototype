@@ -209,6 +209,116 @@ def _parse_cid_widths(w_body: str) -> Dict[int, float]:
     return widths
 
 
+# ─── Стилевые конвенции /W и /ToUnicode для вписывания недостающих CID ─────
+# Та же дисциплина, что pdf_service._op_separators/_fmt_coord (см. CLAUDE.md,
+# критерий 4 «Стиль сериализации операторов»): конвенция ЧИТАЕТСЯ из самого
+# файла, а не хардкодится один раз на все форматы — h6.pdf пишет /W без
+# единого пробела ("19[500]21[500]"), а HALYKformat1.pdf с пробелом после
+# каждого "[" и между записями ("19[ 500] 20[ 500]"); оба реальных файла.
+
+_W_SINGLE_ENTRY_RE = re.compile(rb"(\d+)\[(\s*)(\d+)\]")
+
+
+def _w_array_entries(body: bytes, start: int, end: int) -> List[Tuple[int, int, int, bytes]]:
+    """Разбирает одиночные-CID записи 'cid[width]' /W-массива CIDFontType2 в
+    диапазоне [start, end) байтовой строки body. Возвращает список (cid,
+    entry_start, entry_end, inner_ws) в порядке появления — entry_start/
+    entry_end абсолютные индексы в body, inner_ws — пробельные байты между
+    '[' и цифрой ширины ЭТОЙ записи. Форма 'c1 c2 w' (диапазон одинаковых
+    ширин) не разбирается — на всех 6 локальных реальных файлах Halyk /W
+    всегда в одиночной форме 'cid[width]'; если встретится другая форма или
+    записей меньше двух, список короче двух элементов сигналит вызывающей
+    стороне отказаться от вставки (см. _w_array_insert_sorted).
+    """
+    return [
+        (int(m.group(1)), m.start(), m.end(), m.group(2))
+        for m in _W_SINGLE_ENTRY_RE.finditer(body, start, end)
+    ]
+
+
+def _w_array_insert_sorted(
+    cidobj_bytes: bytes,
+    bracket_start: int,
+    close_idx: int,
+    new_entries: Dict[str, float],
+) -> Optional[bytes]:
+    """Вставляет новые CID-записи в /W-массив В ВОЗРАСТАЮЩЕМ порядке CID (как
+    во всех реальных файлах — иначе хвост массива выглядит как «кто-то
+    дописал руками»), разделителем/внутренним пробелом САМОГО ЭТОГО массива,
+    а не хардкодом.
+
+    new_entries — {cid_hex: width}. Возвращает новые байты объекта CIDFont
+    (cidobj_bytes с точечными splice-вставками) либо None, если конвенцию
+    или записей меньше двух — недостаточно, чтобы доверять «доминантному»
+    разделителю, отказ вместо угадывания.
+    """
+    entries = _w_array_entries(cidobj_bytes, bracket_start + 1, close_idx)
+    if len(entries) < 2:
+        return None
+    # Разделитель МЕЖДУ соседними записями (например b"" или b" ") — берём из
+    # промежутка после первой же записи; конвенция однородна по всему массиву
+    # (проверено на h6.pdf и HALYKformat1.pdf).
+    dominant_sep = cidobj_bytes[entries[0][2]:entries[1][1]]
+    dominant_inner_ws = entries[0][3]
+
+    # Для каждого нового CID точка вставки вычисляется из НЕИЗМЕНЁННОГО
+    # списка entries (снимок до любых правок) — конец последней записи с
+    # cid МЕНЬШЕ нового (если такой нет — самое начало массива, перед первой
+    # записью). Применяются позже в порядке убывания позиции, чтобы splice
+    # одной записи не сдвигал ещё не применённые точки вставки (тот же приём,
+    # что и «запись от конца файла к началу» ниже по трём FontFile2/W/
+    # ToUnicode-регионам).
+    insertions = []
+    for cid_hex, width in new_entries.items():
+        new_cid = int(cid_hex, 16)
+        pos = bracket_start + 1
+        for cid, _e_start, e_end, _inner in entries:
+            if cid < new_cid:
+                pos = e_end
+            else:
+                break
+        new_bytes = (
+            dominant_sep
+            + f"{new_cid}[".encode("ascii")
+            + dominant_inner_ws
+            + f"{int(width)}]".encode("ascii")
+        )
+        insertions.append((pos, new_bytes))
+
+    result = bytearray(cidobj_bytes)
+    for pos, new_bytes in sorted(insertions, key=lambda t: t[0], reverse=True):
+        result[pos:pos] = new_bytes
+    return bytes(result)
+
+
+def _cmap_bf_style(body: bytes) -> Optional[Tuple[bytes, bytes]]:
+    """Читает конвенции EOL и межтокенного разделителя из существующего
+    beginbfrange/beginbfchar-блока ЭТОГО ToUnicode CMap-потока — тот же
+    принцип, что и /W выше: h6.pdf/HALYKformat1.pdf оба пишут записи
+    'beginbfrange' как '<XXXX><XXXX><YYYY>\\r\\n' (CRLF, без пробела между
+    hex-токенами), но хардкодить это на все возможные Halyk-файлы неверно.
+
+    Возвращает (entry_eol, token_sep) либо None, если в потоке нет ни
+    одного bfrange/bfchar-блока хотя бы с одной записью — тогда вызывающая
+    сторона обязана отказаться от вставки нового bfchar-блока, а не
+    гадать про EOL/пробелы.
+    """
+    m = re.search(rb"beginbf(range|char)", body)
+    if m is None:
+        return None
+    tail = body[m.end():]
+    if m.group(1) == b"range":
+        entry_re = re.compile(
+            rb"<[0-9A-Fa-f]+>(\s*)<[0-9A-Fa-f]+>\s*<[0-9A-Fa-f]+>(\r\n|\r|\n)"
+        )
+    else:
+        entry_re = re.compile(rb"<[0-9A-Fa-f]+>(\s*)<[0-9A-Fa-f]+>(\r\n|\r|\n)")
+    em = entry_re.search(tail)
+    if em is None:
+        return None
+    return em.group(2), em.group(1)
+
+
 # ─── Dataclasses ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -1387,6 +1497,31 @@ def _process_halyk_pdf_once(
         except zlib.error:
             continue
 
+        # ── CIDFont-словарь: читаем ЗАРАНЕЕ, до вызова
+        # _try_patch_bold_digit_glyphs (который доверяет CID == GID) — нужен
+        # и для gate /CIDToGIDMap ниже, и позже для правки /W того же
+        # объекта. Один fetch на оба использования, не два.
+        _cid_pattern = f"{_cid_xref} 0 obj".encode()
+        _cid_pos = raw.find(_cid_pattern)
+        if _cid_pos < 0:
+            continue
+        _endobj_pos = raw.find(b"endobj", _cid_pos)
+        _cidobj_bytes = bytes(raw[_cid_pos:_endobj_pos])
+
+        # ── Gate /CIDToGIDMap (design spec — см. docs/superpowers/specs/
+        # 2026-08-05-halyk-bold-glyph-embedding-design.md, раздел про
+        # _try_patch_bold_digit_glyphs, п.1): если у CIDFont-словаря явно
+        # присутствует /CIDToGIDMap И это НЕ /Identity (т.е. ссылка на
+        # отдельный поток GID-маппинга), CID == GID доверять нельзя —
+        # патчить этот шрифт вообще не пытаемся, откат на старое поведение
+        # (подмена шрифта/перебор шума), как и любой другой отказ gate'а.
+        # Отсутствие ключа или явный /Identity — CID == GID, как и
+        # предполагает весь код ниже (на всех 6 локальных реальных файлах
+        # ключа /CIDToGIDMap нет вовсе — эта ветка для них no-op).
+        _c2g_m = re.search(rb"/CIDToGIDMap\s*/Identity\b", _cidobj_bytes)
+        if b"/CIDToGIDMap" in _cidobj_bytes and _c2g_m is None:
+            continue
+
         _result = _try_patch_bold_digit_glyphs(_ff2_bytes, _digit_cids)
         if _result is None:
             continue
@@ -1405,15 +1540,15 @@ def _process_halyk_pdf_once(
         _trailing = bytes(raw[_data_start + _old_length:_endstream_pos])
         _ff2_replacement = _new_header + b"stream" + _stream_sep + _new_compressed + _trailing
 
-        # /W-массив CIDFont-словаря — дописываем новые CID без пробелов,
-        # тем же форматом, что и соседние записи оригинала (сверено на h6.pdf:
-        # "19[500]21[500]..." — без единого пробела). Ничего не пишем в raw.
-        _cid_pattern = f"{_cid_xref} 0 obj".encode()
-        _cid_pos = raw.find(_cid_pattern)
-        if _cid_pos < 0:
-            continue
-        _endobj_pos = raw.find(b"endobj", _cid_pos)
-        _cidobj_bytes = bytes(raw[_cid_pos:_endobj_pos])
+        # /W-массив CIDFont-словаря (_cidobj_bytes/_endobj_pos уже получены
+        # выше, вместе с gate'ом /CIDToGIDMap) — вставляем новые записи В
+        # ВОЗРАСТАЮЩЕМ порядке CID, разделителем/внутренним пробелом САМОГО
+        # ЭТОГО файла (не хардкодом): h6.pdf пишет "19[500]21[500]..." без
+        # единого пробела, а HALYKformat1.pdf — "19[ 500] 20[ 500]..." с
+        # пробелом после каждого "[" и между записями. См.
+        # _w_array_insert_sorted (тот же принцип, что pdf_service.
+        # _op_separators — конвенция читается из соседних записей ЭТОГО
+        # файла). Ничего не пишем в raw здесь.
         _w_m = re.search(rb"/W\s*\[", _cidobj_bytes)
         if not _w_m:
             continue
@@ -1431,11 +1566,11 @@ def _process_halyk_pdf_once(
                     break
         if _close_idx is None:
             continue
-        _new_entries = b"".join(
-            f"{int(_cid, 16)}[{int(_w)}]".encode("ascii")
-            for _cid, _w in _added_widths.items()
+        _new_cidobj_bytes = _w_array_insert_sorted(
+            _cidobj_bytes, _bracket_start, _close_idx, _added_widths
         )
-        _new_cidobj_bytes = _cidobj_bytes[:_close_idx] + _new_entries + _cidobj_bytes[_close_idx:]
+        if _new_cidobj_bytes is None:
+            continue
 
         # ── /ToUnicode CMap Type0-обёртки. Глиф без записи в ToUnicode
         # рисуется корректно ВИЗУАЛЬНО, но для текстового слоя (fitz.get_text
@@ -1479,13 +1614,24 @@ def _process_halyk_pdf_once(
         # Отдельный beginbfchar/endbfchar блок перед endcmap — не трогаем
         # уже существующий bfrange-блок (не нужно пересчитывать его счётчик
         # диапазонов), несколько bfchar/bfrange блоков в одном CMap валидны
-        # по спецификации (ISO 32000).
+        # по спецификации (ISO 32000). EOL и разделитель между hex-токенами
+        # ЧИТАЮТСЯ из уже существующего bfrange/bfchar-блока этого же потока
+        # (см. _cmap_bf_style) — не хардкодятся: h6.pdf/HALYKformat1.pdf оба
+        # пишут "beginbfrange\r\n<023C><023C><0412>\r\n..." (CRLF, без
+        # пробела между токенами), а прежний код вставлял "\n" и пробел —
+        # видимое расхождение почерка ровно того класса, который вся эта
+        # ветка призвана убрать (см. CLAUDE.md, критерий 4).
+        _bf_style = _cmap_bf_style(_tu_body)
+        if _bf_style is None:
+            continue
+        _entry_eol, _token_sep = _bf_style
         _bfchar_block = (
-            f"{len(_tu_entries)} beginbfchar\n".encode("ascii")
+            f"{len(_tu_entries)} beginbfchar".encode("ascii") + _entry_eol
             + b"".join(
-                f"<{_cid}> <{ord(_ch):04X}>\n".encode("ascii") for _cid, _ch in _tu_entries
+                f"<{_cid}>".encode("ascii") + _token_sep + f"<{ord(_ch):04X}>".encode("ascii") + _entry_eol
+                for _cid, _ch in _tu_entries
             )
-            + b"endbfchar\n"
+            + b"endbfchar" + _entry_eol
         )
         _new_tu_body = _tu_body[:_endcmap_idx] + _bfchar_block + _tu_body[_endcmap_idx:]
         _new_tu_compressed = zlib.compress(_new_tu_body) if _tu_is_flate else _new_tu_body
