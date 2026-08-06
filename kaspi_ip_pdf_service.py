@@ -316,6 +316,102 @@ def _purpose_repeats_amount(purpose: str, amount: float) -> bool:
     return re.search(r"(?<!\d)" + digits + r"(?!\d)", compact) is not None
 
 
+def _locate_purpose_amount(
+    line: str, amount: float
+) -> Optional[Tuple[int, int, str, str, bool]]:
+    """Находит позицию цифрового прогона суммы `amount` внутри ОДНОЙ визуальной
+    строки назначения платежа `line` и определяет формат разделителей,
+    использованный именно в этой строке (одна выписка одновременно содержит
+    и "145000-00", и "65 000,00" — единой конвенции нет, см. design spec
+    docs/superpowers/specs/2026-08-06-kaspi-ip-purpose-amount-rewrite-design.md).
+
+    Возвращает (start, end, thousands_sep, decimal_sep, has_decimal):
+    - start/end — индексы в `line` (НЕ в компактной форме без пробелов),
+      задающие срез line[start:end], который целиком покрывает цифровой
+      прогон суммы (целая часть + разделители тысяч + копейки, если есть).
+    - thousands_sep — разделитель между группами разрядов (" "/nbsp или "";
+      "" если сумма записана без разделителя тысяч, напр. "145000-00").
+    - decimal_sep — "," или "-" перед копейками, "" если копеек нет вовсе.
+    - has_decimal — есть ли в СТРОКЕ копейки при этой сумме (напр. "Сумма
+      75000 тенге" без "-00" — has_decimal=False; отличается от "есть ли
+      копейки у самой суммы" — сумма всегда целая тысяча после округления
+      recalculate_kaspi_ip, здесь речь о ТЕКСТЕ).
+
+    None — сумма НЕ найдена в line ЦЕЛИКОМ: либо её вообще нет в строке,
+    либо цифровой прогон разорван переносом на следующую строку (реальный
+    пример: "…Сумма - 65" / "000,00 тенге…" на двух разных Tj) — такие
+    случаи вне рамок этой задачи (см. design spec, "Область охвата"),
+    вызывающая сторона обязана пропустить транзакцию, не роняя её.
+    """
+    if amount < _PURPOSE_AMOUNT_MIN or not line:
+        return None
+    digits = str(int(round(amount)))
+
+    # Компактная форма (без пробела/nbsp) + карта "индекс в compact -> индекс
+    # в line" — тот же принцип нормализации, что и в _purpose_repeats_amount,
+    # но здесь позиция нужна для СРЕЗА, а не только для bool.
+    compact_chars: List[str] = []
+    index_map: List[int] = []
+    for i, ch in enumerate(line):
+        if ch in (" ", " "):
+            continue
+        compact_chars.append(ch)
+        index_map.append(i)
+    compact = "".join(compact_chars)
+
+    m = re.search(r"(?<!\d)" + re.escape(digits) + r"(?!\d)", compact)
+    if m is None:
+        return None
+    start_c, end_c = m.start(), m.end()
+
+    # thousands_sep: символ (если есть) между первыми двумя группами разрядов
+    # цифрового прогона — единственный наблюдаемый в реальных файлах случай
+    # (пробел ИЛИ ничего, никогда не "." и не разный внутри одного прогона).
+    thousands_sep = ""
+    for c_i in range(start_c, end_c - 1):
+        gap = index_map[c_i + 1] - index_map[c_i]
+        if gap > 1:
+            thousands_sep = line[index_map[c_i] + 1 : index_map[c_i + 1]]
+            break
+
+    orig_start = index_map[start_c]
+    orig_end = index_map[end_c - 1] + 1
+
+    # Копейки: сразу после целой части В КОМПАКТНОЙ форме (без пробела между
+    # целой частью и разделителем — подтверждено на всех наблюдаемых реальных
+    # примерах), разделитель "," или "-", ровно 2 цифры.
+    has_decimal = False
+    decimal_sep = ""
+    if end_c < len(compact) and compact[end_c] in (",", "-"):
+        dec_digits = compact[end_c + 1 : end_c + 3]
+        if len(dec_digits) == 2 and dec_digits.isdigit():
+            has_decimal = True
+            decimal_sep = compact[end_c]
+            orig_end = index_map[end_c + 2] + 1
+
+    return orig_start, orig_end, thousands_sep, decimal_sep, has_decimal
+
+
+def _format_purpose_amount(
+    new_amount: float, thousands_sep: str, decimal_sep: str, has_decimal: bool
+) -> str:
+    """Форматирует new_amount в ТОЙ ЖЕ нотации, что нашла _locate_purpose_amount
+    в оригинальной строке — воспроизводит почерк КОНКРЕТНО этой строки, а не
+    общую конвенцию файла."""
+    int_part = str(int(round(abs(new_amount))))
+    if thousands_sep:
+        groups = []
+        rest = int_part
+        while len(rest) > 3:
+            groups.insert(0, rest[-3:])
+            rest = rest[:-3]
+        groups.insert(0, rest)
+        int_part = thousands_sep.join(groups)
+    if has_decimal:
+        cents = round((abs(new_amount) - int(round(abs(new_amount)))) * 100)
+        return f"{int_part}{decimal_sep}{cents:02d}"
+    return int_part
+
 
 # Страница повёрнута на 90° — PyMuPDF возвращает координаты уже в читаемом
 # порядке, поэтому колонки таблицы различаются по Y (не по X): у "Дебет" и
