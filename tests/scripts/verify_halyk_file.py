@@ -443,6 +443,25 @@ def check_bold_row_uniform(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
 
     missing = _bold_missing_digits(out_bytes)
     issues = []
+
+    # Task 5: если в этом прогоне писатель физически вшил недостающие глифы
+    # цифр в Bold-subset (Task 3/4), подмена шрифта не требуется вовсе — это
+    # сильнее, чем «перебор шума нашёл чистый вариант» (subs == 0 без этого
+    # пути тоже возможен, если сумма просто не содержала недостающую цифру).
+    # Помечаем отдельным маркером [glyph-patched], НЕ guard и не FAIL, чтобы
+    # в выводе battery было видно, что новый путь реально сработал.
+    info = getattr(hal, "LAST_RUN_INFO", {}) or {}
+    glyphs_patched = info.get("glyphs_patched") or {}
+    if glyphs_patched:
+        patched_cids = sorted(
+            {cid_hex for widths in glyphs_patched.values() for cid_hex in widths}
+        )
+        issues.append(
+            f"[glyph-patched] недостающие глифы цифр вшиты физически в Bold-subset "
+            f"({len(glyphs_patched)} шрифт(ов), CID {patched_cids}) — подмена шрифта "
+            f"в строке итогов не потребовалась"
+        )
+
     for row in _totals_rows(out_bytes):
         weights = {("B" if "Bold" in s["font"] else "R") for s in row}
         if len(weights) <= 1:
@@ -451,7 +470,6 @@ def check_bold_row_uniform(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
             f"{s['text'].strip()!r}:{'B' if 'Bold' in s['font'] else 'R'}" for s in row
         )
         why = f"; в жирном subset'е нет цифр {sorted(missing)}" if missing else ""
-        info = getattr(hal, "LAST_RUN_INFO", {}) or {}
         if info.get("unavoidable"):
             # Писатель ИЗМЕРИЛ неизбежность: ни одна из его попыток не дала
             # чистого варианта. Этоguard, а не FAIL — но выдаётся строго по
@@ -596,8 +614,14 @@ def run_one(path: Path, multipliers: list[float], out_dir: Path, render: bool) -
         )
         # Сообщения с префиксом «[guard]» — не провал: это случаи, чью
         # неустранимость движок ДОКАЗАЛ измерением (см. check_bold_row_uniform).
-        # Они всё равно попадают в примечание, чтобы не потеряться.
-        geo_fail = [i for i in geo_issues if not i.startswith("[guard]")]
+        # «[glyph-patched]» — тоже не провал, а информационная пометка о том,
+        # что недостающие глифы были физически вшиты в Bold-subset и подмена
+        # шрифта не потребовалась вовсе (Task 5). Оба всё равно попадают в
+        # примечание, чтобы не потеряться.
+        geo_fail = [
+            i for i in geo_issues
+            if not i.startswith("[guard]") and not i.startswith("[glyph-patched]")
+        ]
         geo_ok = len(geo_fail) == 0
         font_issues = font_check(raw, out_bytes)
         font_ok = len(font_issues) == 0

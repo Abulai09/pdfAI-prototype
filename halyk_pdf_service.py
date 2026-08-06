@@ -5,6 +5,7 @@ import re
 import zlib
 import random
 import math
+import struct
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,8 +19,12 @@ from pdf_service import (
     _round_to_natural,
     _fmt_coord,
     _op_separators,
+    _read_truetype_glyph,
+    _patch_truetype_glyphs,
+    _ttf_table_dir,
 )
 from pdf_service_downscale import IncomeTooLowError
+from halyk_bold_digits import DIGIT_GLYPHS, DIGIT_WIDTH_1000, SOURCE_UNITS_PER_EM
 
 # ─── Помощник: running balance на границах дней, не после каждой транзакции ──
 
@@ -202,6 +207,116 @@ def _parse_cid_widths(w_body: str) -> Dict[int, float]:
         else:
             i += 1
     return widths
+
+
+# ─── Стилевые конвенции /W и /ToUnicode для вписывания недостающих CID ─────
+# Та же дисциплина, что pdf_service._op_separators/_fmt_coord (см. CLAUDE.md,
+# критерий 4 «Стиль сериализации операторов»): конвенция ЧИТАЕТСЯ из самого
+# файла, а не хардкодится один раз на все форматы — h6.pdf пишет /W без
+# единого пробела ("19[500]21[500]"), а HALYKformat1.pdf с пробелом после
+# каждого "[" и между записями ("19[ 500] 20[ 500]"); оба реальных файла.
+
+_W_SINGLE_ENTRY_RE = re.compile(rb"(\d+)\[(\s*)(\d+)\]")
+
+
+def _w_array_entries(body: bytes, start: int, end: int) -> List[Tuple[int, int, int, bytes]]:
+    """Разбирает одиночные-CID записи 'cid[width]' /W-массива CIDFontType2 в
+    диапазоне [start, end) байтовой строки body. Возвращает список (cid,
+    entry_start, entry_end, inner_ws) в порядке появления — entry_start/
+    entry_end абсолютные индексы в body, inner_ws — пробельные байты между
+    '[' и цифрой ширины ЭТОЙ записи. Форма 'c1 c2 w' (диапазон одинаковых
+    ширин) не разбирается — на всех 6 локальных реальных файлах Halyk /W
+    всегда в одиночной форме 'cid[width]'; если встретится другая форма или
+    записей меньше двух, список короче двух элементов сигналит вызывающей
+    стороне отказаться от вставки (см. _w_array_insert_sorted).
+    """
+    return [
+        (int(m.group(1)), m.start(), m.end(), m.group(2))
+        for m in _W_SINGLE_ENTRY_RE.finditer(body, start, end)
+    ]
+
+
+def _w_array_insert_sorted(
+    cidobj_bytes: bytes,
+    bracket_start: int,
+    close_idx: int,
+    new_entries: Dict[str, float],
+) -> Optional[bytes]:
+    """Вставляет новые CID-записи в /W-массив В ВОЗРАСТАЮЩЕМ порядке CID (как
+    во всех реальных файлах — иначе хвост массива выглядит как «кто-то
+    дописал руками»), разделителем/внутренним пробелом САМОГО ЭТОГО массива,
+    а не хардкодом.
+
+    new_entries — {cid_hex: width}. Возвращает новые байты объекта CIDFont
+    (cidobj_bytes с точечными splice-вставками) либо None, если конвенцию
+    или записей меньше двух — недостаточно, чтобы доверять «доминантному»
+    разделителю, отказ вместо угадывания.
+    """
+    entries = _w_array_entries(cidobj_bytes, bracket_start + 1, close_idx)
+    if len(entries) < 2:
+        return None
+    # Разделитель МЕЖДУ соседними записями (например b"" или b" ") — берём из
+    # промежутка после первой же записи; конвенция однородна по всему массиву
+    # (проверено на h6.pdf и HALYKformat1.pdf).
+    dominant_sep = cidobj_bytes[entries[0][2]:entries[1][1]]
+    dominant_inner_ws = entries[0][3]
+
+    # Для каждого нового CID точка вставки вычисляется из НЕИЗМЕНЁННОГО
+    # списка entries (снимок до любых правок) — конец последней записи с
+    # cid МЕНЬШЕ нового (если такой нет — самое начало массива, перед первой
+    # записью). Применяются позже в порядке убывания позиции, чтобы splice
+    # одной записи не сдвигал ещё не применённые точки вставки (тот же приём,
+    # что и «запись от конца файла к началу» ниже по трём FontFile2/W/
+    # ToUnicode-регионам).
+    insertions = []
+    for cid_hex, width in new_entries.items():
+        new_cid = int(cid_hex, 16)
+        pos = bracket_start + 1
+        for cid, _e_start, e_end, _inner in entries:
+            if cid < new_cid:
+                pos = e_end
+            else:
+                break
+        new_bytes = (
+            dominant_sep
+            + f"{new_cid}[".encode("ascii")
+            + dominant_inner_ws
+            + f"{int(width)}]".encode("ascii")
+        )
+        insertions.append((pos, new_bytes))
+
+    result = bytearray(cidobj_bytes)
+    for pos, new_bytes in sorted(insertions, key=lambda t: t[0], reverse=True):
+        result[pos:pos] = new_bytes
+    return bytes(result)
+
+
+def _cmap_bf_style(body: bytes) -> Optional[Tuple[bytes, bytes]]:
+    """Читает конвенции EOL и межтокенного разделителя из существующего
+    beginbfrange/beginbfchar-блока ЭТОГО ToUnicode CMap-потока — тот же
+    принцип, что и /W выше: h6.pdf/HALYKformat1.pdf оба пишут записи
+    'beginbfrange' как '<XXXX><XXXX><YYYY>\\r\\n' (CRLF, без пробела между
+    hex-токенами), но хардкодить это на все возможные Halyk-файлы неверно.
+
+    Возвращает (entry_eol, token_sep) либо None, если в потоке нет ни
+    одного bfrange/bfchar-блока хотя бы с одной записью — тогда вызывающая
+    сторона обязана отказаться от вставки нового bfchar-блока, а не
+    гадать про EOL/пробелы.
+    """
+    m = re.search(rb"beginbf(range|char)", body)
+    if m is None:
+        return None
+    tail = body[m.end():]
+    if m.group(1) == b"range":
+        entry_re = re.compile(
+            rb"<[0-9A-Fa-f]+>(\s*)<[0-9A-Fa-f]+>\s*<[0-9A-Fa-f]+>(\r\n|\r|\n)"
+        )
+    else:
+        entry_re = re.compile(rb"<[0-9A-Fa-f]+>(\s*)<[0-9A-Fa-f]+>(\r\n|\r|\n)")
+    em = entry_re.search(tail)
+    if em is None:
+        return None
+    return em.group(2), em.group(1)
 
 
 # ─── Dataclasses ───────────────────────────────────────────────────────────
@@ -976,16 +1091,101 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
     return stmt
 
 
+# ─── Вшивание недостающих глифов цифр в Bold-subset шрифт ──────────────────
+# См. docs/superpowers/specs/2026-08-05-halyk-bold-glyph-embedding-design.md.
+# Заменяет собой (частично) необходимость подмены Bold->Regular в
+# replace_callback ниже: если патч удаётся, avail_cids_map после него уже
+# содержит нужный CID, и needs_switch там просто не сработает — остальной
+# код (needs_switch, retry-перебор шума, [guard]-репортинг) не меняется и
+# остаётся страховкой на случай отказа gate'а.
+
+
+def _try_patch_bold_digit_glyphs(
+    ff2_bytes: bytes,
+    digit_cids: Dict[str, str],
+) -> Optional[Tuple[bytes, Dict[str, float]]]:
+    """Пытается вписать в Bold-subset шрифт недостающие глифы цифр 0-9.
+
+    digit_cids — {цифра: CID в виде 4-символьного hex}, тот же формат, что
+    ключи avail_cids_map (обычно {'0': '0013', ..., '9': '001C'}, но
+    вычисляется вызывающей стороной из FROM_UNICODE, а не жёстко здесь).
+
+    Возвращает (новые байты FontFile2, {cid_hex: 500.0}) для реально
+    допатченных цифр, либо None — если патчить нечего, или "gate" не
+    позволяет доверять зашитым эталонным глифам для ЭТОГО конкретного
+    файла (см. ниже). None означает «ничего не меняли», вызывающая сторона
+    не отклоняется от старого поведения.
+    """
+    try:
+        # unitsPerEm — сверяем через head-таблицу, переиспользуя разбор directory
+        # из pdf_service._ttf_table_dir (избегаем дублирования).
+        table_dir = _ttf_table_dir(ff2_bytes)
+        if "head" not in table_dir:
+            return None
+        head_offset, _ = table_dir["head"]
+        units_per_em = struct.unpack(">H", ff2_bytes[head_offset + 18:head_offset + 20])[0]
+        if units_per_em != SOURCE_UNITS_PER_EM:
+            return None
+
+        missing_digits = []
+        verified_match = False
+
+        for digit in "0123456789":
+            cid_hex = digit_cids.get(digit)
+            if cid_hex is None:
+                continue
+            gid = int(cid_hex, 16)
+            existing = _read_truetype_glyph(ff2_bytes, gid)
+            baked = DIGIT_GLYPHS[digit]
+            if existing == b"":
+                missing_digits.append(digit)
+                continue
+            # Present digit — сверяем с эталоном как gate ("сначала проверь,
+            # потом доверяй"): existing может быть на 1 байт длиннее (паддинг
+            # до чётной длины внутри glyf-таблицы), поэтому сравниваем по
+            # префиксу и требуем, чтобы хвост был нулевым И длина delta ≤ 1.
+            n = len(baked)
+            len_delta = len(existing) - n
+            if (
+                len_delta in (0, 1)
+                and existing[:n] == baked
+                and all(b == 0 for b in existing[n:])
+            ):
+                verified_match = True
+            else:
+                return None  # другой мастер-шрифт — не доверяем НИЧЕМУ
+
+        if not verified_match or not missing_digits:
+            return None
+
+        glyph_patches = {int(digit_cids[d], 16): DIGIT_GLYPHS[d] for d in missing_digits}
+        patched = _patch_truetype_glyphs(ff2_bytes, glyph_patches)
+        added_widths = {digit_cids[d]: DIGIT_WIDTH_1000 for d in missing_digits}
+        return patched, added_widths
+    except Exception as exc:  # noqa: BLE001 — любой сбой здесь ЧИСТО fallback, не проброс
+        print(f"[Halyk] Патч глифов Bold не применён ({exc.__class__.__name__}: {exc}) "
+              f"— используется старое поведение (подмена шрифта/перебор шума).")
+        return None
+
+
 # ─── Сырая замена байт ─────────────────────────────────────────────────────
 
-def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) -> Tuple[bytes, int]:
-    """Один проход обработки. Возвращает (результат, число подмен шрифта).
+def _process_halyk_pdf_once(
+    input_bytes: bytes, target_monthly_income: float
+) -> Tuple[bytes, int, Dict[int, Dict[str, float]]]:
+    """Один проход обработки. Возвращает (результат, число подмен шрифта,
+    вшитые глифы).
 
     Второй элемент — сколько раз пришлось нарисовать число ЧУЖИМ (Regular)
     шрифтом вместо жирного, потому что в жирном subset'е не оказалось нужного
     глифа (см. `needs_switch` ниже). Вызывающая обёртка `process_halyk_pdf`
     использует его, чтобы перебрать шум и по возможности получить результат
     вообще без подмен.
+
+    Третий элемент — {cid_xref: {cid_hex: width}} для Bold-шрифтов, в которые
+    реально были вшиты недостающие глифы цифр в этом прогоне (Task 3/4) —
+    используется только для отчётности автотестов (LAST_RUN_INFO), не
+    прод-логикой.
     """
     from collections import deque as _deque
 
@@ -1038,6 +1238,17 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
     # в шрифте нет, и наша замена с этой цифрой отрисуется пустым «.notdef».
     # Нужно, чтобы такие токены переключать на Regular-шрифт (там глиф есть).
     _xref_avail_cids: Dict[int, Dict[str, set]] = {}  # content_xref → {F-name: {cid_hex}}
+    # content_xref → {F-name: (cid_font_xref, FontFile2_xref, ToUnicode_xref)}
+    # — только для Bold-шрифтов, собирается заодно с _page_avail_cids ниже;
+    # используется ниже (до doc.close()) для построения множества уникальных
+    # троек шрифтов, которые нужно попытаться допатчить недостающими глифами
+    # цифр. ToUnicode_xref — объект CMap-потока Type0-обёртки (не CIDFont-
+    # потомка): без него вписанный глиф рисуется корректно, но текстовый слой
+    # (извлечение текста/копипаст/поиск, а также ЛЮБАЯ проверка в этом
+    # проекте, читающая PDF через fitz.get_text — все, т.к. они не парсят
+    # глиф-контуры) для этого CID останется пустым — глиф "невидим" для
+    # текста. None, если у конкретного Bold-шрифта нет /ToUnicode вовсе.
+    _xref_bold_ff2: Dict[int, Dict[str, Tuple[int, int, Optional[int]]]] = {}
     for _pn in range(len(doc)):
         _page_contents = doc[_pn].get_contents()
         _pobj = doc.xref_object(doc[_pn].xref)
@@ -1047,6 +1258,7 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
         _page_space_w: Dict[str, float] = {}
         _page_comma_w: Dict[str, float] = {}
         _page_avail_cids: Dict[str, set] = {}
+        _page_bold_ff2: Dict[str, Tuple[int, int, Optional[int]]] = {}  # F-name -> (cid_xref, ff2_xref, tounicode_xref)
         for _fn, _fx in re.findall(r"/F(\d+)\s+(\d+)\s+0\s+R", _pobj):
             try:
                 _fobj = doc.xref_object(int(_fx))
@@ -1081,6 +1293,17 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
                                 _cw = _w_widths.get(int(_comma_cid, 16))
                                 if _cw is not None:
                                     _page_comma_w["F" + _fn] = _cw
+                    if "Bold" in _bname or ",B" in _bname or "bold" in _bname:
+                        _fd_m2 = re.search(r"/FontDescriptor\s+(\d+)\s+0\s+R", _cidobj)
+                        if _fd_m2:
+                            _fdobj2 = doc.xref_object(int(_fd_m2.group(1)))
+                            _ff2_m2 = re.search(r"/FontFile2\s+(\d+)\s+0\s+R", _fdobj2)
+                            if _ff2_m2:
+                                _tu_m2 = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", _fobj)
+                                _tu_xref2 = int(_tu_m2.group(1)) if _tu_m2 else None
+                                _page_bold_ff2["F" + _fn] = (
+                                    int(_desc_m.group(1)), int(_ff2_m2.group(1)), _tu_xref2,
+                                )
             except Exception:
                 pass
         for _cx in _page_contents:
@@ -1090,6 +1313,7 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
             _xref_space_w[_cx] = _page_space_w
             _xref_comma_w[_cx] = _page_comma_w
             _xref_avail_cids[_cx] = _page_avail_cids
+            _xref_bold_ff2[_cx] = _page_bold_ff2
 
     # ── Карта page→xref (для порядка обработки) ──────────────────────────
     page_xrefs = [doc[i].get_contents() for i in range(len(doc))]
@@ -1097,6 +1321,18 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
     # overflow-ужатие шрифта в replace_callback): широкий «Исходящий остаток»
     # в строке «…в валюте: <сумма>» выезжает за кромку листа.
     _page_width = max((doc[i].rect.width for i in range(len(doc))), default=595.276)
+
+    # Множество уникальных пар (cid_font_xref, FontFile2_xref) по всему
+    # документу — один и тот же Bold-шрифт обычно встречается на каждой
+    # странице под одним и тем же именем ресурса, патчить его нужно только
+    # один раз. Собирается ДО doc.close(), т.к. читает doc.xref_object() выше.
+    _bold_font_pairs: set = set()
+    for _m in _xref_bold_ff2.values():
+        _bold_font_pairs.update(_m.values())
+    # digit_cids для gate _try_patch_bold_digit_glyphs — тот же CID-маппинг,
+    # что уже вычислен для всего документа через FROM_UNICODE выше.
+    _digit_cids = {ch: FROM_UNICODE[ch] for ch in "0123456789" if ch in FROM_UNICODE}
+
     doc.close()
 
 
@@ -1220,6 +1456,228 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
     total_replaced = 0
     font_substitutions = 0
     cumulative_offset = 0
+
+    # ── Патч Bold-шрифта: вшиваем недостающие глифы цифр, если gate
+    # позволяет доверять зашитому эталону (см. halyk_bold_digits.py).
+    # Делается ПЕРВЫМ, до поиска позиций content-стримов — все последующие
+    # raw.find() увидят уже сдвинутые (после этого патча) позиции сами по
+    # себе, отдельного cumulative_offset для этого шага не нужно.
+    _newly_available_cids: Dict[int, Dict[str, float]] = {}  # cid_xref -> {cid_hex: width}
+    _cid_to_digit_char = {_v: _k for _k, _v in _digit_cids.items()}  # cid_hex -> '0'..'9'
+    for _cid_xref, _ff2_xref, _tu_xref in _bold_font_pairs:
+        # ── Резолвим и готовим ВСЕ ТРИ правки (FontFile2, /W, ToUnicode) из
+        # ОДНОГО снимка `raw` — ни одной записи в `raw` до этого момента.
+        # Так гарантируется настоящая, а не «в основном верная», атомарность:
+        # либо все три позиции разрешились и патч применяется целиком, либо
+        # НИ ОДНА запись не происходит вовсе (см. код-ревью Task 4 — прежняя
+        # версия делала свежий raw.find() для ToUnicode ПОСЛЕ того, как
+        # FontFile2/W уже были записаны в raw, и на невозможность найти
+        # ToUnicode в этот момент реагировала предупреждением, а не отменой
+        # уже применённых правок — оставляя ровно то частично пропатченное
+        # состояние, которого весь этот блок должен избегать).
+        _ff2_pattern = f"{_ff2_xref} 0 obj".encode()
+        _ff2_pos = raw.find(_ff2_pattern)
+        if _ff2_pos < 0:
+            continue
+        _stream_kw = raw.find(b"stream", _ff2_pos)
+        _data_start = _stream_kw + len(b"stream")
+        if raw[_data_start:_data_start + 2] == b"\r\n":
+            _data_start += 2
+        elif raw[_data_start:_data_start + 1] == b"\n":
+            _data_start += 1
+        _endstream_pos = raw.find(b"endstream", _data_start)
+        _header = bytes(raw[_ff2_pos:_stream_kw])
+        _len_m = re.search(rb"/Length\s+(\d+)", _header)
+        if not _len_m:
+            continue
+        _old_length = int(_len_m.group(1))
+        _compressed = bytes(raw[_data_start:_data_start + _old_length])
+        try:
+            _ff2_bytes = zlib.decompress(_compressed)
+        except zlib.error:
+            continue
+
+        # ── CIDFont-словарь: читаем ЗАРАНЕЕ, до вызова
+        # _try_patch_bold_digit_glyphs (который доверяет CID == GID) — нужен
+        # и для gate /CIDToGIDMap ниже, и позже для правки /W того же
+        # объекта. Один fetch на оба использования, не два.
+        _cid_pattern = f"{_cid_xref} 0 obj".encode()
+        _cid_pos = raw.find(_cid_pattern)
+        if _cid_pos < 0:
+            continue
+        _endobj_pos = raw.find(b"endobj", _cid_pos)
+        _cidobj_bytes = bytes(raw[_cid_pos:_endobj_pos])
+
+        # ── Gate /CIDToGIDMap (design spec — см. docs/superpowers/specs/
+        # 2026-08-05-halyk-bold-glyph-embedding-design.md, раздел про
+        # _try_patch_bold_digit_glyphs, п.1): если у CIDFont-словаря явно
+        # присутствует /CIDToGIDMap И это НЕ /Identity (т.е. ссылка на
+        # отдельный поток GID-маппинга), CID == GID доверять нельзя —
+        # патчить этот шрифт вообще не пытаемся, откат на старое поведение
+        # (подмена шрифта/перебор шума), как и любой другой отказ gate'а.
+        # Отсутствие ключа или явный /Identity — CID == GID, как и
+        # предполагает весь код ниже (на всех 6 локальных реальных файлах
+        # ключа /CIDToGIDMap нет вовсе — эта ветка для них no-op).
+        _c2g_m = re.search(rb"/CIDToGIDMap\s*/Identity\b", _cidobj_bytes)
+        if b"/CIDToGIDMap" in _cidobj_bytes and _c2g_m is None:
+            continue
+
+        _result = _try_patch_bold_digit_glyphs(_ff2_bytes, _digit_cids)
+        if _result is None:
+            continue
+        _patched_ff2, _added_widths = _result
+
+        # Готовим содержимое правки FontFile2 (ничего в raw ещё не пишем).
+        _new_compressed = zlib.compress(_patched_ff2)
+        _new_length = len(_new_compressed)
+        _new_length1 = len(_patched_ff2)
+        _new_header = re.sub(rb"/Length\s+\d+", f"/Length {_new_length}".encode(), _header)
+        _new_header = re.sub(rb"/Length1\s+\d+", f"/Length1 {_new_length1}".encode(), _new_header)
+        # Разделитель между "stream" и телом ("\r\n" или "\n") — берём из
+        # оригинала, не хардкодим, тот же приём, что _op_separators для
+        # content-стримов.
+        _stream_sep = bytes(raw[_stream_kw + len(b"stream"):_data_start])
+        _trailing = bytes(raw[_data_start + _old_length:_endstream_pos])
+        _ff2_replacement = _new_header + b"stream" + _stream_sep + _new_compressed + _trailing
+
+        # /W-массив CIDFont-словаря (_cidobj_bytes/_endobj_pos уже получены
+        # выше, вместе с gate'ом /CIDToGIDMap) — вставляем новые записи В
+        # ВОЗРАСТАЮЩЕМ порядке CID, разделителем/внутренним пробелом САМОГО
+        # ЭТОГО файла (не хардкодом): h6.pdf пишет "19[500]21[500]..." без
+        # единого пробела, а HALYKformat1.pdf — "19[ 500] 20[ 500]..." с
+        # пробелом после каждого "[" и между записями. См.
+        # _w_array_insert_sorted (тот же принцип, что pdf_service.
+        # _op_separators — конвенция читается из соседних записей ЭТОГО
+        # файла). Ничего не пишем в raw здесь.
+        _w_m = re.search(rb"/W\s*\[", _cidobj_bytes)
+        if not _w_m:
+            continue
+        _bracket_start = _w_m.end() - 1
+        _depth = 0
+        _close_idx = None
+        for _j in range(_bracket_start, len(_cidobj_bytes)):
+            _c = _cidobj_bytes[_j:_j + 1]
+            if _c == b"[":
+                _depth += 1
+            elif _c == b"]":
+                _depth -= 1
+                if _depth == 0:
+                    _close_idx = _j
+                    break
+        if _close_idx is None:
+            continue
+        _new_cidobj_bytes = _w_array_insert_sorted(
+            _cidobj_bytes, _bracket_start, _close_idx, _added_widths
+        )
+        if _new_cidobj_bytes is None:
+            continue
+
+        # ── /ToUnicode CMap Type0-обёртки. Глиф без записи в ToUnicode
+        # рисуется корректно ВИЗУАЛЬНО, но для текстового слоя (fitz.get_text
+        # — извлечение текста/копипаст/поиск, и КАЖДАЯ проверка этого
+        # проекта, читающая PDF именно так, включая её же
+        # check_totals_match_rows) этот CID остаётся непривязанным ни к
+        # какому символу и извлекается пустым. Найдено смоук-тестом на
+        # h6.pdf: без этого блока «859 800,00» реэкстрактился как «89
+        # 800,00» — CID новой «5» рисовался, но не читался как текст.
+        # Позиция и содержимое правки резолвятся здесь же, из того же
+        # снимка `raw`, что и FontFile2/W выше — ничего не пишем в raw.
+        _tu_entries = [
+            (_cid, _cid_to_digit_char[_cid]) for _cid in _added_widths if _cid in _cid_to_digit_char
+        ]
+        if _tu_xref is None or not _tu_entries:
+            continue
+        _tu_pos = raw.find(f"{_tu_xref} 0 obj".encode())
+        if _tu_pos < 0:
+            continue
+        _tu_stream_kw = raw.find(b"stream", _tu_pos)
+        _tu_data_start = _tu_stream_kw + len(b"stream")
+        if raw[_tu_data_start:_tu_data_start + 2] == b"\r\n":
+            _tu_data_start += 2
+        elif raw[_tu_data_start:_tu_data_start + 1] == b"\n":
+            _tu_data_start += 1
+        _tu_endstream_pos = raw.find(b"endstream", _tu_data_start)
+        _tu_header = bytes(raw[_tu_pos:_tu_stream_kw])
+        _tu_len_m = re.search(rb"/Length\s+(\d+)", _tu_header)
+        if not _tu_len_m:
+            continue
+        _tu_old_length = int(_tu_len_m.group(1))
+        _tu_compressed = bytes(raw[_tu_data_start:_tu_data_start + _tu_old_length])
+        _tu_is_flate = b"/FlateDecode" in _tu_header
+        try:
+            _tu_body = zlib.decompress(_tu_compressed) if _tu_is_flate else bytes(_tu_compressed)
+        except zlib.error:
+            continue
+        _endcmap_idx = _tu_body.rfind(b"endcmap")
+        if _endcmap_idx < 0:
+            continue
+        # Отдельный beginbfchar/endbfchar блок перед endcmap — не трогаем
+        # уже существующий bfrange-блок (не нужно пересчитывать его счётчик
+        # диапазонов), несколько bfchar/bfrange блоков в одном CMap валидны
+        # по спецификации (ISO 32000). EOL и разделитель между hex-токенами
+        # ЧИТАЮТСЯ из уже существующего bfrange/bfchar-блока этого же потока
+        # (см. _cmap_bf_style) — не хардкодятся: h6.pdf/HALYKformat1.pdf оба
+        # пишут "beginbfrange\r\n<023C><023C><0412>\r\n..." (CRLF, без
+        # пробела между токенами), а прежний код вставлял "\n" и пробел —
+        # видимое расхождение почерка ровно того класса, который вся эта
+        # ветка призвана убрать (см. CLAUDE.md, критерий 4).
+        _bf_style = _cmap_bf_style(_tu_body)
+        if _bf_style is None:
+            continue
+        _entry_eol, _token_sep = _bf_style
+        _bfchar_block = (
+            f"{len(_tu_entries)} beginbfchar".encode("ascii") + _entry_eol
+            + b"".join(
+                f"<{_cid}>".encode("ascii") + _token_sep + f"<{ord(_ch):04X}>".encode("ascii") + _entry_eol
+                for _cid, _ch in _tu_entries
+            )
+            + b"endbfchar" + _entry_eol
+        )
+        _new_tu_body = _tu_body[:_endcmap_idx] + _bfchar_block + _tu_body[_endcmap_idx:]
+        _new_tu_compressed = zlib.compress(_new_tu_body) if _tu_is_flate else _new_tu_body
+        _new_tu_header = re.sub(
+            rb"/Length\s+\d+", f"/Length {len(_new_tu_compressed)}".encode(), _tu_header
+        )
+        _tu_stream_sep = bytes(raw[_tu_stream_kw + len(b"stream"):_tu_data_start])
+        _tu_trailing = bytes(raw[_tu_data_start + _tu_old_length:_tu_endstream_pos])
+        _tu_replacement = _new_tu_header + b"stream" + _tu_stream_sep + _new_tu_compressed + _tu_trailing
+
+        # ── Применение: все три позиции уже разрешены из одного снимка
+        # `raw` выше — теперь пишем. Три индирект-объекта физически не
+        # пересекаются по построению PDF (это отдельные "N 0 obj"..."endobj"
+        # блоки), но на всякий случай проверяем это явно перед записью —
+        # если бы регионы пересеклись, применение в убывающем порядке start
+        # могло бы записать поверх ещё не применённой правки. Затем пишем
+        # от КОНЦА файла к НАЧАЛУ: splice в bytearray сдвигает все байты
+        # ПОСЛЕ точки правки, поэтому запись в более позднюю (по смещению)
+        # область никогда не портит start/end ещё не применённой более
+        # ранней области.
+        _regions = sorted(
+            [
+                (_ff2_pos, _endstream_pos, _ff2_replacement),
+                (_cid_pos, _endobj_pos, _new_cidobj_bytes),
+                (_tu_pos, _tu_endstream_pos, _tu_replacement),
+            ],
+            key=lambda r: r[0],
+            reverse=True,
+        )
+        if any(_regions[_k][0] < _regions[_k + 1][1] for _k in range(len(_regions) - 1)):
+            continue  # региона пересеклись — не должно случаться, но не пишем ничего
+        for _start, _end, _new_bytes in _regions:
+            raw[_start:_end] = _new_bytes
+
+        print(f"[Halyk] Вшиты недостающие цифры в Bold-шрифт (xref {_ff2_xref}), "
+              f"дополнена ToUnicode-карта (xref {_tu_xref}): {sorted(_added_widths.keys())}")
+
+        _newly_available_cids[_cid_xref] = _added_widths
+
+    if _newly_available_cids:
+        for _cx, _pair_map in _xref_bold_ff2.items():
+            for _fname, (_cx_cid_xref, _cx_ff2_xref, _cx_tu_xref) in _pair_map.items():
+                if _cx_cid_xref in _newly_available_cids:
+                    _xref_avail_cids.setdefault(_cx, {})
+                    _xref_avail_cids[_cx].setdefault(_fname, set())
+                    _xref_avail_cids[_cx][_fname] |= set(_newly_available_cids[_cx_cid_xref].keys())
 
     all_content_xrefs: set = set()
     for xrefs in page_xrefs:
@@ -1955,10 +2413,20 @@ def _process_halyk_pdf_once(input_bytes: bytes, target_monthly_income: float) ->
     print(f"\n[Halyk] Произведено замен: {total_replaced}")
 
     result = bytes(raw)
-    if cumulative_offset != 0:
+    # cumulative_offset отслеживает только сдвиги ОТ content-stream Td/Tj
+    # замен (см. цикл выше). Патч Bold-глифов (FontFile2/W/ToUnicode) тоже
+    # меняет общую длину файла, но делается ДО этого цикла и в этот
+    # накопитель не попадает — если сумма length_delta+delta по всем
+    # content-стримам случайно даст ровно 0 (растущие и уменьшающиеся замены
+    # взаимно погасились), проверка `cumulative_offset != 0` не заметит
+    # сдвиг от патча шрифта, xref не перестроится, и почти все offsets
+    # окажутся битыми. Поймано на практике (HALYKformat3.pdf x2, редкий
+    # розыгрыш шума — не воспроизвелось за ~200 последующих попыток, но
+    # причина установлена по коду, а не предположена).
+    if cumulative_offset != 0 or _newly_available_cids:
         result = _rebuild_xref_table(result)
 
-    return result, font_substitutions
+    return result, font_substitutions, _newly_available_cids
 
 
 # Сколько раз перебрать ±3% шум, пытаясь получить итоги без «недостающих» цифр.
@@ -2012,21 +2480,23 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
     файла из-за этого было бы хуже: всё остальное в нём корректно.
     """
     LAST_RUN_INFO.clear()
-    result, subs = _process_halyk_pdf_once(input_bytes, target_monthly_income)
+    result, subs, glyphs_patched = _process_halyk_pdf_once(input_bytes, target_monthly_income)
     attempts = 1
     if subs == 0:
-        LAST_RUN_INFO.update(attempts=1, min_substitutions=0, unavoidable=False)
+        LAST_RUN_INFO.update(attempts=1, min_substitutions=0, unavoidable=False,
+                              glyphs_patched=glyphs_patched)
         return result
     for attempt in range(2, _BOLD_GLYPH_RETRIES + 1):
-        cand, cand_subs = _process_halyk_pdf_once(input_bytes, target_monthly_income)
+        cand, cand_subs, cand_glyphs_patched = _process_halyk_pdf_once(input_bytes, target_monthly_income)
         attempts = attempt
         if cand_subs == 0:
             print(f"[Halyk] Подмена шрифта в строке итогов не понадобилась "
                   f"(попытка {attempt} из {_BOLD_GLYPH_RETRIES})")
-            LAST_RUN_INFO.update(attempts=attempt, min_substitutions=0, unavoidable=False)
+            LAST_RUN_INFO.update(attempts=attempt, min_substitutions=0, unavoidable=False,
+                                  glyphs_patched=cand_glyphs_patched)
             return cand
         if cand_subs < subs:
-            result, subs = cand, cand_subs
+            result, subs, glyphs_patched = cand, cand_subs, cand_glyphs_patched
     # Ни одна из попыток не дала чистого варианта — это и есть ДОКАЗАТЕЛЬСТВО
     # неизбежности, полученное измерением, а не рассуждением «в числе есть
     # недостающая цифра» (последнее верно всегда и потому ничего не значит).
@@ -2045,6 +2515,7 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
         attempts=attempts,
         min_substitutions=subs,
         unavoidable=attempts >= _MIN_ATTEMPTS_TO_PROVE,
+        glyphs_patched=glyphs_patched,
     )
     print(f"[Halyk] ⚠️ Не удалось избежать подмены шрифта за {_BOLD_GLYPH_RETRIES} "
           f"попыток: осталось {subs} — в жирном subset'е нет нужных цифр, и "

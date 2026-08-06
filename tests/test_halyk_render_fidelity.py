@@ -132,18 +132,38 @@ class TestBoldRowUniform:
         for path in HALYK_FILES:
             for mult, raw, out in _outputs(path):
                 issues = _quiet(vhal.check_bold_row_uniform, raw, out)
-                hard = [i for i in issues if not i.startswith("[guard]")]
+                # «[glyph-patched]» (Task 5) — не провал, а информационная
+                # пометка о том, что недостающие глифы были физически вшиты
+                # в Bold-subset и подмена шрифта не потребовалась вовсе;
+                # `verify_halyk_file.py` фильтрует её тем же способом.
+                hard = [
+                    i for i in issues
+                    if not i.startswith("[guard]") and not i.startswith("[glyph-patched]")
+                ]
                 assert not hard, f"{path.name} x{mult}: {hard}"
 
     @requires_corpus
-    def test_check_can_actually_fail(self):
+    def test_check_can_actually_fail(self, monkeypatch):
         """Мутация: перебор отключён — проверка обязана краснеть.
 
         Именно этот тест поймал, что первая версия проверки не срабатывала
         ни разу на 24 заведомо дефектных прогонах.
+
+        С 2026-08-05 (вшивание недостающих глифов цифр в Bold-subset,
+        `_try_patch_bold_digit_glyphs` + интеграция в `_process_halyk_pdf_once`)
+        `_BOLD_GLYPH_RETRIES=1` одного больше не хватает, чтобы воспроизвести
+        подмену шрифта: патч глифов детерминирован (не зависит от ±3% шума
+        конкретной попытки) и на ВСЕХ файлах корпуса, где раньше не хватало
+        цифр в Bold, теперь чинит это на первой же попытке — needs_switch
+        просто не срабатывает независимо от retries. Поэтому эта мутация
+        отдельно отключает и сам патч глифов (не только перебор), чтобы
+        по-прежнему проверять именно то, что и раньше: способность
+        `check_bold_row_uniform` заметить смешанное начертание, когда оно
+        РЕАЛЬНО происходит.
         """
         saved = hal._BOLD_GLYPH_RETRIES
         hal._BOLD_GLYPH_RETRIES = 1
+        monkeypatch.setattr(hal, "_try_patch_bold_digit_glyphs", lambda *a, **kw: None)
         try:
             fired = 0
             for path in HALYK_FILES:

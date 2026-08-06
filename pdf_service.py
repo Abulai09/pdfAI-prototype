@@ -2,6 +2,7 @@ import fitz
 import re
 import copy
 import random
+import struct
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Dict, Deque, Optional, Tuple
@@ -3182,5 +3183,182 @@ def _rebuild_xref_table(pdf_bytes: bytes) -> bytes:
         print(f"[XREF] startxref: {startxref_match.group(1).decode()} → {xref_pos}")
     
     print(f"[XREF] Обновлено {updated} offsets из {count}")
-    
+
     return bytes(raw)
+
+
+# ─── TrueType (sfnt) glyph patching — используется halyk_pdf_service.py для
+# вшивания недостающих глифов цифр в Bold-subset шрифт вместо подмены на
+# Regular. Разбирает/патчит таблицы вручную (без fontTools в рантайме — он
+# при пересборке меняет физический порядок таблиц даже без единой правки,
+# что для этого проекта неприемлемо, см. docs/superpowers/specs/
+# 2026-08-05-halyk-bold-glyph-embedding-design.md). ───────────────────────
+
+
+def _ttf_checksum(data: bytes) -> int:
+    """Чек-сумма TrueType-таблицы по спецификации sfnt: данные дополняются
+    нулями до кратности 4 байт, суммируются как big-endian uint32 со
+    сбросом переполнения."""
+    padded = data + b"\x00" * (-len(data) % 4)
+    total = 0
+    for i in range(0, len(padded), 4):
+        total = (total + struct.unpack(">L", padded[i:i + 4])[0]) & 0xFFFFFFFF
+    return total
+
+
+def _ttf_table_dir(font_bytes: bytes) -> Dict[str, Tuple[int, int]]:
+    """{tag: (offset, length)} по table directory sfnt-файла."""
+    num_tables = struct.unpack(">H", font_bytes[4:6])[0]
+    by_tag: Dict[str, Tuple[int, int]] = {}
+    for i in range(num_tables):
+        off = 12 + i * 16
+        tag, _checksum, offset, length = struct.unpack(">4sLLL", font_bytes[off:off + 16])
+        by_tag[tag.decode("ascii")] = (offset, length)
+    return by_tag
+
+
+def _ttf_loca(font_bytes: bytes, by_tag: Dict[str, Tuple[int, int]]) -> Tuple[List[int], int]:
+    """Возвращает (список офсетов глифов относительно начала glyf, indexToLocFormat)."""
+    if "loca" not in by_tag or "head" not in by_tag:
+        raise ValueError("font missing loca/head table")
+    loca_offset, loca_len = by_tag["loca"]
+    head_offset, _ = by_tag["head"]
+    fmt = struct.unpack(">h", font_bytes[head_offset + 50:head_offset + 52])[0]
+    if fmt not in (0, 1):
+        raise ValueError(f"unexpected indexToLocFormat {fmt}")
+    entry_size = 2 if fmt == 0 else 4
+    n = loca_len // entry_size
+    offsets = []
+    for i in range(n):
+        raw = font_bytes[loca_offset + i * entry_size: loca_offset + (i + 1) * entry_size]
+        if entry_size == 2:
+            offsets.append(struct.unpack(">H", raw)[0] * 2)
+        else:
+            offsets.append(struct.unpack(">L", raw)[0])
+    return offsets, fmt
+
+
+def _read_truetype_glyph(font_bytes: bytes, gid: int) -> bytes:
+    """Сырые байты одного глифа из glyf-таблицы (включая паддинг-байт до
+    чётной длины, если он есть — вызывающая сторона, сравнивающая с эталоном
+    неизвестной длины, должна сравнивать по префиксу + проверять, что хвост
+    нулевой, а не требовать точного совпадения длины)."""
+    by_tag = _ttf_table_dir(font_bytes)
+    if "glyf" not in by_tag:
+        raise ValueError("font missing glyf table")
+    glyf_offset, _glyf_len = by_tag["glyf"]
+    loca, _fmt = _ttf_loca(font_bytes, by_tag)
+    num_glyphs = len(loca) - 1
+    if gid < 0 or gid >= num_glyphs:
+        raise ValueError(f"gid {gid} out of range (numGlyphs={num_glyphs})")
+    start, end = loca[gid], loca[gid + 1]
+    return bytes(font_bytes[glyf_offset + start: glyf_offset + end])
+
+
+def _patch_truetype_glyphs(font_bytes: bytes, glyph_patches: Dict[int, bytes]) -> bytes:
+    """Точечно заменяет байты указанных GID в glyf-таблице TrueType-шрифта,
+    не трогая ничего вокруг: нетронутые глифы и все остальные таблицы
+    остаются побайтово идентичны входу, только сдвигаются на дельту длины,
+    если физически расположены в файле после glyf. Пересчитывает checksum
+    записей glyf/loca в table directory и глобальный head.checkSumAdjustment.
+
+    Кидает ValueError при любой неожиданной структуре (композитный глиф там,
+    где не ожидался; GID вне диапазона; отсутствие нужных таблиц) — не
+    пытается угадать и молча продолжить. Вызывающая сторона обязана поймать
+    исключение и откатиться к старому поведению (не менять шрифт).
+    """
+    try:
+        buf = bytearray(font_bytes)
+        num_tables = struct.unpack(">H", buf[4:6])[0]
+        dir_start = 12
+        entries = []  # [tag, checksum, offset, length] — мутируемый список
+        for i in range(num_tables):
+            off = dir_start + i * 16
+            tag, checksum, offset, length = struct.unpack(">4sLLL", buf[off:off + 16])
+            entries.append([tag.decode("ascii"), checksum, offset, length])
+        by_tag = {e[0]: e for e in entries}
+
+        for required in ("glyf", "loca", "head"):
+            if required not in by_tag:
+                raise ValueError(f"font missing {required} table")
+
+        glyf_e = by_tag["glyf"]
+        loca_e = by_tag["loca"]
+        head_e = by_tag["head"]
+        glyf_offset, glyf_len = glyf_e[2], glyf_e[3]
+        loca_offset, loca_len = loca_e[2], loca_e[3]
+
+        old_loca, index_to_loc_format = _ttf_loca(bytes(buf), {k: (v[2], v[3]) for k, v in by_tag.items()})
+        num_glyphs = len(old_loca) - 1
+        entry_size = 2 if index_to_loc_format == 0 else 4
+
+        old_glyf = bytes(buf[glyf_offset:glyf_offset + glyf_len])
+
+        for gid in glyph_patches:
+            if gid < 0 or gid >= num_glyphs:
+                raise ValueError(f"gid {gid} out of range (numGlyphs={num_glyphs})")
+
+        new_glyf = bytearray()
+        new_loca = [0]
+        for gid in range(num_glyphs):
+            if gid in glyph_patches:
+                data = glyph_patches[gid]
+                if len(data) % 2 != 0:
+                    data = data + b"\x00"
+            else:
+                start, end = old_loca[gid], old_loca[gid + 1]
+                data = old_glyf[start:end]
+            new_glyf.extend(data)
+            new_loca.append(len(new_glyf))
+        new_glyf = bytes(new_glyf)
+
+        if index_to_loc_format == 1:
+            new_loca_bytes = b"".join(struct.pack(">L", off) for off in new_loca)
+        else:
+            for off in new_loca:
+                if off % 2 != 0 or off // 2 > 0xFFFF:
+                    raise ValueError("glyf grew too large for short loca format")
+            new_loca_bytes = b"".join(struct.pack(">H", off // 2) for off in new_loca)
+
+        if len(new_loca_bytes) != loca_len:
+            raise ValueError("loca length changed unexpectedly")
+
+        old_glyf_padded_len = (glyf_len + 3) & ~3
+        new_glyf_padded = new_glyf + b"\x00" * (-len(new_glyf) % 4)
+        delta = len(new_glyf_padded) - old_glyf_padded_len
+
+        following = [e for e in entries if e[2] > glyf_offset]
+        if following:
+            next_e = min(following, key=lambda e: e[2])
+            if next_e[2] != glyf_offset + old_glyf_padded_len:
+                raise ValueError("unexpected gap after glyf table; refusing to patch")
+
+        buf[glyf_offset:glyf_offset + old_glyf_padded_len] = new_glyf_padded
+
+        for e in entries:
+            if e[2] > glyf_offset:
+                e[2] += delta
+
+        new_loca_offset = by_tag["loca"][2]
+        buf[new_loca_offset:new_loca_offset + loca_len] = new_loca_bytes
+
+        glyf_e[3] = len(new_glyf)
+        glyf_e[1] = _ttf_checksum(new_glyf)
+        loca_e[1] = _ttf_checksum(new_loca_bytes)
+
+        for i, e in enumerate(entries):
+            off = dir_start + i * 16
+            tag, checksum, offset, length = e
+            buf[off:off + 16] = struct.pack(">4sLLL", tag.encode("ascii"), checksum & 0xFFFFFFFF, offset, length)
+
+        new_head_offset = by_tag["head"][2]
+        buf[new_head_offset + 8:new_head_offset + 12] = b"\x00\x00\x00\x00"
+        total = _ttf_checksum(bytes(buf))
+        adjustment = (0xB1B0AFBA - total) & 0xFFFFFFFF
+        buf[new_head_offset + 8:new_head_offset + 12] = struct.pack(">L", adjustment)
+
+        return bytes(buf)
+    except ValueError:
+        raise
+    except (struct.error, IndexError, UnicodeDecodeError, KeyError) as e:
+        raise ValueError(f"invalid font structure: {e}")

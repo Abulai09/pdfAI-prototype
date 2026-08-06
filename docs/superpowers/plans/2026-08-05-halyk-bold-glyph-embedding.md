@@ -13,7 +13,7 @@
 - Никаких новых зависимостей в `requirements.txt` (рантайм). `fontTools` — только в `requirements-dev.txt`, используется исключительно тестами как независимый валидатор.
 - Стиль патченных байт PDF/шрифта обязан быть неотличим от того, что писал оригинальный генератор (криterion 4, `CLAUDE.md`) — никаких признаков пересборки инструментом (порядок таблиц шрифта, форматирование `/W`-массива без пробелов, как в оригинале).
 - Существующее поведение (перебор `_BOLD_GLYPH_RETRIES`, `[guard]`-репортинг) не удаляется — остаётся страховкой на случай отказа gate'а.
-- `pytest tests/` не должен регрессировать текущий бейзлайн 71 passed / 69 skipped.
+- `pytest tests/` не должен регрессировать текущий бейзлайн 83 passed / 69 skipped (измерено в этом worktree непосредственно перед стартом реализации — актуальнее, чем «71 passed», ранее зафиксированные в `CLAUDE.md`, т.к. с тех пор добавились новые fixture-free тестовые файлы).
 - Все новые pytest-тесты — fixture-free (не требуют `tests/fixtures/`, которых нет в этом checkout'е).
 - Полная real-file валидация — через `tests/scripts/verify_halyk_file.py` на `C:\Users\Abylay\Desktop\testpdf\halyk\*.pdf` (локальный корпус, не в git).
 
@@ -435,10 +435,27 @@ print('OK, numGlyphs=', tt2['maxp'].numGlyphs)
 ```
 Expected: `OK, numGlyphs= 4101` без исключений (уже проверено при подготовке этого плана — должно воспроизвестись один в один).
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Добавить `fonttools` в `requirements-dev.txt`**
+
+Текущее содержимое `requirements-dev.txt`:
+```
+-r requirements.txt
+pytest>=8.0.0
+```
+
+Добавить третью строку:
+```
+-r requirements.txt
+pytest>=8.0.0
+fonttools>=4.63.0
+```
+
+(`fonttools` уже установлен в этом окружении командой `pip install fonttools` при подготовке плана — версия 4.63.0. Используется только тестами этого и последующих задач, не рантайм-кодом.)
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add pdf_service.py tests/test_truetype_glyph_patch.py
+git add pdf_service.py tests/test_truetype_glyph_patch.py requirements-dev.txt
 git commit -m "feat(halyk): add low-level TrueType glyf/loca patcher (no fontTools at runtime)"
 ```
 
@@ -931,7 +948,7 @@ git commit -m "feat(halyk): add trust-gated glyph patch decision function"
 - [ ] **Step 4: Прогнать существующий `pytest tests/`, убедиться в отсутствии регрессии**
 
 Run: `pytest tests/ -v`
-Expected: тот же бейзлайн (71 passed / 69 skipped) плюс новые тесты из Task 1-3 — ничего не должно сломаться, т.к. на файлах без `_bold_font_pairs` (или там, где gate отказывает) `_newly_available_cids` остаётся пустым и весь новый блок — no-op.
+Expected: тот же бейзлайн (83 passed / 69 skipped) плюс новые тесты из Task 1-3 — ничего не должно сломаться, т.к. на файлах без `_bold_font_pairs` (или там, где gate отказывает) `_newly_available_cids` остаётся пустым и весь новый блок — no-op.
 
 - [ ] **Step 5: Commit**
 
@@ -1048,7 +1065,7 @@ python tests/scripts/verify_halyk_file.py "C:\Users\Abylay\Desktop\testpdf\halyk
 - [ ] **Step 3: `pytest tests/`**
 
 Run: `pytest tests/ -v`
-Expected: не хуже 71 passed / 69 skipped, плюс новые тесты этого плана (Task 1: 8, Task 2: 5, Task 3: 6 = +19).
+Expected: не хуже 83 passed / 69 skipped, плюс новые тесты этого плана (Task 1: 8, Task 2: 5, Task 3: 6 = +19).
 
 - [ ] **Step 4: Отрисовать и посмотреть глазами**
 

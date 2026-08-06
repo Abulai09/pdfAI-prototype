@@ -355,11 +355,18 @@ def run_one(path: Path, multipliers: list[float], render: bool) -> tuple[bool, l
         # verify_halyk_file.check_bold_row_uniform). Их надо показать, но не
         # ронять ими прогон — иначе батарея станет вечно красной и перестанет
         # читаться. Та же логика уже применена в verify_halyk_file.run_one.
+        # «[glyph-patched]» (Task 5) — тоже не провал, а информационная
+        # пометка о том, что недостающие Bold-глифы цифр были физически
+        # вшиты в subset и подмена шрифта не потребовалась вовсе; та же
+        # check_bold_row_uniform используется здесь напрямую через CRITERIA,
+        # поэтому фильтр нужен и тут, не только в verify_halyk_file.py.
         guard_notes = [
-            msg for msgs in results.values() for msg in msgs if msg.startswith("[guard]")
+            msg for msgs in results.values() for msg in msgs
+            if msg.startswith("[guard]") or msg.startswith("[glyph-patched]")
         ]
         results = {
-            k: [m for m in v if not m.startswith("[guard]")] for k, v in results.items()
+            k: [m for m in v if not m.startswith("[guard]") and not m.startswith("[glyph-patched]")]
+            for k, v in results.items()
         }
         if guard_notes:
             note = "; ".join(filter(None, [note, *guard_notes]))
