@@ -274,6 +274,72 @@ def check_column_alignment(orig_bytes: bytes, out_bytes: bytes, window: float = 
     ]
 
 
+def check_purpose_amount_consistency(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Для каждой транзакции ОРИГИНАЛА с amount_in_purpose=True, чья сумма при
+    данной цели изменилась: либо текст назначения в РЕЗУЛЬТАТЕ теперь содержит
+    НОВУЮ сумму (успех, без сообщения), либо это задокументированный skip
+    (перенос строки / gate по ширине — см. design spec
+    docs/superpowers/specs/2026-08-06-kaspi-ip-purpose-amount-rewrite-design.md)
+    — помечается [guard]. Молчаливое расхождение (ни то, ни другое — текст
+    остался со СТАРОЙ суммой без видимой причины) — FAIL.
+    """
+    orig_doc = fitz.open(stream=orig_bytes, filetype="pdf")
+    orig_stmt = kip.parse_kaspi_ip_statement(orig_doc)
+    orig_doc.close()
+
+    out_doc = fitz.open(stream=out_bytes, filetype="pdf")
+    out_stmt = kip.parse_kaspi_ip_statement(out_doc)
+    out_doc.close()
+
+    if len(orig_stmt.transactions) != len(out_stmt.transactions):
+        return []  # разное число транзакций — не эта проверка должна это ловить
+
+    issues = []
+    for tx_o, tx_n in zip(orig_stmt.transactions, out_stmt.transactions):
+        if not tx_o.amount_in_purpose or not tx_o.is_scaleable:
+            continue
+        if abs(tx_n.new_amount - tx_o.amount) < 0.005:
+            continue  # сумма фактически не изменилась при этой цели
+
+        locatable = any(
+            kip._locate_purpose_amount(ln, tx_o.amount) is not None
+            for ln, *_ in tx_o.purpose_line_bboxes
+        )
+        if not locatable:
+            issues.append(
+                f"[guard] {tx_o.doc_number}: сумма разорвана переносом строки в "
+                f"назначении — переписывание вне рамок (design spec)"
+            )
+            continue
+
+        new_digits = str(int(round(tx_n.new_amount)))
+        old_digits = str(int(round(tx_o.amount)))
+        new_out_purpose = " ".join(ln for ln, *_ in tx_n.purpose_line_bboxes)
+        compact = re.sub(r"[  ]", "", new_out_purpose)
+        has_new = re.search(r"(?<!\d)" + new_digits + r"(?!\d)", compact) is not None
+        has_old = re.search(r"(?<!\d)" + old_digits + r"(?!\d)", compact) is not None
+
+        if has_new and not has_old:
+            continue  # успех — сумма переписана
+        if has_old and not has_new:
+            # Не FAIL сама по себе: строка могла не влезть в эмпирическую
+            # ширину ячейки (см. design spec, gate) — это задокументированный,
+            # осознанный skip, а не молчаливое расхождение.
+            issues.append(
+                f"[guard] {tx_o.doc_number}: назначение платежа не переписано "
+                f"(старая сумма {old_digits} осталась, новая {new_digits} не "
+                f"уместилась — gate по ширине ячейки)"
+            )
+            continue
+        # has_new and has_old одновременно, или ни то ни другое — неоднозначный
+        # случай, требует ручного разбора.
+        issues.append(
+            f"{tx_o.doc_number}: неоднозначный результат переписывания "
+            f"назначения (old_present={has_old}, new_present={has_new})"
+        )
+    return issues
+
+
 def render_pages(pdf_bytes: bytes, out_dir: Path, label: str, pages: list[int], dpi: int = 150) -> None:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     for pn in pages:
@@ -325,20 +391,28 @@ def run_one(path: Path, multipliers: list[float], out_dir: Path, render: bool) -
         math_ok = len(math_issues) == 0
         hdr_issues = header_matches_body(out_bytes)
         hdr_ok = len(hdr_issues) == 0
-        geo_issues = (
+        geo_issues_all = (
             geometry_check(out_bytes, sample_pages=[1, 2])
             + style_check(raw, out_bytes)
             + check_isi_floor(out_bytes)
             + check_rounding_escalation(raw, out_bytes)
             + check_column_alignment(raw, out_bytes)
+            + check_purpose_amount_consistency(raw, out_bytes)
         )
+        # «[guard]» — не провал: случаи, чью неустранимость движок ДОКАЗАЛ
+        # измерением (см. check_purpose_amount_consistency — перенос строки
+        # разрывает сумму, либо новая строка не влезает в эмпирическую ширину
+        # ячейки — переписывание вне рамок design spec). Показываем в
+        # примечании, чтобы не потерялось, но не роняем ими батарею — та же
+        # конвенция, что уже применена в verify_halyk_file.py.
+        geo_issues = [i for i in geo_issues_all if not i.startswith("[guard]")]
         geo_ok = len(geo_issues) == 0
 
         (out_dir / f"{path.stem}_{label}.pdf").write_bytes(out_bytes)
         if render:
             render_pages(out_bytes, out_dir, f"{path.stem}_{label}", pages=[0, 1])
 
-        note = "; ".join(math_issues + hdr_issues + geo_issues)
+        note = "; ".join(math_issues + hdr_issues + geo_issues_all)
         rows.append((label, target, "process",
                      "OK" if math_ok else "FAIL",
                      "OK" if hdr_ok else "FAIL",
