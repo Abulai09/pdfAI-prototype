@@ -216,9 +216,18 @@ class KaspiIPTransaction:
     purpose: str              # Назначение платежа
     new_amount: float = 0.0
     # Сумма строки продублирована внутри «Назначения платежа» («…Сумма
-    # 210 000-00 теңге…»). Такие строки НЕ масштабируются — см.
-    # _purpose_repeats_amount и причину там же.
+    # 210 000-00 теңге…»). Масштабируются наравне с остальными (заморозка
+    # таких строк пробовалась и откачена 2026-08-04 — см. CLAUDE.md,
+    # ISI падал ниже жёсткого порога); при этом амбиции переписать саму
+    # сумму И внутри текста назначения см. purpose_line_bboxes ниже и
+    # docs/superpowers/specs/2026-08-06-kaspi-ip-purpose-amount-rewrite-design.md.
     amount_in_purpose: bool = False
+    # (текст_строки, x0, x1, y_mid, font_size) для КАЖДОЙ визуальной строки,
+    # вошедшей в purpose (до обрезки [:120]) — используется писателем
+    # (process_kaspi_ip_pdf) чтобы локализовать и переписать цифровой прогон
+    # суммы внутри назначения, если amount_in_purpose=True. НЕ пишется в PDF
+    # напрямую — вспомогательные данные парсинга.
+    purpose_line_bboxes: List[Tuple[str, float, float, float, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -570,21 +579,26 @@ def parse_kaspi_ip_statement(doc) -> KaspiIPStatementData:
     return KaspiIPStatementData(summary=summary, transactions=transactions)
 
 
-def _page_lines_with_y(page) -> List[Tuple[str, Optional[float]]]:
+def _page_lines_with_y(page) -> List[Tuple[str, Optional[Tuple[float, float, float, float]], float]]:
     """
     Строки страницы (как в get_text(), с тем же порядком и разбиением), но
-    каждая — с Y-координатой середины (для определения колонки Дебет/Кредит).
+    каждая — с полным bbox и размером шрифта первого спана. Нужны: bbox.y —
+    для определения колонки Дебет/Кредит (как раньше), bbox.x0/x1 и размер —
+    для gate по ширине при переписывании строк "Назначение платежа" (см.
+    process_kaspi_ip_pdf, purpose_line_bboxes на KaspiIPTransaction).
     Строится из get_text("dict"), а не из отдельного вызова get_text(), чтобы
-    порядок и разбиение на строки совпадали с bbox гарантированно (единый источник).
+    порядок и разбиение на строки совпадали с bbox гарантированно (единый
+    источник).
     """
-    result: List[Tuple[str, Optional[float]]] = []
+    result: List[Tuple[str, Optional[Tuple[float, float, float, float]], float]] = []
     d = page.get_text("dict")
     for block in d.get("blocks", []):
         for line in block.get("lines", []):
-            text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+            spans = line.get("spans", [])
+            text = "".join(s.get("text", "") for s in spans).strip()
             bbox = line.get("bbox")
-            y_mid = (bbox[1] + bbox[3]) / 2 if bbox else None
-            result.append((text, y_mid))
+            size = spans[0].get("size", 0.0) if spans else 0.0
+            result.append((text, tuple(bbox) if bbox else None, size))
     return result
 
 
@@ -593,7 +607,7 @@ def _parse_transactions_from_page(
 ):
     """Парсит транзакции со страницы через текстовый вывод."""
     lines_with_y = _page_lines_with_y(page)
-    lines_text = [t for t, _y in lines_with_y]
+    lines_text = [t for t, _bbox, _sz in lines_with_y]
 
     # Структура каждой транзакции в Kaspi IP (по позиции строки):
     # i+0: doc_number (1-9 цифр — номер документа/КНП-ссылки может быть
@@ -652,7 +666,8 @@ def _parse_transactions_from_page(
 
         # Кредит vs Дебет — по Y-координате колонки (не по назначению платежа,
         # см. комментарий у _DEBIT_SCALE_KEYWORDS).
-        amount_y = lines_with_y[i + 3][1]
+        amount_bbox = lines_with_y[i + 3][1]
+        amount_y = (amount_bbox[1] + amount_bbox[3]) / 2 if amount_bbox else None
         is_credit = amount_y is not None and amount_y < cd_threshold
 
         # Собираем остаток блока до следующего doc_number.
@@ -665,24 +680,32 @@ def _parse_transactions_from_page(
         # doc_number отличают так же, как и на верхнем уровне сканирования:
         # следующая строка после него — дата.
         j = i + 4
-        block_lines = []
+        block_line_idxs: List[int] = []
         while j < len(lines_text):
             ln = lines_text[j]
             if _DOC_NUM_RE.match(ln) and j + 1 < len(lines_text) and _DATE_RE.search(lines_text[j + 1]):
                 break
             if "Итого" in ln or "Входящий" in ln or "Исходящий" in ln:
                 break
-            block_lines.append(ln)
+            block_line_idxs.append(j)
             j += 1
 
-        # Назначение: пропускаем IBAN/BIN/BIC/КНП, берём остальное
+        # Назначение: пропускаем IBAN/BIN/BIC/КНП, берём остальное. Заодно
+        # запоминаем bbox+размер каждой вошедшей строки — нужно писателю
+        # (process_kaspi_ip_pdf) для переписывания суммы внутри назначения,
+        # см. purpose_line_bboxes.
         purpose_parts = []
-        for ln in block_lines:
+        purpose_line_bboxes: List[Tuple[str, float, float, float, float]] = []
+        for idx in block_line_idxs:
+            ln = lines_text[idx]
             if not ln:
                 continue
             if _SKIP_RE.match(ln):
                 continue
             purpose_parts.append(ln)
+            _bbox, _sz = lines_with_y[idx][1], lines_with_y[idx][2]
+            if _bbox is not None:
+                purpose_line_bboxes.append((ln, _bbox[0], _bbox[2], (_bbox[1] + _bbox[3]) / 2, _sz))
         purpose = " ".join(purpose_parts)
 
         if is_credit:
@@ -709,6 +732,7 @@ def _parse_transactions_from_page(
             purpose=purpose[:120],
             new_amount=amount_val,
             amount_in_purpose=amount_in_purpose,
+            purpose_line_bboxes=purpose_line_bboxes,
         )
         transactions.append(tx)
         i = j

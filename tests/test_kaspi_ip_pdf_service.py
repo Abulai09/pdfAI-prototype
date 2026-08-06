@@ -156,3 +156,32 @@ def test_validate_suggested_min_is_achievable(fixture_name):
     out = k.process_kaspi_ip_pdf(raw, target_income)
     result = k.validate_kaspi_ip(out)
     assert result["passed"], [c for c in result["checks"] if not c["ok"]]
+
+
+# ─── Task 2 (2026-08-06): purpose_line_bboxes ────────────────────────────────
+
+def test_purpose_line_bboxes_locatable_when_amount_repeated():
+    """Если в фикстуре есть строки с amount_in_purpose=True, каждая обязана
+    иметь непустой purpose_line_bboxes (иначе process_kaspi_ip_pdf не сможет
+    её переписать); большинство (не обязательно 100% — см. design spec,
+    "Область охвата") обязаны быть locatable через _locate_purpose_amount.
+    Если в фикстуре таких строк нет вовсе (как на IP2/IP3 в design spec) —
+    тест тривиально проходит, ничего не проверяя."""
+    doc = fitz.open(FIXTURES["original"])
+    stmt = k.parse_kaspi_ip_statement(doc)
+    doc.close()
+
+    repeated = [t for t in stmt.transactions if t.amount_in_purpose]
+    if not repeated:
+        pytest.skip("в этой фикстуре нет строк с amount_in_purpose=True")
+
+    locatable = 0
+    for tx in repeated:
+        assert tx.purpose_line_bboxes, f"пустой purpose_line_bboxes для {tx.doc_number}"
+        if any(
+            k._locate_purpose_amount(ln, tx.amount) is not None
+            for ln, _x0, _x1, _y, _sz in tx.purpose_line_bboxes
+        ):
+            locatable += 1
+    print(f"[note] {locatable}/{len(repeated)} строк с amount_in_purpose locatable")
+    assert locatable > 0
