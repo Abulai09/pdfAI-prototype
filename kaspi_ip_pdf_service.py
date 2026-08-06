@@ -422,6 +422,45 @@ def _format_purpose_amount(
     return int_part
 
 
+def _unescape_pdf_literal(raw: bytes) -> bytes:
+    """Убирает PDF backslash-экранирование внутри literal-строки `(...)`.
+
+    Найдено 2026-08-06 на реальном файле (IP4.pdf, стр.0): в отличие от
+    денежных ячеек (только цифры/разделители — CID 0x0013-0x001C/0x000F/
+    0x0003/0x0011, ни один байт которых не совпадает с "(", ")" или "\\"),
+    произвольный CID-текст назначения платежа регулярно попадает байтом
+    именно в 0x28/0x29/0x5C (замер: 1420 из 5889 Tj-строк на одной
+    странице) — генератор ОБЯЗАН экранировать такие байты, иначе PDF
+    literal-строка была бы синтаксически некорректна. Наивный "2 байта на
+    символ" разбор (как в paren_decode для ЦИФРОВЫХ ячеек, где эта
+    проблема физически не возникает) для прозы даёт неверную длину/сдвиг.
+    Обрабатывает только "\\(", "\\)", "\\\\" — единственные escape-последовательности,
+    которые этот генератор реально использует (замерено), не полный набор
+    PDF spec (octal-коды, "\\n" и т.п. здесь не встречаются)."""
+    out = bytearray()
+    i = 0
+    n = len(raw)
+    while i < n:
+        if raw[i] == 0x5C and i + 1 < n:
+            out.append(raw[i + 1])
+            i += 2
+        else:
+            out.append(raw[i])
+            i += 1
+    return bytes(out)
+
+
+def _escape_pdf_literal(raw: bytes) -> bytes:
+    """Обратная операция к _unescape_pdf_literal — экранирует "(", ")", "\\"
+    перед записью произвольного CID-текста обратно в PDF literal-строку."""
+    out = bytearray()
+    for b in raw:
+        if b in (0x28, 0x29, 0x5C):
+            out.append(0x5C)
+        out.append(b)
+    return bytes(out)
+
+
 # Страница повёрнута на 90° — PyMuPDF возвращает координаты уже в читаемом
 # порядке, поэтому колонки таблицы различаются по Y (не по X): у "Дебет" и
 # "Кредит" непересекающиеся Y-диапазоны (проверено на двух разных выписках —
@@ -1235,6 +1274,53 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
     stmt = parse_kaspi_ip_statement(doc)
     stmt = recalculate_kaspi_ip(stmt, target_monthly_income)
 
+    # ── Очередь замен для сумм, продублированных в тексте «Назначение
+    # платежа» (см. docs/superpowers/specs/2026-08-06-kaspi-ip-purpose-amount-rewrite-design.md).
+    # Строится ДО doc.close() — нужны bbox/размер строк purpose, собранные
+    # при парсинге (tx.purpose_line_bboxes), и GLYPH_EM (уже посчитан выше).
+    # Значение в очереди — (old_amount, new_amount): сам текст замены
+    # достраивается позже, в replace_tm, ПОВТОРНЫМ вызовом
+    # _locate_purpose_amount на РЕАЛЬНОМ decoded-тексте найденной Tj-строки
+    # (не на копии, собранной здесь через PyMuPDF) — гарантирует байт-в-байт
+    # точность вне заменяемого цифрового прогона.
+    page_replace_purpose: Dict[int, Dict[str, deque]] = defaultdict(lambda: defaultdict(deque))
+    _purpose_max_right = 0.0
+    for _tx in stmt.transactions:
+        for _ln, _x0, _x1, _y, _sz in _tx.purpose_line_bboxes:
+            if _x1 > _purpose_max_right:
+                _purpose_max_right = _x1
+
+    def _adv_purpose(text: str, size: float) -> float:
+        if GLYPH_EM:
+            return sum(GLYPH_EM.get(c, _ARIAL_DIGIT_EM) for c in text) * size
+        return sum(0.5 if c in (" ", ",", ".", "-") else 1.0 for c in text) * (_ARIAL_DIGIT_EM * size)
+
+    for _tx in stmt.transactions:
+        if not _tx.amount_in_purpose or not _tx.is_scaleable:
+            continue
+        if abs(_tx.new_amount - _tx.amount) < 0.005:
+            continue
+        _target_line = None
+        _target_x0 = None
+        _target_size = None
+        for _ln, _x0, _x1, _y, _sz in _tx.purpose_line_bboxes:
+            if _locate_purpose_amount(_ln, _tx.amount) is not None:
+                _target_line, _target_x0, _target_size = _ln, _x0, _sz
+                break
+        if _target_line is None:
+            continue  # сумма разорвана переносом строки — оставляем как есть
+
+        _loc = _locate_purpose_amount(_target_line, _tx.amount)
+        _start, _end, _th_sep, _dec_sep, _has_dec = _loc
+        _new_amount_text = _format_purpose_amount(_tx.new_amount, _th_sep, _dec_sep, _has_dec)
+        _new_line_preview = _target_line[:_start] + _new_amount_text + _target_line[_end:]
+        _new_width = _adv_purpose(_new_line_preview, _target_size)
+
+        if _target_x0 + _new_width > _purpose_max_right:
+            continue  # gate: новая строка не влезает в эмпирический край — не трогаем
+
+        page_replace_purpose[_tx.page_num][_target_line].append((_tx.amount, _tx.new_amount))
+
     # ─── Декодер/энкодер для BigEndian 2-байт CID ────────────────────────
     def paren_decode(raw_bytes: bytes) -> str:
         result = ""
@@ -1444,6 +1530,28 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
         rb"1\s+0\s+0\s+1\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+Tm\s+"
         rb"(/F\d+)\s+(\d+)\s+Tf\s+"
         rb"\(([^)]*)\)\s*Tj",
+    )
+
+    # ─── Паттерн: 1 0 0 1 X Y Tm [Fx sz Tf] (...) Tj — для строк «Назначение
+    # платежа» (см. docs/superpowers/specs/2026-08-06-kaspi-ip-purpose-amount-rewrite-design.md).
+    # ОТДЕЛЬНЫЙ проход от tm_pat, а не встраивание в replace_tm: tm_pat
+    # ТРЕБУЕТ /Fx N Tf НЕПОСРЕДСТВЕННО перед каждым Tm...Tj — верно для
+    # денежных ячеек (шрифт там всегда переустанавливается явно), но НЕ
+    # для многострочного абзаца назначения платежа, где генератор задаёт
+    # шрифт ОДИН РАЗ на несколько последующих строк (замерено на IP4.pdf,
+    # стр.0: 187 Tm/187 Tj против всего 124 Tf — 63 Tm...Tj без
+    # непосредственно предшествующего Tf). Tf-часть здесь ОПЦИОНАЛЬНА и
+    # захвачена целиком одной группой — воспроизводится байт-в-байт как
+    # есть (пусто или ровно тот же `/Fx N Tf `), шрифт никогда не меняется.
+    # Содержимое строки — (?:\\.|[^()\\])*, а не наивное [^)]* — произвольный
+    # CID-текст прозы регулярно содержит байты 0x28/0x29/0x5C, экранированные
+    # backslash'ем оригинальным генератором (см. _unescape_pdf_literal); без
+    # этого регекс обрывает захват на первом ЭКРАНИРОВАННОМ ")" вместо
+    # настоящего конца строки.
+    _purpose_pat = re.compile(
+        rb"1\s+0\s+0\s+1\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+Tm\s+"
+        rb"((?:/F\d+\s+\d+\s+Tf\s+)?)"
+        rb"\(((?:\\.|[^()\\])*)\)\s*Tj",
     )
 
     # ─── Raw bytes обработка ─────────────────────────────────────────────
@@ -1695,7 +1803,38 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
                 b"(" + new_bytes + b")" + _sc + b"Tj"
             )
 
+        def replace_purpose(match, _pg=pg_idx):
+            nonlocal total_replaced
+            _pq = page_replace_purpose.get(_pg, {})
+            if not _pq:
+                return match.group(0)
+            raw_content = _unescape_pdf_literal(match.group(4))
+            decoded = paren_decode(raw_content)
+            q = _pq.get(decoded.strip())
+            if not q:
+                return match.group(0)
+            old_amt, new_amt = q.popleft()
+            loc = _locate_purpose_amount(decoded, old_amt)
+            if loc is None:
+                return match.group(0)
+            s, e, th, dc, hd = loc
+            new_text = _format_purpose_amount(new_amt, th, dc, hd)
+            new_line = decoded[:s] + new_text + decoded[e:]
+            new_bytes_raw = paren_encode(new_line)
+            if b'\x00\x00' in new_bytes_raw:
+                return match.group(0)
+            new_bytes = _escape_pdf_literal(new_bytes_raw)
+            total_replaced += 1
+            print(f"  [IP][purpose] стр.{_pg} {decoded.strip()[:60]!r} → {new_line[:60]!r}")
+            _so, _sc = _op_separators(match.group(0))
+            return (
+                b"1 0 0 1 " + match.group(1) + b" " + match.group(2) + b" Tm\n" +
+                match.group(3) +
+                b"(" + new_bytes + b")" + _sc + b"Tj"
+            )
+
         new_decompressed = tm_pat.sub(replace_tm, decompressed)
+        new_decompressed = _purpose_pat.sub(replace_purpose, new_decompressed)
         if new_decompressed == decompressed:
             continue
 

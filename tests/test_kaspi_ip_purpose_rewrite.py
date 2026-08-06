@@ -3,7 +3,12 @@
 Строки — синтетические, но формат (разделители, структура фразы) взят из
 реальных примеров, задокументированных в спеке."""
 
-from kaspi_ip_pdf_service import _locate_purpose_amount, _format_purpose_amount
+from kaspi_ip_pdf_service import (
+    _locate_purpose_amount,
+    _format_purpose_amount,
+    _unescape_pdf_literal,
+    _escape_pdf_literal,
+)
 
 
 # ─── _locate_purpose_amount ─────────────────────────────────────────────────
@@ -110,3 +115,39 @@ def test_format_no_decimal():
 
 def test_format_no_decimal_with_thousands_sep():
     assert _format_purpose_amount(1500000.0, " ", "", False) == "1 500 000"
+
+
+# ─── _unescape_pdf_literal / _escape_pdf_literal ────────────────────────────
+# Найдено 2026-08-06 на реальном файле (IP4.pdf): в отличие от денежных
+# ячеек (только "безопасные" CID цифр/разделителей), CID-байты произвольного
+# текста назначения платежа регулярно попадают в 0x28/0x29/0x5C — байты,
+# которые PDF literal-строка обязана экранировать backslash'ем. Замер:
+# 1420 из 5889 Tj-строк на одной странице содержат хотя бы один такой байт.
+
+def test_unescape_removes_backslash_before_special_bytes():
+    # b"\\(" -> b"(" (экранированная открывающая скобка внутри CID-потока)
+    assert _unescape_pdf_literal(b"AB\\(CD") == b"AB(CD"
+    assert _unescape_pdf_literal(b"AB\\)CD") == b"AB)CD"
+    assert _unescape_pdf_literal(b"AB\\\\CD") == b"AB\\CD"
+
+
+def test_unescape_leaves_plain_bytes_untouched():
+    assert _unescape_pdf_literal(b"\x02E\x02b\x02p") == b"\x02E\x02b\x02p"
+
+
+def test_escape_inserts_backslash_before_special_bytes():
+    assert _escape_pdf_literal(b"AB(CD") == b"AB\\(CD"
+    assert _escape_pdf_literal(b"AB)CD") == b"AB\\)CD"
+    assert _escape_pdf_literal(b"AB\\CD") == b"AB\\\\CD"
+
+
+def test_escape_leaves_plain_bytes_untouched():
+    assert _escape_pdf_literal(b"\x02E\x02b\x02p") == b"\x02E\x02b\x02p"
+
+
+def test_escape_unescape_roundtrip():
+    # Байты, реально встреченные в дампе IP4.pdf (2-байтные CID, чей младший
+    # байт совпадает с "(", ")" или "\\").
+    raw = b"\x02E\x02b\x02p\x02_\x02\\\x02h\x02c\x00\x03\x02k\x02q\x02_\x02l\x00\x1d"
+    escaped = _escape_pdf_literal(raw)
+    assert _unescape_pdf_literal(escaped) == raw
