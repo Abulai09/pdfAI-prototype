@@ -5,6 +5,7 @@ import re
 import math
 import zlib
 import random
+import copy
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -619,10 +620,13 @@ def _parse_transactions_from_page(
     return transactions
 
 
-def recalculate_kaspi_ip(stmt: KaspiIPStatementData, target_monthly_income: float) -> KaspiIPStatementData:
+def _recalculate_kaspi_ip_once(stmt: KaspiIPStatementData, target_monthly_income: float) -> KaspiIPStatementData:
     """
     Масштабирует кредитные поступления (Продажи с Kaspi.kz) до target_monthly_income,
     пропорционально масштабируя комиссии и переводы собственных средств.
+
+    Один розыгрыш ±3% шума (`noise_by_value`) — вызывается только из
+    `recalculate_kaspi_ip`, которая переразыгрывает шум при необходимости.
     """
     # Группируем кредит (доход) по месяцам
     month_credit: Dict[str, float] = defaultdict(float)
@@ -931,6 +935,56 @@ def recalculate_kaspi_ip(stmt: KaspiIPStatementData, target_monthly_income: floa
     print(f"[KaspiIP] Исходящий остаток: → {s.closing_balance:,.2f}")
 
     return stmt
+
+
+# Сколько раз переразыгрывать ±3% шум (`noise_by_value`), если running-balance
+# коррекция внутри одного прохода не смогла удержать баланс неотрицательным.
+# Найдено 2026-08-06 на реальных пограничных целях (`kaspiIP.pdf` ×0.6,
+# `IP4.pdf` ×1.05, см. CLAUDE.md): один и тот же файл и цель то проходят, то
+# упираются в `post_check_negative_balance` от прогона к прогону — min_rb
+# колеблется около нуля вместе с розыгрышем шума (наблюдались −6 тыс …
+# −1,17 млн ₸). Аналитическая коррекция в `_recalculate_kaspi_ip_once`
+# (множитель на весь масштабируемый кредит до точки минимума) уже покрывает
+# большинство случаев, но не может помочь, когда сама точка минимума
+# оказывается РАНЬШЕ любого масштабируемого кредита (`credit_before_min <= 0`)
+# — а то, какой день окажется минимумом, зависит от шума. Тот же класс
+# приёма, что и `halyk_pdf_service._BOLD_GLYPH_RETRIES` /
+# `pdf_service._CERT_GLYPH_RETRIES`: каждый розыгрыш — самостоятельно
+# законный пересчёт, из нескольких берётся тот, что не требует floor-отказа.
+_IP_BALANCE_RETRIES = 24
+
+
+def recalculate_kaspi_ip(stmt: KaspiIPStatementData, target_monthly_income: float) -> KaspiIPStatementData:
+    """
+    Пересчитывает выписку, переразыгрывая шум до `_IP_BALANCE_RETRIES` раз,
+    если конкретный розыгрыш не даёт удержать running balance ≥ 0.
+
+    ПРОВЕРКИ 1/2 (`below_balance_floor`, `too_aggressive`) детерминированы —
+    не зависят от шума, срабатывают ДО его розыгрыша — поэтому их отказ
+    пробрасывается немедленно, без пустого перебора одинаковых провалов.
+    Только ПРОВЕРКА 3 (`post_check_negative_balance`) зависит от того, какой
+    именно розыгрыш `noise_by_value` выпал, и есть смысл переразыгрывать.
+    """
+    last_error: Optional[IncomeTooLowError] = None
+    for attempt in range(1, _IP_BALANCE_RETRIES + 1):
+        try:
+            result = _recalculate_kaspi_ip_once(copy.deepcopy(stmt), target_monthly_income)
+        except IncomeTooLowError as e:
+            if e.reason != "post_check_negative_balance":
+                raise
+            last_error = e
+            continue
+        if attempt > 1:
+            print(f"[KaspiIP] ✅ Баланс удержан с {attempt}-го розыгрыша шума "
+                  f"из {_IP_BALANCE_RETRIES} (предыдущие упирались в "
+                  f"post_check_negative_balance)")
+        return result
+
+    print(f"[KaspiIP] ⚠️ Ни один из {_IP_BALANCE_RETRIES} розыгрышей шума не "
+          f"удержал баланс ≥ 0 — цель действительно погранична, а не просто "
+          f"неудачный сид")
+    assert last_error is not None
+    raise last_error
 
 
 # ─── Замена через raw bytes (paren-формат BigEndian CID) ─────────────────────
