@@ -223,6 +223,85 @@ def check_natural_rounding(out: "fitz.Document", start_page: int) -> list[str]:
     return issues
 
 
+def _monthly_salary_totals(stmt: "p.StatementData") -> dict[str, float]:
+    m: dict[str, float] = {}
+    for t in stmt.transactions:
+        if t.sign > 0 and t.is_salary and not t.is_refund:
+            mk = p._get_month_key(t.date) or "unknown"
+            m[mk] = m.get(mk, 0) + t.amount
+    return m
+
+
+def check_variance_preserved(orig: "fitz.Document", out: "fitz.Document", start_page: int, cv_threshold: float = 0.20) -> list[str]:
+    """Критерий (добавлен 2026-08-03): разброс дохода по месяцам не должен
+    схлопываться к плоскому.
+
+    Единый K на весь период (см. CLAUDE.md, "Исправлено 2026-08-03: помесячное
+    выравнивание убивало естественный разброс дохода") масштабирует ВСЕ месяцы
+    одним и тем же множителем, значит отношение (новая_сумма_месяца /
+    оригинальная_сумма_месяца) должно быть почти константой — разброс только
+    от ±3%-шума на транзакцию и, изредка, от «Шага 3» (поднимает salary в
+    ОДНОМ дефицитном месяце, если апскейл иначе увёл бы баланс в минус).
+    Высокий разброс коэффициентов по месяцам — прямой признак регрессии к
+    старому багу помесячного выравнивания (K_month = target/доход_месяца,
+    обратно пропорционален доходу месяца — оттого и большой разброс).
+    `_round_to_natural`'s own grid check (`check_natural_rounding`) НЕ ловит
+    эту регрессию: и старое, и новое поведение одинаково лежат на сетке.
+    """
+    orig_stmt = p.parse_full_statement(orig, start_page=start_page)
+    out_stmt = p.parse_full_statement(out, start_page=start_page)
+    om, nm = _monthly_salary_totals(orig_stmt), _monthly_salary_totals(out_stmt)
+    ratios = [nm[mk] / om[mk] for mk in om if mk in nm and om[mk] > 0]
+    if len(ratios) < 2:
+        return []
+    mean_k = sum(ratios) / len(ratios)
+    if mean_k <= 0:
+        return []
+    variance = sum((r - mean_k) ** 2 for r in ratios) / len(ratios)
+    cv = variance ** 0.5 / mean_k
+    if cv > cv_threshold:
+        return [
+            f"коэффициенты масштабирования по месяцам разошлись слишком сильно "
+            f"(CV={cv:.3f} > {cv_threshold}, коэффициенты: "
+            f"{[round(r, 3) for r in sorted(ratios)]}) — похоже на регрессию к "
+            f"помесячному выравниванию (K_month=target/доход_месяца) вместо "
+            f"единого K на весь период"
+        ]
+    return []
+
+
+def check_rounding_escalation(orig: "fitz.Document", out: "fitz.Document", start_page: int) -> list[str]:
+    """Критерий (добавлен 2026-08-03): если оригинальная сумма кратна крупному
+    «человеческому» числу (5 000/10 000/.../1 000 000), результат должен
+    остаться кратным ЕМУ ЖЕ, а не просесть до мелкого базового шага величины
+    (см. CLAUDE.md, "Исправлено 2026-08-03: `_round_to_natural` не сохраняла
+    круглость ПОСЛЕ умножения на дробный K"). Существующий `check_natural_rounding`
+    этого не ловит — он проверяет только "лежит на СВОЕЙ базовой сетке",
+    которая математически гарантированно выполняется в обоих случаях (крупный
+    шаг всегда кратен мелкому).
+    """
+    orig_stmt = p.parse_full_statement(orig, start_page=start_page)
+    out_stmt = p.parse_full_statement(out, start_page=start_page)
+    o_sal = [t for t in orig_stmt.transactions if t.sign > 0 and t.is_salary and not t.is_refund]
+    n_sal = [t for t in out_stmt.transactions if t.sign > 0 and t.is_salary and not t.is_refund]
+    if len(o_sal) != len(n_sal):
+        return []  # структура разошлась — другая проверка это поймает отдельно
+    issues = []
+    for ot, nt in zip(o_sal, n_sal):
+        oa, na = ot.amount, nt.amount
+        if oa <= 0:
+            continue
+        for cand in p._NATURAL_STEP_CANDIDATES:
+            if oa % cand < 0.01 or cand - (oa % cand) < 0.01:
+                if na % cand > 0.01 and cand - (na % cand) > 0.01:
+                    issues.append(
+                        f"{ot.date}: оригинал {oa:,.0f} кратен {cand:,.0f}, "
+                        f"но результат {na:,.0f} — нет (просел до более мелкого шага)"
+                    )
+                break
+    return issues[:10]
+
+
 # ── Признаки стиля сериализации (форензик-разбор 02/08/2026) ──────────────
 # Оригинал однороден на 100%: 0 чисел с избыточными нулями, 0 склеенных
 # «Td … Tj» в одну строку, единый способ примыкания Tj к строке-аргументу.
@@ -368,6 +447,8 @@ def geometry_check(pdf_bytes: bytes, orig_bytes: bytes) -> list[str]:
     issues.extend(check_column_alignment(orig, doc, start_page))
     issues.extend(check_fonts(orig, doc))
     issues.extend(check_natural_rounding(doc, start_page))
+    issues.extend(check_variance_preserved(orig, doc, start_page))
+    issues.extend(check_rounding_escalation(orig, doc, start_page))
 
     # Стиль сериализации. Единственное расхождение, которое здесь НЕ считается
     # провалом, — лишний Tj от вынужденной подмены шрифта на стр.0: у части

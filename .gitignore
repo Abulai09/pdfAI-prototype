@@ -26,3 +26,9 @@ graphify-out/
 
 # Артефакт Windows-редиректа (`> nul`)
 nul
+
+# Отчёт verify_any_file.py — пишется в корень при каждом прогоне батареи
+verify_any_report.json
+
+# Собранный дистрибутив (см. build/dist/ выше — тот же класс артефакта)
+dist.zip

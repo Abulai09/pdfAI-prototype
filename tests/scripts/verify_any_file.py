@@ -27,6 +27,13 @@ verify_kaspi_ip_file.py: те три работают каждый со свои
                                правый край колонки «Сумма», левый край справки
   критерий 2e шрифты           имя и кегль не изменились
   критерий 3  округление       суммы лежат на «человеческой» сетке
+  критерий 3b разброс/мес.     (Kaspi Gold) коэффициент месяца ≈ единый K,
+                               не съехал к помесячному выравниванию
+  критерий 3c эскалация шага   круглый оригинал (5000/10000/.../1 000 000)
+                               остаётся кратным ЕМУ ЖЕ, не проседает до
+                               базового шага после масштабирования
+  критерий 1c ISI-порог        (Halyk/Kaspi ИП) жёсткий порог ISI реально
+                               держится в результате, пересчитано независимо
   критерий 4  стиль            почерк записи операторов совпал с оригиналом
   структура                    xref/стримы целы, PDF не пришлось «чинить»,
                                число страниц и набор шрифтов стр.0 не выросли
@@ -182,6 +189,8 @@ def criteria_kaspi_gold(raw: bytes, out_bytes: bytes) -> dict[str, list[str]]:
             "2d правый край колонки": vgold.check_column_alignment(orig, out, start),
             "2e шрифты": vgold.check_fonts(orig, out),
             "3 округление": vgold.check_natural_rounding(out, start),
+            "3b разброс по месяцам": vgold.check_variance_preserved(orig, out, start),
+            "3c эскалация шага": vgold.check_rounding_escalation(orig, out, start),
             "4 стиль": style,
         }
         if note:
@@ -204,7 +213,10 @@ def criteria_kaspi_ip(raw: bytes, out_bytes: bytes) -> dict[str, list[str]]:
     return {
         "1 математика": list(kip.validate_kaspi_ip(out_bytes)["issues"]),
         "1b шапка = тело": vip.header_matches_body(out_bytes),
+        "1c ISI-порог": vip.check_isi_floor(out_bytes),
         "2a наложения слов": overlaps,
+        "2c правый край «Дебет»": vip.check_column_alignment(raw, out_bytes),
+        "3c эскалация шага": vip.check_rounding_escalation(raw, out_bytes),
         "4 стиль": vip.style_check(raw, out_bytes),
     }
 
@@ -212,8 +224,13 @@ def criteria_kaspi_ip(raw: bytes, out_bytes: bytes) -> dict[str, list[str]]:
 def criteria_halyk(raw: bytes, out_bytes: bytes) -> dict[str, list[str]]:
     return {
         "1 математика": list(hal.validate_halyk(out_bytes)["issues"]),
+        "1c ISI-порог": vhal.check_isi_floor(out_bytes),
         "2a наложения слов": vhal.geometry_check(out_bytes),
         "2e шрифты": vhal.font_check(raw, out_bytes),
+        "2f начертание итогов": vhal.check_bold_row_uniform(raw, out_bytes),
+        "2g зазор Td": vhal.check_td_gap(raw, out_bytes),
+        "1d итог = Σстрок": vhal.check_totals_match_rows(raw, out_bytes),
+        "3c эскалация шага": vhal.check_rounding_escalation(raw, out_bytes),
         "4 стиль": vhal.style_check(raw, out_bytes),
     }
 
@@ -332,6 +349,20 @@ def run_one(path: Path, multipliers: list[float], render: bool) -> tuple[bool, l
         results = CRITERIA[fmt](raw, out_bytes)
         note = "; ".join(results.pop("_note", []))
         results["структура"] = structural_checks(raw, out_bytes, fmt)
+
+        # Сообщения с префиксом «[guard]» — не провал: так помечаются случаи,
+        # чью неустранимость движок ДОКАЗАЛ измерением (см.
+        # verify_halyk_file.check_bold_row_uniform). Их надо показать, но не
+        # ронять ими прогон — иначе батарея станет вечно красной и перестанет
+        # читаться. Та же логика уже применена в verify_halyk_file.run_one.
+        guard_notes = [
+            msg for msgs in results.values() for msg in msgs if msg.startswith("[guard]")
+        ]
+        results = {
+            k: [m for m in v if not m.startswith("[guard]")] for k, v in results.items()
+        }
+        if guard_notes:
+            note = "; ".join(filter(None, [note, *guard_notes]))
 
         failed = {k: v for k, v in results.items() if v}
         ok = not failed
