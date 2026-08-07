@@ -135,11 +135,19 @@ def validate_fields(fields: KaspiIPFields) -> list[str]:
 
 
 import zlib
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional, Tuple
 
 import fitz
 
-from pdf_service import build_dynamic_cmap, _rebuild_xref_table
+from pdf_service import (
+    build_dynamic_cmap,
+    _rebuild_xref_table,
+    _patch_truetype_glyphs,
+    _read_truetype_glyph,
+    _w_array_insert_sorted,
+    _cmap_add_mappings,
+)
+import kaspi_ip_glyphs
 
 # Токен показа текста ровно в той форме, в какой его пишет генератор шаблона
 # (замер: 215 таких токенов на стр. 0, ноль TJ-массивов, ноль '/"). `Tf`
@@ -334,3 +342,239 @@ def substitute_fixed_length(pdf_bytes: bytes, fields: KaspiIPFields) -> bytes:
         if new_body != body:
             _replace_stream(raw, xref, new_body, zlib.compress)
     return _rebuild_xref_table(bytes(raw))
+
+
+def _font_objects(doc) -> tuple:
+    """(xref FontFile2, xref CIDFont-словаря, xref ToUnicode) основного шрифта."""
+    ff2 = cid_obj = tu = None
+    for xref in range(1, doc.xref_length()):
+        obj = doc.xref_object(xref, compressed=True) or ""
+        if "/CIDFontType2" in obj:
+            cid_obj = xref
+            m = re.search(r"/FontFile2\s+(\d+)\s+0\s+R", obj)
+            if not m:
+                dm = re.search(r"/FontDescriptor\s+(\d+)\s+0\s+R", obj)
+                if dm:
+                    m = re.search(r"/FontFile2\s+(\d+)\s+0\s+R",
+                                  doc.xref_object(int(dm.group(1)), compressed=True) or "")
+            if m:
+                ff2 = int(m.group(1))
+        if "/Type0" in obj:
+            m = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", obj)
+            if m:
+                tu = int(m.group(1))
+    if ff2 is None or cid_obj is None or tu is None:
+        raise SubstitutionError("не найдены объекты шрифта (FontFile2 / CIDFont / ToUnicode)")
+    return ff2, cid_obj, tu
+
+
+def _glyph_matches_reference(subset_glyph: bytes, reference: bytes) -> bool:
+    """Сравнение глифа документа с замороженным эталоном — С ДОПУСКОМ на
+    паддинг-байт чётности.
+
+    Найдено при проверке Task 5 на реальном шаблоне: `kaspi_ip_glyphs.GLYPHS`
+    получен через `fontTools`-компиляцию (`glyf.compile()`), которая паддинг
+    НЕ добавляет, а `_read_truetype_glyph` читает СЫРЫЕ байты `glyf`-таблицы
+    документа, где паддинг-байт для выравнивания на чётную длину МОЖЕТ
+    присутствовать — это прямо задокументировано в docstring
+    `_read_truetype_glyph`. Строгое сравнение (`==`) на настоящем шаблоне даёт
+    48 ложных расхождений из 125 присутствующих символов — gate был бы
+    сломан на собственном же эталонном файле. Тот же допуск («1 паддинг-байт,
+    хвост нулевой») уже применяется в Halyk (`_try_patch_bold_digit_glyphs`).
+    """
+    if subset_glyph == reference:
+        return True
+    if len(subset_glyph) == len(reference) + 1 and subset_glyph[:-1] == reference \
+            and subset_glyph[-1] == 0:
+        return True
+    return False
+
+
+def _trusted_glyph_source(font_bytes: bytes, from_unicode: Dict[str, str]) -> bool:
+    """Gate: доверять замороженным контурам можно, только если КАЖДЫЙ уже
+    присутствующий в subset'е символ побайтово совпал с эталоном (с допуском
+    на паддинг — см. `_glyph_matches_reference`).
+
+    Тот же принцип, что у `_try_patch_bold_digit_glyphs` в Halyk: сначала
+    проверь, потом доверяй. Замер на шаблоне: 125 присутствующих символов из
+    125 совпали. Файл, собранный из другого мастер-шрифта, обязан получить
+    отказ, а не чужие контуры.
+    """
+    for ch, cid in from_unicode.items():
+        gid = int(cid, 16)
+        expected = kaspi_ip_glyphs.GLYPHS.get(gid)
+        if expected is None:
+            continue
+        if not _glyph_matches_reference(_read_truetype_glyph(font_bytes, gid), expected):
+            return False
+    return True
+
+
+def _composite_components(glyph_data: bytes) -> List[int]:
+    """GID компонентов составного глифа. Простой глиф → пустой список."""
+    if len(glyph_data) < 10:
+        return []
+    num_contours = int.from_bytes(glyph_data[0:2], "big", signed=True)
+    if num_contours >= 0:
+        return []
+    out = []
+    pos = 10
+    while pos + 4 <= len(glyph_data):
+        flags = int.from_bytes(glyph_data[pos:pos + 2], "big")
+        out.append(int.from_bytes(glyph_data[pos + 2:pos + 4], "big"))
+        pos += 4
+        pos += 4 if flags & 0x0001 else 2       # ARG_1_AND_2_ARE_WORDS
+        if flags & 0x0008:                       # WE_HAVE_A_SCALE
+            pos += 2
+        elif flags & 0x0040:                     # X_AND_Y_SCALE
+            pos += 4
+        elif flags & 0x0080:                     # TWO_BY_TWO
+            pos += 8
+        if not flags & 0x0020:                   # MORE_COMPONENTS
+            break
+    return out
+
+
+def _find_w_array_bounds(cidobj_bytes: bytes) -> Optional[Tuple[int, int]]:
+    """Границы (bracket, close) вложенного /W-массива в СЫРЫХ байтах объекта
+    CIDFont (включая заголовок «N 0 obj» — сама функция от заголовка не
+    зависит, ей нужен только сам массив).
+
+    /W — ВЛОЖЕННЫЙ массив (`[3[277]5[354]…]`), поэтому конец ищем счётчиком
+    вложенности, а не первой попавшейся «]» (та закрывает первую же запись
+    вида `[277]`) — тот же приём, что в `halyk_pdf_service.
+    _prune_bold_orphan_glyphs`.
+    """
+    m = re.search(rb"/W\s*\[", cidobj_bytes)
+    if not m:
+        return None
+    bracket = m.end() - 1
+    depth = 0
+    for i in range(bracket, len(cidobj_bytes)):
+        ch = cidobj_bytes[i:i + 1]
+        if ch == b"[":
+            depth += 1
+        elif ch == b"]":
+            depth -= 1
+            if depth == 0:
+                return bracket, i
+    return None
+
+
+def _insert_widths(cidobj_bytes: bytes, chars: List[str]) -> Optional[bytes]:
+    """Дописывает ширины новых CID в /W тем же стилем, каким массив написан.
+
+    Работает на СЫРЫХ байтах объекта (как их вернул `raw.find(...)`), а не на
+    тексте `doc.xref_object()` — тот переформатирует объект (переставляет
+    ключи, меняет пробелы вокруг `/W`; замерено на шаблоне: `/W [3[277]…`
+    → `/W[3[277]…` без пробела, плюс лишние `/Type/Font/Subtype/…` спереди).
+    Запись переформатированного текста обратно в файл была бы ровно тем же
+    классом признака, что и критерий 4 «стиль сериализации операторов».
+    """
+    bounds = _find_w_array_bounds(cidobj_bytes)
+    if bounds is None:
+        return None
+    bracket, close = bounds
+    entries = {
+        f"{kaspi_ip_glyphs.CHAR_GID[c]:04X}": kaspi_ip_glyphs.WIDTHS_1000[
+            kaspi_ip_glyphs.CHAR_GID[c]
+        ]
+        for c in chars
+    }
+    return _w_array_insert_sorted(cidobj_bytes, bracket, close, entries)
+
+
+def _raw_object_bounds(raw: bytes, xref: int) -> Tuple[int, int]:
+    """(начало «N 0 obj», начало «endobj») объекта `xref` в сырых байтах."""
+    pos = raw.find(f"{xref} 0 obj".encode())
+    if pos < 0:
+        raise SubstitutionError(f"объект {xref} не найден в байтах документа")
+    end = raw.find(b"endobj", pos)
+    if end < 0:
+        raise SubstitutionError(f"у объекта {xref} нет endobj")
+    return pos, end
+
+
+def embed_missing_glyphs(pdf_bytes: bytes, chars: set) -> tuple:
+    """Вшивает глифы символов, которых нет в subset'е документа.
+
+    Возвращает (новые байты, {символ: CID-hex}). Если вшивать нечего —
+    возвращает вход БЕЗ ИЗМЕНЕНИЙ и пустую карту.
+
+    Составные глифы (их 27 в наборе: А→A, Ё→E+dieresis, Й→uni0418+breve,
+    Э→uni0404 …) вшиваются ВМЕСТЕ с компонентами: составной глиф ссылается на
+    другие GID, и без компонента он отрисуется пустым. Компоненты в /W и
+    ToUnicode не попадают — они никогда не показываются как самостоятельный
+    CID, а ширина им не нужна.
+
+    Все три правки — glyf/loca, /W и ToUnicode — готовятся из ОДНОГО снимка
+    байт и применяются либо все, либо ни одной.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        _, from_unicode = build_dynamic_cmap(doc)
+        missing = sorted(c for c in chars if c not in from_unicode)
+        if not missing:
+            return pdf_bytes, {}
+        ff2_xref, cid_xref, tu_xref = _font_objects(doc)
+        font_bytes = doc.xref_stream(ff2_xref)
+        tu_body = doc.xref_stream(tu_xref)
+    finally:
+        doc.close()
+
+    # Объект CIDFont читается ИЗ СЫРЫХ БАЙТ, не через doc.xref_object() —
+    # см. docstring _insert_widths про переформатирование.
+    cid_start, cid_end = _raw_object_bounds(pdf_bytes, cid_xref)
+    cid_obj = pdf_bytes[cid_start:cid_end]
+
+    if not _trusted_glyph_source(font_bytes, from_unicode):
+        raise SubstitutionError(
+            "subset шрифта документа не совпал с эталонным Arial — "
+            "вшивание глифов отменено"
+        )
+
+    unknown = [c for c in missing if c not in kaspi_ip_glyphs.CHAR_GID]
+    if unknown:
+        raise SubstitutionError(
+            "нет замороженных контуров для символов: " + " ".join(repr(c) for c in unknown)
+        )
+
+    # GID к вшиванию: сами символы + рекурсивно компоненты составных глифов.
+    want_gids = {kaspi_ip_glyphs.CHAR_GID[c] for c in missing}
+    present_gids = {int(cid, 16) for cid in from_unicode.values()}
+    patches: Dict[int, bytes] = {}
+    stack = list(want_gids)
+    while stack:
+        gid = stack.pop()
+        if gid in patches or gid in present_gids:
+            continue
+        data = kaspi_ip_glyphs.GLYPHS.get(gid)
+        if data is None:
+            raise SubstitutionError(f"нет замороженного контура для GID {gid}")
+        patches[gid] = data
+        for comp_gid in _composite_components(data):
+            stack.append(comp_gid)
+
+    new_font = _patch_truetype_glyphs(font_bytes, patches)
+    added = {c: f"{kaspi_ip_glyphs.CHAR_GID[c]:04X}" for c in missing}
+
+    new_cid_obj = _insert_widths(cid_obj, missing)
+    new_tu = _cmap_add_mappings(
+        tu_body, [(added[c], f"{ord(c):04X}") for c in missing]
+    )
+    if new_cid_obj is None or new_tu is None:
+        raise SubstitutionError("не удалось обновить /W или ToUnicode — правка отменена")
+
+    raw = bytearray(pdf_bytes)
+    # FontFile2 физически стоит в файле РАНЬШЕ CIDFont (замер на шаблоне:
+    # xref 219 на позиции 422602, xref 221 на 469206) — правка его длины
+    # сдвигает всё, что идёт следом. _replace_stream от этого не страдает
+    # сама (ищет объект заново через raw.find() при каждом вызове), но
+    # cid_start/cid_end, снятые с ПЕРВОНАЧАЛЬНЫХ pdf_bytes, после такого
+    # сдвига уже не те индексы в `raw` — поэтому границы CIDFont
+    # пересчитываются заново, ПОСЛЕ обеих правок потоков, а не до них.
+    _replace_stream(raw, ff2_xref, new_font, zlib.compress)
+    _replace_stream(raw, tu_xref, new_tu, zlib.compress)
+    cid_start, cid_end = _raw_object_bounds(bytes(raw), cid_xref)
+    raw[cid_start:cid_end] = new_cid_obj
+    return _rebuild_xref_table(bytes(raw)), added

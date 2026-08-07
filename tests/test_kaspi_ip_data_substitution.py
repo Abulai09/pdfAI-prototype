@@ -88,3 +88,34 @@ def test_structure_intact():
         assert d.is_repaired is False
     finally:
         d.close()
+
+
+def test_embed_adds_missing_glyph_and_keeps_existing():
+    """«Ы» нет в subset'е шаблона — после вшивания она обязана появиться
+    и в карте символов, и в /W, и в ToUnicode."""
+    import pdf_service
+    raw = kid.load_template()
+    d = fitz.open(stream=raw, filetype="pdf")
+    _, before = pdf_service.build_dynamic_cmap(d)
+    d.close()
+    assert "Ы" not in before
+
+    out, added = kid.embed_missing_glyphs(raw, {"Ы", "Ю"})
+    assert set(added) == {"Ы", "Ю"}
+
+    d = fitz.open(stream=out, filetype="pdf")
+    try:
+        _, after = pdf_service.build_dynamic_cmap(d)
+        assert "Ы" in after and "Ю" in after
+        # старые символы не потеряны
+        assert all(ch in after for ch in before)
+        assert d.page_count == 101 and d.is_repaired is False
+    finally:
+        d.close()
+
+
+def test_embed_is_noop_when_nothing_missing():
+    raw = kid.load_template()
+    out, added = kid.embed_missing_glyphs(raw, {"А", "Б", "1"})
+    assert added == {}
+    assert out is raw
