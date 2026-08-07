@@ -578,3 +578,64 @@ def embed_missing_glyphs(pdf_bytes: bytes, chars: set) -> tuple:
     cid_start, cid_end = _raw_object_bounds(bytes(raw), cid_xref)
     raw[cid_start:cid_end] = new_cid_obj
     return _rebuild_xref_table(bytes(raw)), added
+
+
+from kaspi_ip_pdf_service import _primary_glyph_advances
+
+# Замер на шаблоне: значение наименования занимает 148 pt, соседей на строке
+# правее нет, до края отведённой области ещё ~482 pt. Поле лево-выровнено,
+# поэтому X начала не пересчитывается — ширина нужна только чтобы отказать,
+# если текст не помещается.
+MAX_NAME_WIDTH_PT = 482.0
+
+
+def _text_width_pt(text: str, advances: Dict[str, float], size: float) -> float:
+    return sum(advances.get(ch, 0.5) for ch in text) * size
+
+
+def substitute_fields(pdf_bytes: bytes, fields: KaspiIPFields) -> bytes:
+    """Подставляет все пять реквизитов. Публичная точка входа модуля.
+
+    Порядок важен: глифы вшиваются ПЕРВЫМИ, иначе `_encode_cid` не найдёт CID
+    для новых символов имени. Поля фиксированной длины идут вторыми — они не
+    зависят от вшивания. Имя пишется последним, когда карта символов уже полна.
+    """
+    errors = validate_fields(fields)
+    if errors:
+        raise SubstitutionError("; ".join(errors))
+
+    name = fields.client_name.strip()
+    working, _added = embed_missing_glyphs(pdf_bytes, set(name))
+    working = substitute_fixed_length(working, fields)
+
+    doc = fitz.open(stream=working, filetype="pdf")
+    try:
+        _, from_unicode = build_dynamic_cmap(doc)
+        advances = _primary_glyph_advances(doc, from_unicode)
+        tokens = _page_tokens(doc, 0)
+        token = _find_value_token(tokens, _LABEL_CLIENT)
+        # Смещения токенов посчитаны по read_contents(), который СКЛЕИВАЕТ все
+        # потоки страницы. Писать мы будем в один поток, поэтому если их больше
+        # одного — смещения не совпадут, и это отказ, а не тихая порча байтов.
+        contents = doc[0].get_contents()
+        if len(contents) != 1:
+            raise SubstitutionError(
+                f"у страницы 0 потоков содержимого: {len(contents)}, ожидался один"
+            )
+        content_xref = contents[0]
+        body = doc.xref_stream(content_xref)
+        size = 8.0
+        width = _text_width_pt(name, advances, size)
+        if width > MAX_NAME_WIDTH_PT:
+            raise SubstitutionError(
+                f"наименование клиента не помещается в поле: {width:.1f} pt "
+                f"при доступных {MAX_NAME_WIDTH_PT:.0f} pt"
+            )
+        new_cid = _escape_pdf_string(_encode_cid(name, from_unicode))
+        new_body = body[:token["start"]] + new_cid + body[token["end"]:]
+    finally:
+        doc.close()
+
+    raw = bytearray(working)
+    _replace_stream(raw, content_xref, new_body, zlib.compress)
+    return _rebuild_xref_table(bytes(raw))

@@ -119,3 +119,39 @@ def test_embed_is_noop_when_nothing_missing():
     out, added = kid.embed_missing_glyphs(raw, {"А", "Б", "1"})
     assert added == {}
     assert out is raw
+
+
+def test_substitute_fields_writes_all_five():
+    out = kid.substitute_fields(kid.load_template(), NEW)
+    text = _all_text(out)
+    assert NEW.client_name in text
+    assert "ИП АБЛАЕВА НАГИМА ТУРЕХАНОВНА" not in text
+    assert text.count(NEW.account) == 13
+    assert text.count(NEW.iin) == 17
+    assert "01.02.2025 - 01.02.2026" in text
+    assert "31.01.2026 09:15" in text
+
+
+def test_substitute_fields_name_with_missing_glyph():
+    """«Ы» нет в subset'е — имя всё равно обязано напечататься целиком."""
+    fields = kid.KaspiIPFields(**{**NEW.__dict__, "client_name": "ИП САТЫБАЛДЫ ЮЛИЯ"})
+    out = kid.substitute_fields(kid.load_template(), fields)
+    assert "ИП САТЫБАЛДЫ ЮЛИЯ" in _all_text(out)
+
+
+def test_substitute_fields_rejects_too_long_name():
+    long_name = "ИП " + "О" * 200
+    fields = kid.KaspiIPFields(**{**NEW.__dict__, "client_name": long_name})
+    with pytest.raises(kid.SubstitutionError) as e:
+        kid.substitute_fields(kid.load_template(), fields)
+    assert "не помещается" in str(e.value)
+
+
+def test_substitute_fields_keeps_font_set():
+    before = fitz.open(stream=kid.load_template(), filetype="pdf")
+    after = fitz.open(stream=kid.substitute_fields(kid.load_template(), NEW), filetype="pdf")
+    try:
+        assert {(f[3], f[4]) for f in after[0].get_fonts(full=True)} == \
+               {(f[3], f[4]) for f in before[0].get_fonts(full=True)}
+    finally:
+        before.close(); after.close()
