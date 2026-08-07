@@ -3363,3 +3363,192 @@ def _patch_truetype_glyphs(font_bytes: bytes, glyph_patches: Dict[int, bytes]) -
     except (struct.error, IndexError, UnicodeDecodeError, KeyError) as e:
         raise ValueError(f"invalid font structure: {e}")
 
+
+# ─── Общие помощники /W и ToUnicode CMap (перенесены из halyk_pdf_service ──
+# 2026-08-07: понадобились второй раз — kaspi_ip_data_service тоже вшивает
+# недостающие глифы Arial и дописывает их в /W и ToUnicode тем же приёмом.
+# halyk_pdf_service импортирует их отсюда; _w_array_remove/_cmap_remove_
+# mappings/_cmap_reorder остались там — нужны только Halyk.
+
+# Конвенция ЧИТАЕТСЯ из самого файла, а не хардкодится один раз на все
+# форматы — h6.pdf пишет /W без единого пробела ("19[500]21[500]"), а
+# HALYKformat1.pdf с пробелом после каждого "[" и между записями
+# ("19[ 500] 20[ 500]"); оба реальных файла.
+_W_SINGLE_ENTRY_RE = re.compile(rb"(\d+)\[(\s*)(\d+)\]")
+
+
+def _w_array_entries(body: bytes, start: int, end: int) -> List[Tuple[int, int, int, bytes]]:
+    """Разбирает одиночные-CID записи 'cid[width]' /W-массива CIDFontType2 в
+    диапазоне [start, end) байтовой строки body. Возвращает список (cid,
+    entry_start, entry_end, inner_ws) в порядке появления — entry_start/
+    entry_end абсолютные индексы в body, inner_ws — пробельные байты между
+    '[' и цифрой ширины ЭТОЙ записи. Форма 'c1 c2 w' (диапазон одинаковых
+    ширин) не разбирается — на всех 6 локальных реальных файлах Halyk /W
+    всегда в одиночной форме 'cid[width]'; если встретится другая форма или
+    записей меньше двух, список короче двух элементов сигналит вызывающей
+    стороне отказаться от вставки (см. _w_array_insert_sorted).
+    """
+    return [
+        (int(m.group(1)), m.start(), m.end(), m.group(2))
+        for m in _W_SINGLE_ENTRY_RE.finditer(body, start, end)
+    ]
+
+
+def _w_array_insert_sorted(
+    cidobj_bytes: bytes,
+    bracket_start: int,
+    close_idx: int,
+    new_entries: Dict[str, float],
+) -> Optional[bytes]:
+    """Вставляет новые CID-записи в /W-массив В ВОЗРАСТАЮЩЕМ порядке CID (как
+    во всех реальных файлах — иначе хвост массива выглядит как «кто-то
+    дописал руками»), разделителем/внутренним пробелом САМОГО ЭТОГО массива,
+    а не хардкодом.
+
+    new_entries — {cid_hex: width}. Возвращает новые байты объекта CIDFont
+    (cidobj_bytes с точечными splice-вставками) либо None, если конвенцию
+    или записей меньше двух — недостаточно, чтобы доверять «доминантному»
+    разделителю, отказ вместо угадывания.
+    """
+    entries = _w_array_entries(cidobj_bytes, bracket_start + 1, close_idx)
+    if len(entries) < 2:
+        return None
+    # Разделитель МЕЖДУ соседними записями (например b"" или b" ") — берём из
+    # промежутка после первой же записи; конвенция однородна по всему массиву
+    # (проверено на h6.pdf и HALYKformat1.pdf).
+    dominant_sep = cidobj_bytes[entries[0][2]:entries[1][1]]
+    dominant_inner_ws = entries[0][3]
+
+    # Для каждого нового CID точка вставки вычисляется из НЕИЗМЕНЁННОГО
+    # списка entries (снимок до любых правок) — конец последней записи с
+    # cid МЕНЬШЕ нового (если такой нет — самое начало массива, перед первой
+    # записью). Применяются позже в порядке убывания позиции, чтобы splice
+    # одной записи не сдвигал ещё не применённые точки вставки (тот же приём,
+    # что и «запись от конца файла к началу» ниже по трём FontFile2/W/
+    # ToUnicode-регионам).
+    insertions = []
+    for cid_hex, width in new_entries.items():
+        new_cid = int(cid_hex, 16)
+        pos = bracket_start + 1
+        for cid, _e_start, e_end, _inner in entries:
+            if cid < new_cid:
+                pos = e_end
+            else:
+                break
+        new_bytes = (
+            dominant_sep
+            + f"{new_cid}[".encode("ascii")
+            + dominant_inner_ws
+            + f"{int(width)}]".encode("ascii")
+        )
+        insertions.append((pos, new_bytes))
+
+    result = bytearray(cidobj_bytes)
+    for pos, new_bytes in sorted(insertions, key=lambda t: t[0], reverse=True):
+        result[pos:pos] = new_bytes
+    return bytes(result)
+
+
+def _cmap_bf_style(body: bytes) -> Optional[Tuple[bytes, bytes]]:
+    """Читает конвенции EOL и межтокенного разделителя из существующего
+    beginbfrange/beginbfchar-блока ЭТОГО ToUnicode CMap-потока — тот же
+    принцип, что и /W выше: h6.pdf/HALYKformat1.pdf оба пишут записи
+    'beginbfrange' как '<XXXX><XXXX><YYYY>\\r\\n' (CRLF, без пробела между
+    hex-токенами), но хардкодить это на все возможные Halyk-файлы неверно.
+
+    Возвращает (entry_eol, token_sep) либо None, если в потоке нет ни
+    одного bfrange/bfchar-блока хотя бы с одной записью — тогда вызывающая
+    сторона обязана отказаться от вставки нового bfchar-блока, а не
+    гадать про EOL/пробелы.
+    """
+    m = re.search(rb"beginbf(range|char)", body)
+    if m is None:
+        return None
+    tail = body[m.end():]
+    if m.group(1) == b"range":
+        entry_re = re.compile(
+            rb"<[0-9A-Fa-f]+>(\s*)<[0-9A-Fa-f]+>\s*<[0-9A-Fa-f]+>(\r\n|\r|\n)"
+        )
+    else:
+        entry_re = re.compile(rb"<[0-9A-Fa-f]+>(\s*)<[0-9A-Fa-f]+>(\r\n|\r|\n)")
+    em = entry_re.search(tail)
+    if em is None:
+        return None
+    return em.group(2), em.group(1)
+
+
+# Предел записей в ОДНОМ bfrange/bfchar-блоке (ISO 32000, 9.10.3). Переполнять
+# нельзя — при превышении открывается новый блок ТОГО ЖЕ рода.
+_CMAP_MAX_BLOCK_ENTRIES = 100
+
+_BFRANGE_BLOCK_RE = re.compile(rb"(\d+)(\s+)beginbfrange(.*?)endbfrange", re.S)
+_BFCHAR_BLOCK_RE = re.compile(rb"(\d+)(\s+)beginbfchar(.*?)endbfchar", re.S)
+
+
+def _cmap_add_mappings(body: bytes, entries: List[Tuple[str, str]]) -> Optional[bytes]:
+    """Дописывает соответствия CID→Unicode в ToUnicode CMap ТЕМ ЖЕ РОДОМ блока,
+    каким таблицу пишет сам генератор этого файла.
+
+    `entries` — список (cid_hex, unicode_hex), оба по 4 hex-символа.
+
+    Найдено 2026-08-06: прежняя версия приклеивала ОТДЕЛЬНЫЙ блок
+    `beginbfchar` перед `endcmap` — сознательно, чтобы не пересчитывать
+    счётчик существующего блока. Но генератор Halyk пишет ВСЮ таблицу
+    исключительно через `beginbfrange` вырожденными диапазонами
+    (`<0013><0013><0030>`) и `beginbfchar` не эмитит нигде — замер на всех 6
+    реальных файлах (h6.pdf: 53 bfrange, 0 bfchar). Оба блока валидны по
+    спецификации, но чужой род блока — ровно тот класс признака, что и
+    критерий 4 «стиль сериализации операторов», причём самый заметный из
+    известных: присутствие `beginbfchar` в Halyk-документе видно САМО ПО
+    СЕБЕ, без эталона для сравнения.
+
+    Поэтому род блока не хардкодится ни в ту, ни в другую сторону, а
+    ЧИТАЕТСЯ из файла (тот же принцип, что `_op_separators`/`_w_array_
+    insert_sorted`): есть bfrange — дописываем вырожденные диапазоны в него,
+    иначе дописываем в bfchar. Возвращает новое тело потока либо None, если
+    конвенцию установить не удалось (отказ вместо угадывания).
+    """
+    style = _cmap_bf_style(body)
+    if style is None or not entries:
+        return None
+    eol, sep = style
+
+    use_range = _BFRANGE_BLOCK_RE.search(body) is not None
+    block_re = _BFRANGE_BLOCK_RE if use_range else _BFCHAR_BLOCK_RE
+    kw = b"bfrange" if use_range else b"bfchar"
+
+    def render(cid_hex: str, uni_hex: str) -> bytes:
+        head = f"<{cid_hex}>".encode("ascii")
+        if use_range:
+            # Вырожденный диапазон — ровно та форма, какой генератор пишет
+            # КАЖДУЮ свою запись (первый и последний код диапазона совпадают).
+            head += sep + f"<{cid_hex}>".encode("ascii")
+        return head + sep + f"<{uni_hex}>".encode("ascii") + eol
+
+    blocks = list(block_re.finditer(body))
+    if not blocks:
+        return None
+    last = blocks[-1]
+    count = int(last.group(1))
+
+    # Влезает в последний блок — дописываем в него и обновляем ЕГО счётчик.
+    if count + len(entries) <= _CMAP_MAX_BLOCK_ENTRIES:
+        insert_at = last.end() - len(b"end" + kw)
+        payload = b"".join(render(c, u) for c, u in entries)
+        new_body = body[:insert_at] + payload + body[insert_at:]
+        # Счётчик правим ПОСЛЕ вставки, по смещениям из того же снимка: она
+        # находится позже начала блока, поэтому его границы не сдвинулись.
+        return (
+            new_body[:last.start(1)]
+            + str(count + len(entries)).encode("ascii")
+            + new_body[last.end(1):]
+        )
+
+    # Не влезает — открываем НОВЫЙ блок того же рода сразу за последним
+    # (несколько блоков в одном CMap валидны и для генератора естественны).
+    payload = (
+        str(len(entries)).encode("ascii") + last.group(2) + b"begin" + kw + eol
+        + b"".join(render(c, u) for c, u in entries)
+        + b"end" + kw + eol
+    )
+    return body[:last.end()] + eol + payload + body[last.end():]
