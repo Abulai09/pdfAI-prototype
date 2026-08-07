@@ -138,13 +138,26 @@ def _content_blob(pdf_bytes: bytes) -> bytes:
 
 def style_check(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
     """Почерк записи операторов обязан совпасть с оригиналом ТОЧНО —
-    расхождение в любую сторону — след (см. verify_gold_file.py)."""
+    расхождение в любую сторону — след (см. verify_gold_file.py).
+
+    Единственная законная поправка — СТЁРТЫЕ токены-минусы: когда входящий
+    остаток переходит из минуса в плюс, его знак удаляется из потока целиком,
+    и «Td … Tj» становится ровно на столько же меньше. Это не отклонение
+    почерка, а совпадение с ним: в настоящем файле с положительным остатком
+    отдельного токена минуса нет вовсе (замер: `HALYKformat3.pdf`,
+    "Входящий остаток: 12,51" — два токена, без минуса). Поправка берётся из
+    `LAST_RUN_INFO` — то есть по ФАКТУ прогона, а не как допуск «плюс-минус
+    несколько токенов», который снова сделал бы проверку неспособной краснеть.
+    """
     blob_o, blob_n = _content_blob(orig_bytes), _content_blob(out_bytes)
+    erased = int((getattr(hal, "LAST_RUN_INFO", {}) or {}).get("minus_erased") or 0)
     issues = []
     for label, rx in _STYLE_METRICS.items():
         n_o, n_n = len(rx.findall(blob_o)), len(rx.findall(blob_n))
-        if n_o != n_n:
-            issues.append(f"стиль сериализации: {label} — было {n_o}, стало {n_n}")
+        expected = n_o - erased if rx is _RE_TD_TJ_SAME_LINE else n_o
+        if expected != n_n:
+            note = f" (ожидалось {expected}: стёрто минусов {erased})" if expected != n_o else ""
+            issues.append(f"стиль сериализации: {label} — было {n_o}, стало {n_n}{note}")
     return issues
 
 
@@ -184,7 +197,14 @@ def font_check(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
 _TD_TOKEN = re.compile(
     rb"(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+Td\s*(/F\d+\s+[\d.]+\s+Tf\s*)?<([0-9A-Fa-f]+)>\s*Tj"
 )
-_MONEY_TEXT = re.compile(r"^-?\d{1,3}(?:[  ]\d{3})*(?:,\d{2})?$")
+# Разделитель разрядов извлекается как NBSP (CMap `<0003><0003><00A0>`), и
+# класс ОБЯЗАН его принимать. Здесь стояли ДВА обычных пробела (0x20, 0x20)
+# вместо «пробел + NBSP» — из-за чего `_td_gaps` видел только суммы без
+# разделителя («0,00») и молчал на реально сбитых зазорах: на HALYKformat4
+# из 14 пар в выборку попадали 10, а единственная сбитая (2.4 вместо 2.0)
+# как раз содержала NBSP. Байты записаны явными escape'ами, чтобы такая
+# подмена не могла повториться незаметно при копировании.
+_MONEY_TEXT = re.compile("^-?\\d{1,3}(?:[  ]\\d{3})*(?:,\\d{2})?$")
 
 
 def _page_font_widths(doc: "fitz.Document", page_no: int) -> dict:
@@ -332,6 +352,573 @@ def check_totals_match_rows(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
         issues.append(
             f"расход: итог−Σстрок = {o_out:+,.2f} (в оригинале {b_out:+,.2f})"
         )
+    return issues
+
+
+def _cmap_block_kinds(pdf_bytes: bytes) -> dict[int, Counter]:
+    """{xref ToUnicode-потока: Counter{'bfchar': n, 'bfrange': n}}.
+
+    Считает, СКОЛЬКИМИ блоками какого рода записана таблица code→Unicode в
+    каждом CMap-потоке документа.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out: dict[int, Counter] = {}
+    try:
+        for xref in range(1, doc.xref_length()):
+            try:
+                body = doc.xref_stream(xref)
+            except Exception:  # noqa: BLE001
+                continue
+            if not body or b"begincodespacerange" not in body:
+                continue
+            out[xref] = Counter(
+                {
+                    "bfchar": body.count(b"beginbfchar"),
+                    "bfrange": body.count(b"beginbfrange"),
+                }
+            )
+    finally:
+        doc.close()
+    return out
+
+
+def check_cmap_block_style(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Таблица code→Unicode обязана быть записана ТЕМ ЖЕ родом блоков, что и
+    в оригинале.
+
+    Найдено 2026-08-06: вшивание недостающих глифов цифр в Bold-subset (см.
+    «Исправлено 2026-08-05») дописывало соответствия CID→Unicode ОТДЕЛЬНЫМ
+    блоком `beginbfchar`, тогда как генератор Halyk пишет ВСЮ таблицу
+    исключительно через `beginbfrange` вырожденными диапазонами
+    (`<0013><0013><0030>`) и `beginbfchar` не эмитит нигде и никогда —
+    замер на 6 реальных файлах. По спецификации оба блока валидны, но это
+    ровно тот класс признака, что и критерий 4 «стиль сериализации»: не
+    ошибка формата, а чужой почерк. Причём самый заметный из всех
+    найденных — присутствие `beginbfchar` в Halyk-документе видно БЕЗ
+    эталона для сравнения, само по себе.
+
+    Сравнивается всё же с оригиналом (а не «bfchar запрещён» жёстко) — по
+    той же конвенции, что и `check_td_gap`: если однажды встретится
+    Halyk-вариант, чей генератор сам пишет bfchar, проверка обязана это
+    принять, а не падать на неиспорченном файле.
+    """
+    base = _cmap_block_kinds(orig_bytes)
+    if not base:
+        return []
+    out = _cmap_block_kinds(out_bytes)
+    issues = []
+    for xref, counts in sorted(out.items()):
+        was = base.get(xref)
+        if was is None:
+            continue  # новый поток — не наш класс дефекта, ловится другими проверками
+        for kind in ("bfchar", "bfrange"):
+            if counts[kind] > was[kind]:
+                issues.append(
+                    f"в CMap-потоке xref={xref} появилось блоков `begin{kind}`: "
+                    f"{counts[kind]} против {was[kind]} в оригинале — таблица "
+                    f"code→Unicode дописана не тем родом блока, каким её пишет "
+                    f"сам генератор"
+                )
+    return issues
+
+
+def _flate_streams(pdf_bytes: bytes) -> dict:
+    """{xref: (сжатые байты, распакованные байты)} — только те потоки, чей
+    почерк сжатия вообще о чём-то говорит: content-стримы страниц, ToUnicode и
+    FontFile2. Потоки картинок исключены намеренно: логотип в HALYKformat1
+    пересжимается впустую и давал бы ложное срабатывание.
+    """
+    out = {}
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        want = set()
+        for pno in range(doc.page_count):
+            want.update(doc[pno].get_contents())
+        for xref in range(1, doc.xref_length()):
+            obj = doc.xref_object(xref, compressed=True) or ""
+            for key in ("/ToUnicode", "/FontFile2"):
+                m = re.search(re.escape(key) + r"\s+(\d+)\s+0\s+R", obj)
+                if m:
+                    want.add(int(m.group(1)))
+        for xref in sorted(want):
+            obj = doc.xref_object(xref, compressed=True) or ""
+            if "FlateDecode" not in obj:
+                continue
+            try:
+                comp = doc.xref_stream_raw(xref)
+                body = doc.xref_stream(xref)
+            except Exception:  # noqa: BLE001
+                continue
+            if comp and body:
+                out[xref] = (bytes(comp), bytes(body))
+    finally:
+        doc.close()
+    return out
+
+
+def check_stream_compressor(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Ни один поток результата не должен воспроизводиться python-zlib, если
+    ни один поток оригинала не воспроизводится.
+
+    Замер 2026-08-07 на всех 6 реальных файлах: из 56 потоков (content
+    страниц + ToUnicode + FontFile2) НИ ОДИН не воспроизводится
+    `zlib.compress` ни на одном уровне 0..9 — оригиналы выпущены
+    `PDFsharp 1.50 / MigraDoc`, а он сжимает собственной копией SharpZipLib,
+    самостоятельной реализацией DEFLATE. Наши же переписанные потоки
+    воспроизводились `zlib.compress(данные, 6)` ТОЧНО: 145 совпадений на 24
+    связках файл×цель (format1 — 5, format2 — 11-12, format3 — 7, format4 — 1,
+    h6 — 4, hformat5 — 6-8). Это самый дешёвый для проверяющего признак из
+    всех найденных за проект: три строки кода и никакого эталона.
+
+    Сравнение идёт с оригиналом, а не «zlib запрещён» жёстко, — та же
+    конвенция, что у `check_td_gap`/`check_cmap_block_style`: если однажды
+    попадётся Halyk-вариант, чей генератор сам пишет python-совместимым
+    zlib, проверка обязана это принять, а не краснеть на неиспорченном файле.
+    Проверяется весь диапазон уровней, а не только 6: подмена уровня — не
+    исправление признака, а его маскировка от одной конкретной формулировки.
+    """
+    base = _flate_streams(orig_bytes)
+    base_hits = sum(
+        1 for comp, body in base.values()
+        if any(zlib.compress(body, lvl) == comp for lvl in range(10))
+    )
+    if base_hits:
+        return []  # генератор этого файла сам пишет как python-zlib
+    issues = []
+    for xref, (comp, body) in sorted(_flate_streams(out_bytes).items()):
+        for lvl in range(10):
+            if zlib.compress(body, lvl) == comp:
+                issues.append(
+                    f"поток xref={xref} побайтово воспроизводится "
+                    f"zlib.compress(данные, {lvl}) — пересжат python-zlib, тогда "
+                    f"как ни один из {len(base)} потоков оригинала так не "
+                    f"воспроизводится"
+                )
+                break
+    return issues
+
+
+def _cmap_text_order_inversions(pdf_bytes: bytes) -> dict:
+    """{xref ToUnicode: (инверсий, записей)} — насколько порядок записей
+    таблицы расходится с порядком ПЕРВОГО ПОЯВЛЕНИЯ CID в тексте.
+
+    Имена шрифтовых ресурсов ЛОКАЛЬНЫ ДЛЯ СТРАНИЦЫ, поэтому каждый `Tj`
+    привязывается к активному `Tf` в пределах своей страницы. Без этого
+    CID Regular и Bold смешиваются, и проверка показывает сотни «инверсий»
+    даже на нетронутом оригинале — на этом сломался первый вариант замера.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        first_use: dict = {}
+        seen: dict = {}
+        for pno in range(doc.page_count):
+            page = doc[pno]
+            fmap = {}
+            for f in page.get_fonts(full=True):
+                fobj = doc.xref_object(f[0], compressed=True) or ""
+                m = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", fobj)
+                if m:
+                    fmap[f[4]] = int(m.group(1))
+            if not fmap:
+                continue
+            buf = b""
+            for cx in page.get_contents():
+                try:
+                    buf += doc.xref_stream(cx)
+                except Exception:  # noqa: BLE001
+                    return {}
+            cur = None
+            for m in re.finditer(rb"/(F\d+)\s+[\d.]+\s+Tf|<([0-9A-Fa-f]+)>\s*Tj", buf):
+                if m.group(1) is not None:
+                    cur = fmap.get(m.group(1).decode("ascii"))
+                    continue
+                if cur is None:
+                    continue
+                h = m.group(2).decode("ascii").upper()
+                lst = first_use.setdefault(cur, [])
+                st = seen.setdefault(cur, set())
+                for j in range(0, len(h), 4):
+                    c = h[j:j + 4]
+                    if c not in st:
+                        st.add(c)
+                        lst.append(c)
+
+        result = {}
+        for tux, used in first_use.items():
+            body = doc.xref_stream(tux)
+            if not body:
+                continue
+            listed = []
+            for bm in re.finditer(rb"beginbf(range|char)(.*?)endbf(?:range|char)",
+                                  body, re.S):
+                chunk = bm.group(2)
+                if bm.group(1) == b"range":
+                    for em in re.finditer(
+                        rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<", chunk
+                    ):
+                        for c in range(int(em.group(1), 16), int(em.group(2), 16) + 1):
+                            listed.append(f"{c:04X}")
+                else:
+                    for em in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<", chunk):
+                        listed.append(f"{int(em.group(1), 16):04X}")
+            rank = {c: i for i, c in enumerate(used)}
+            seq = [rank[c] for c in listed if c in rank]
+            inv = sum(1 for i in range(len(seq)) for j in range(i + 1, len(seq))
+                      if seq[i] > seq[j])
+            result[tux] = (inv, len(seq))
+        return result
+    finally:
+        doc.close()
+
+
+def check_cmap_text_order(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Порядок записей ToUnicode обязан совпадать с порядком первого появления
+    CID в тексте — ровно так, как это делает сам генератор.
+
+    Замер 2026-08-07: во всех 12 таблицах 6 оригиналов — 0 инверсий при 100%
+    покрытии (каждый перечисленный CID реально напечатан). Генератор выкладывает
+    subset по мере вёрстки, поэтому признак различим БЕЗ эталона: достаточно
+    сопоставить таблицу и текст одного и того же файла.
+
+    В результатах инверсии были на 16 связках из 24 (3-40 штук) по ДВУМ
+    причинам сразу: дописывание новых CID в конец таблицы / удаление старых из
+    середины И сама замена текста, которая двигает первое появление цифры по
+    документу. Вторая причина задевала даже Regular-таблицу, которую движок не
+    патчит вовсе, — поэтому проверка меряет ИТОГОВЫЙ порядок, а не факт правки.
+    """
+    base = _cmap_text_order_inversions(orig_bytes)
+    if not base:
+        return []
+    out = _cmap_text_order_inversions(out_bytes)
+    issues = []
+    for tux, (inv, n) in sorted(out.items()):
+        was = base.get(tux)
+        if was is None:
+            continue
+        if inv > was[0]:
+            issues.append(
+                f"в ToUnicode xref={tux} порядок записей разошёлся с порядком "
+                f"первого появления CID в тексте: {inv} инверсий на {n} записях "
+                f"против {was[0]} в оригинале"
+            )
+    return issues
+
+
+_AMOUNT_SPAN_RE = re.compile(r"^-?\d[\d  ]*(?:,\d{2})?$")
+
+
+def _amount_centers(pdf_bytes: bytes) -> set:
+    """Множество X-центров ТЕКСТОВЫХ ПРОГОНОВ с денежными суммами.
+
+    Разделитель разрядов в этом формате извлекается как NBSP (CMap:
+    `<0003><0003><00A0>`), а не как обычный пробел — регулярка обязана его
+    принимать, иначе замер молча теряет почти все суммы документа и
+    проверка становится зелёной на заведомо сбитых файлах (ровно так
+    первая попытка этого замера 2026-08-06 не увидела дефект вовсе).
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    centers = set()
+    try:
+        for pn in range(doc.page_count):
+            for blk in doc[pn].get_text("dict").get("blocks", []):
+                for line in blk.get("lines", []):
+                    for s in line.get("spans", []):
+                        t = s["text"].strip()
+                        if _AMOUNT_SPAN_RE.match(t) and any(c.isdigit() for c in t):
+                            centers.add(round((s["bbox"][0] + s["bbox"][2]) / 2, 2))
+    finally:
+        doc.close()
+    return centers
+
+
+# Насколько близко к центру колонки сумма считается «принадлежащей» ей.
+# Уход внутри этого окна — сбитое центрирование; дальше — это уже не эта
+# колонка (напр. число, законно перенесённое wrap-логикой на строку ниже).
+_COLUMN_ATTRACTION_PT = 8.0
+# Сколько сумм на одном центре в оригинале, чтобы считать его КОЛОНКОЙ, а не
+# одиночным числом в тексте шапки.
+_MIN_AMOUNTS_PER_COLUMN = 3
+
+
+def check_amount_center_grid(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Денежные КОЛОНКИ этого формата центрированы: во всех 6 реальных
+    оригиналах суммы любой длины стоят на одном и том же X-центре своей
+    колонки ({240.60, 341.81, 407.46, 451.47, 464.90} — набор свой у каждого
+    файла, поэтому берётся ИЗ ОРИГИНАЛА, а не хардкодится). Сумма, оставшаяся
+    в своей колонке, обязана сохранить её центр ТОЧНО.
+
+    Проверяются только настоящие колонки (не менее `_MIN_AMOUNTS_PER_COLUMN`
+    сумм на центре в оригинале) и только «уползание» в пределах
+    `_COLUMN_ATTRACTION_PT`. Одиночное число в тексте шапки колонкой не
+    является, а число, ЗАКОННО перенесённое wrap-логикой на строку ниже
+    (замер: `HALYKformat2`, «…в валюте: 80 664 911,06» не влезло в строку и
+    ушло переносом), встаёт далеко от любой колонки — считать это сбитым
+    центрированием было бы ложным срабатыванием.
+
+    `find_line_overlaps` этот класс не видит по построению: равномерно
+    сдвинутая сумма ни на что не наезжает — та же слепая зона, из-за
+    которой в Kaspi ИП пришлось заводить `check_column_alignment`.
+    """
+    from collections import Counter as _C
+
+    doc = fitz.open(stream=orig_bytes, filetype="pdf")
+    tally: _C = _C()
+    try:
+        for pn in range(doc.page_count):
+            for blk in doc[pn].get_text("dict").get("blocks", []):
+                for line in blk.get("lines", []):
+                    for s in line.get("spans", []):
+                        t = s["text"].strip()
+                        if _AMOUNT_SPAN_RE.match(t) and any(c.isdigit() for c in t):
+                            tally[round((s["bbox"][0] + s["bbox"][2]) / 2, 2)] += 1
+    finally:
+        doc.close()
+    columns = {c for c, n in tally.items() if n >= _MIN_AMOUNTS_PER_COLUMN}
+    if not columns:
+        return []
+
+    drifted = {}
+    for c in _amount_centers(out_bytes) - set(tally):
+        near = min(columns, key=lambda col: abs(col - c))
+        if abs(near - c) <= _COLUMN_ATTRACTION_PT:
+            drifted.setdefault(near, []).append(c)
+    if not drifted:
+        return []
+    parts = [
+        f"колонка {col}: суммы уехали на {sorted(v)}" for col, v in sorted(drifted.items())
+    ]
+    return ["центрирование денежной колонки сбито — " + "; ".join(parts)]
+
+
+def _fee_rows(pdf_bytes: bytes) -> int:
+    """Сколько строк, где «Расход» больше «Суммы операции» — то есть в расход
+    свёрнута комиссия за перевод.
+
+    Колонки берутся по их X-центрам (240.60 — «Сумма операции», 407.46 —
+    «Расход»), потому что это та же фиксированная сетка, что проверяет
+    `check_amount_center_grid`.
+    """
+    def num(t: str):
+        try:
+            return float(t.replace(" ", "").replace(" ", "").replace(",", "."))
+        except ValueError:
+            return None
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    n = 0
+    try:
+        for pn in range(doc.page_count):
+            rows: dict[float, list] = {}
+            for blk in doc[pn].get_text("dict").get("blocks", []):
+                for line in blk.get("lines", []):
+                    for s in line.get("spans", []):
+                        if s["text"].strip():
+                            rows.setdefault(round(s["bbox"][1], 1), []).append(s)
+            for sps in rows.values():
+                cent = {
+                    round((s["bbox"][0] + s["bbox"][2]) / 2, 2): s["text"].strip()
+                    for s in sps
+                }
+                op, rash = num(cent.get(240.60, "")), num(cent.get(407.46, ""))
+                if op is None or rash is None or rash >= 0:
+                    continue
+                if abs(abs(rash) - abs(op)) > 0.005:
+                    n += 1
+    finally:
+        doc.close()
+    return n
+
+
+def check_fee_rows_preserved(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Строки со свёрнутой в «Расход» комиссией обязаны сохраниться.
+
+    Замер 2026-08-06 по всем 6 реальным файлам: «Расход» превышает «Сумму
+    операции» ровно на 150 или 200 ₸ при нулевой колонке «Комиссия» —
+    17/60/23/2/17/23 строк соответственно. Это конвенция формата, одинаковая
+    во всех подлинных документах.
+
+    До удаления `[FEE-NORM]` движок приводил расход к сумме операции, и таких
+    строк в результате оставалось РОВНО НОЛЬ на каждом файле и каждой цели.
+    Отсутствие того, что есть у всех настоящих выписок, — самостоятельный
+    признак правки, различимый без эталона, поэтому проверка требует
+    сохранения, а не «не хуже, чем было».
+
+    Сравнивается с числом строк В ОРИГИНАЛЕ (а не с ненулём) — по той же
+    конвенции, что `check_td_gap`/`check_totals_match_rows`: файл, у которого
+    таких строк нет вовсе, не должен падать на пустом месте.
+    """
+    base = _fee_rows(orig_bytes)
+    if base == 0:
+        return []
+    got = _fee_rows(out_bytes)
+    if got == base:
+        return []
+    return [
+        f"строк со свёрнутой в «Расход» комиссией стало {got} вместо {base} "
+        f"— в подлинных выписках этот признак есть всегда (150/200 ₸ при "
+        f"нулевой колонке «Комиссия»), его исчезновение само по себе улика"
+    ]
+
+
+_DIGIT_CID_HEX = {f"{0x13 + i:04X}": str(i) for i in range(10)}
+
+
+def _bold_digits_present_and_used(pdf_bytes: bytes) -> tuple[set, set]:
+    """(цифры в /W жирных шрифтов, цифры, реально нарисованные жирным).
+
+    Все 6 реальных файлов рисуют текст ИСКЛЮЧИТЕЛЬНО через `<hex>Tj` —
+    ни одного `TJ`-массива, `()Tj` или `'`/`"` (замер 2026-08-06), поэтому
+    скан по `<hex>Tj` для этого формата полон, а не приблизителен.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    present: set = set()
+    used: set = set()
+    seen_fonts: set = set()
+    try:
+        for pn in range(doc.page_count):
+            pobj = doc.xref_object(doc[pn].xref)
+            bold: dict[str, int] = {}
+            for fn, fx in re.findall(r"/F(\d+)\s+(\d+)\s+0\s+R", pobj):
+                try:
+                    fobj = doc.xref_object(int(fx))
+                except Exception:  # noqa: BLE001
+                    continue
+                bm = re.search(r"/BaseFont\s*/(\S+)", fobj)
+                if not bm or ("Bold" not in bm.group(1) and ",B" not in bm.group(1)):
+                    continue
+                dm = re.search(r"/DescendantFonts\s*\[?\s*(\d+)\s+0\s+R", fobj)
+                if dm:
+                    bold["F" + fn] = int(dm.group(1))
+            for dx in set(bold.values()):
+                if dx in seen_fonts:
+                    continue
+                seen_fonts.add(dx)
+                wm = re.search(r"/W\s*\[(.*?)\]\s*(?:/|>>)", doc.xref_object(dx), re.S)
+                if not wm:
+                    continue
+                for m in re.finditer(r"(\d+)\s*\[\s*[\d\s]+\]", wm.group(1)):
+                    h = f"{int(m.group(1)):04X}"
+                    if h in _DIGIT_CID_HEX:
+                        present.add(h)
+            if not bold:
+                continue
+            buf = b""
+            for cx in doc[pn].get_contents():
+                try:
+                    buf += zlib.decompress(doc.xref_stream_raw(cx))
+                except Exception:  # noqa: BLE001
+                    try:
+                        buf += doc.xref_stream(cx)
+                    except Exception:  # noqa: BLE001
+                        pass
+            cur = None
+            for m in re.finditer(rb"/F(\d+)\s+[\d.]+\s+Tf|<([0-9A-Fa-f]+)>\s*Tj", buf):
+                if m.group(1) is not None:
+                    cur = "F" + m.group(1).decode()
+                elif cur in bold:
+                    h = m.group(2).decode().upper()
+                    for j in range(0, len(h), 4):
+                        if h[j:j + 4] in _DIGIT_CID_HEX:
+                            used.add(h[j:j + 4])
+    finally:
+        doc.close()
+    return present, used
+
+
+def check_bold_subset_tightness(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """Subset ЖИРНОГО шрифта у настоящего файла ПЛОТНЫЙ: что лежит в /W, то и
+    напечатано в документе — замер на всех 4 реальных файлах с жирными
+    цифрами, ноль лишних, 4 из 4. Глиф, не встречающийся ни в одном числе
+    документа, — признак правки, различимый БЕЗ эталона.
+
+    Проверка делит лишние глифы на две причины, потому что закрыты они
+    по-разному:
+
+    * **вшитый и неиспользованный** — цифра, которую наш патч добавил в
+      subset, хотя в новом тексте её нет. Это НАША ошибка и она устранима
+      (закрыто 2026-08-06 ограничением патча набором реально нужных цифр),
+      поэтому здесь — FAIL: возврат к «вшиваем все недостающие подряд»
+      должен краснеть.
+    * **осиротевший** — цифра, что БЫЛА в оригинальном subset'е и
+      использовалась ИМ, но перестала употребляться после замены текста.
+      Это свойство любого редактирования, а не вшивания глифов (замер: 20 из
+      22 лишних на корпусе — именно такие, они остались бы даже без патча).
+      Убрать их можно только УДАЛЕНИЕМ глифов из /W/ToUnicode/glyf, что
+      несопоставимо рискованнее добавления, — решено не делать (см.
+      CLAUDE.md). Поэтому здесь — не FAIL, а `[guard]`-пометка: число
+      остаётся на виду и не вырастет незамеченным.
+    """
+    orig_present, _ = _bold_digits_present_and_used(orig_bytes)
+    if not orig_present:
+        return []  # у этого файла жирный шрифт цифр не содержит вовсе
+    present, used = _bold_digits_present_and_used(out_bytes)
+    extra = present - used
+    if not extra:
+        return []
+
+    info = getattr(hal, "LAST_RUN_INFO", {}) or {}
+    patched = {
+        cid for widths in (info.get("glyphs_patched") or {}).values() for cid in widths
+    }
+    d = lambda s: sorted(_DIGIT_CID_HEX[c] for c in s)  # noqa: E731
+
+    issues = []
+    patched_unused = extra & patched
+    if patched_unused:
+        issues.append(
+            f"в жирный subset вшиты цифры {d(patched_unused)}, которых нет ни в "
+            f"одном напечатанном числе — патч обязан ограничиваться реально "
+            f"нужными цифрами (см. _bold_needed_digits)"
+        )
+    orphaned = extra - patched
+    if orphaned:
+        issues.append(
+            f"[guard] в жирном subset'е осталось {len(orphaned)} неиспользуемых "
+            f"цифр {d(orphaned)} — они были в ОРИГИНАЛЬНОМ subset'е и осиротели "
+            f"после замены текста (не следствие вшивания глифов); устранимо "
+            f"только удалением глифов, сознательно не делается"
+        )
+    return issues
+
+
+_OPENING_LABELS = ("қалдығы: ", "Кіріс қалдығы:", "Входящий остаток:")
+
+
+def check_opening_balance_sign_erasure(out_bytes: bytes) -> list[str]:
+    """Если минус входящего остатка стёрт (ПРОВЕРКА 3 подняла его в плюс),
+    между двоеточием и первой цифрой не должно остаться НИКАКОГО символа,
+    кроме одного обычного пробела — как в любом реально положительном файле
+    (замер: `HALYKformat3.pdf`, "Входящий остаток: 12,51" — сразу цифра).
+
+    Найдено 2026-08-06: `process_halyk_pdf` стирал токен минуса, подставляя
+    вместо него глиф-заглушку (NBSP, а не обычный пробел — `FROM_UNICODE.get
+    ("\\xa0")` шёл первым), из-за чего в тексте оставался невидимый, но
+    посторонний символ, которого нет ни в одном настоящем документе с
+    положительным входящим остатком. Проверяет РЕЗУЛЬТАТ напрямую по тексту
+    страницы 0 — не зависит от того, чем именно заменили минус.
+    """
+    doc = fitz.open(stream=out_bytes, filetype="pdf")
+    try:
+        text = doc[0].get_text()
+    finally:
+        doc.close()
+    issues = []
+    for label in _OPENING_LABELS:
+        idx = text.find(label)
+        if idx == -1:
+            continue
+        after = text[idx + len(label):idx + len(label) + 8]
+        m = re.match(r"([^\d\-]*)(-?)\d", after)
+        if not m:
+            continue
+        gap = m.group(1)
+        if gap not in (" ", ""):
+            issues.append(
+                f"после «{label.strip()}» остался посторонний символ(ы) {gap!r} "
+                f"(ord={[hex(ord(c)) for c in gap]}) — настоящий файл с положительным "
+                f"остатком не содержит там ничего, кроме одного пробела"
+            )
+        break  # первая найденная метка — единственная актуальная для этого файла
     return issues
 
 
@@ -611,6 +1198,13 @@ def run_one(path: Path, multipliers: list[float], out_dir: Path, render: bool) -
             + check_bold_row_uniform(raw, out_bytes)
             + check_td_gap(raw, out_bytes)
             + check_totals_match_rows(raw, out_bytes)
+            + check_opening_balance_sign_erasure(out_bytes)
+            + check_cmap_block_style(raw, out_bytes)
+            + check_amount_center_grid(raw, out_bytes)
+            + check_bold_subset_tightness(raw, out_bytes)
+            + check_fee_rows_preserved(raw, out_bytes)
+            + check_stream_compressor(raw, out_bytes)
+            + check_cmap_text_order(raw, out_bytes)
         )
         # Сообщения с префиксом «[guard]» — не провал: это случаи, чью
         # неустранимость движок ДОКАЗАЛ измерением (см. check_bold_row_uniform).

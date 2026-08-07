@@ -3362,3 +3362,4 @@ def _patch_truetype_glyphs(font_bytes: bytes, glyph_patches: Dict[int, bytes]) -
         raise
     except (struct.error, IndexError, UnicodeDecodeError, KeyError) as e:
         raise ValueError(f"invalid font structure: {e}")
+

@@ -6,12 +6,15 @@ import zlib
 import random
 import math
 import struct
+import hashlib
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
+
+import pdfsharp_deflate
 
 from pdf_service import (
     build_dynamic_cmap,
@@ -25,6 +28,74 @@ from pdf_service import (
 )
 from pdf_service_downscale import IncomeTooLowError
 from halyk_bold_digits import DIGIT_GLYPHS, DIGIT_WIDTH_1000, SOURCE_UNITS_PER_EM
+
+# ─── Выбор компрессора потоков: читаем конвенцию из самого файла ─────────────
+
+# Сколько нетронутых потоков файла проверить, прежде чем доверить ему
+# компрессор PDFsharp. Больше одного — потому что совпадение на единственном
+# коротком потоке теоретически могло бы быть случайным; на всех 6 реальных
+# файлах совпадают ВСЕ потоки (56 из 56), так что цена проверки — сотые доли
+# секунды, а отказ гарантированно громкий.
+_COMPRESSOR_PROBE_STREAMS = 3
+
+
+def _pick_stream_compressor(raw: bytes) -> Callable[[bytes], bytes]:
+    """Возвращает функцию сжатия, которой писал ОРИГИНАЛЬНЫЙ генератор.
+
+    Замер 2026-08-07 на `testpdf/halyk` (6 файлов, 56 потоков — content
+    страниц, ToUnicode, FontFile2): ни один поток оригинала не воспроизводится
+    `zlib.compress` ни на одном уровне 0..9, а любой поток, переписанный нами
+    через zlib, воспроизводится `zlib.compress(данные, 6)` ТОЧНО. То есть
+    «этот поток пересжат python-скриптом» читается тремя строками кода и
+    БЕЗ эталона — самый дешёвый для проверяющего признак из всех найденных.
+    До правки так светились 145 потоков на 24 связках файл×цель.
+
+    Оригиналы выпущены `PDFsharp 1.50 / MigraDoc` (/Producer), который сжимает
+    собственной копией SharpZipLib — самостоятельной реализацией DEFLATE.
+    `pdfsharp_deflate.compress` воспроизводит её байт-в-байт (56/56 на корпусе).
+
+    Здесь это НЕ принимается на веру: берутся самые короткие нетронутые потоки
+    ЭТОГО файла и проверяется, воспроизводит ли их порт из их же распакованного
+    содержимого. Совпало на всех проверенных — компрессор используется; иначе
+    возвращается `zlib.compress`, то есть прежнее поведение без единого
+    побочного эффекта. Та же дисциплина «сначала проверь, потом доверяй», что
+    у gate'а вшивания глифов (`_try_patch_bold_digit_glyphs`): файл, выпущенный
+    другим генератором, обязан вернуть нас на безопасный путь, а не получить
+    чужой почерк сжатия.
+    """
+    try:
+        doc = fitz.open(stream=raw, filetype="pdf")
+    except Exception:  # noqa: BLE001
+        return zlib.compress
+    try:
+        candidates: List[Tuple[int, bytes, bytes]] = []
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref, compressed=True) or ""
+                if "FlateDecode" not in obj or "/Image" in obj:
+                    continue
+                comp = doc.xref_stream_raw(xref)
+                body = doc.xref_stream(xref)
+            except Exception:  # noqa: BLE001
+                continue
+            if not comp or not body:
+                continue
+            candidates.append((len(body), bytes(comp), bytes(body)))
+        candidates.sort(key=lambda c: c[0])
+        probed = 0
+        for _, comp, body in candidates[:_COMPRESSOR_PROBE_STREAMS]:
+            try:
+                if pdfsharp_deflate.compress(body, 6) != comp:
+                    return zlib.compress
+            except Exception:  # noqa: BLE001
+                return zlib.compress
+            probed += 1
+        if probed == 0:
+            return zlib.compress
+        return lambda data: pdfsharp_deflate.compress(data, 6)
+    finally:
+        doc.close()
+
 
 # ─── Помощник: running balance на границах дней, не после каждой транзакции ──
 
@@ -291,6 +362,94 @@ def _w_array_insert_sorted(
     return bytes(result)
 
 
+def _w_array_remove(
+    cidobj_bytes: bytes,
+    bracket_start: int,
+    close_idx: int,
+    cids: set,
+) -> Optional[bytes]:
+    """Удаляет из /W-массива записи перечисленных CID (hex, 4 симв.).
+
+    Вместе с записью снимается и разделитель перед ней — иначе в массиве
+    остаётся двойной пробел там, где его не бывает. У первой записи массива
+    разделителя слева нет, поэтому у неё снимается тот, что справа.
+    Возвращает None, если хоть один CID не найден (отказ вместо частичной
+    правки).
+    """
+    entries = _w_array_entries(cidobj_bytes, bracket_start + 1, close_idx)
+    if len(entries) < 2:
+        return None
+    want = {int(c, 16) for c in cids}
+    targets = [e for e in entries if e[0] in want]
+    if len(targets) != len(want):
+        return None
+
+    cuts = []
+    for idx, (cid, e_start, e_end, _ws) in enumerate(entries):
+        if cid not in want:
+            continue
+        if idx > 0:
+            cuts.append((entries[idx - 1][2], e_end))       # съедаем разделитель слева
+        elif len(entries) > 1:
+            cuts.append((e_start, entries[idx + 1][1]))     # первая запись — разделитель справа
+        else:
+            cuts.append((e_start, e_end))
+    result = bytearray(cidobj_bytes)
+    for start, end in sorted(cuts, key=lambda t: t[0], reverse=True):
+        del result[start:end]
+    return bytes(result)
+
+
+_BF_ENTRY_RANGE_RE = re.compile(
+    rb"<([0-9A-Fa-f]+)>\s*<[0-9A-Fa-f]+>\s*<[0-9A-Fa-f]+>\s*(?:\r\n|\r|\n)?"
+)
+_BF_ENTRY_CHAR_RE = re.compile(rb"<([0-9A-Fa-f]+)>\s*<[0-9A-Fa-f]+>\s*(?:\r\n|\r|\n)?")
+
+
+def _cmap_remove_mappings(body: bytes, cids: set) -> Optional[bytes]:
+    """Убирает из ToUnicode CMap записи перечисленных CID и правит счётчик
+    блока, в котором они лежали.
+
+    Обратная операция к `_cmap_add_mappings` и с той же дисциплиной: род
+    блока не предполагается, а определяется по факту; если удалить удалось
+    не все запрошенные CID — возвращает None (отказ вместо полуправки, из-за
+    которой ToUnicode рассинхронизировался бы с /W).
+    """
+    want = {c.upper() for c in cids}
+    if not want:
+        return None
+    out = bytearray(body)
+    removed_total = 0
+
+    for block_re, entry_re, kw in (
+        (_BFRANGE_BLOCK_RE, _BF_ENTRY_RANGE_RE, b"bfrange"),
+        (_BFCHAR_BLOCK_RE, _BF_ENTRY_CHAR_RE, b"bfchar"),
+    ):
+        while True:
+            m = block_re.search(bytes(out))
+            if m is None:
+                break
+            inner_start = m.start(3)
+            inner = m.group(3)
+            drop = [
+                em for em in entry_re.finditer(inner)
+                if em.group(1).decode("ascii").upper() in want
+            ]
+            if not drop:
+                break
+            for em in sorted(drop, key=lambda e: e.start(), reverse=True):
+                del out[inner_start + em.start():inner_start + em.end()]
+            # Счётчик блока стоит непосредственно перед "beginXXX"; пересчёт по
+            # снимку ПОСЛЕ удаления, но границы группы(1) не сдвинулись — она
+            # расположена раньше вырезанных байт.
+            new_count = int(m.group(1)) - len(drop)
+            out[m.start(1):m.end(1)] = str(new_count).encode("ascii")
+            removed_total += len(drop)
+            break  # один блок за проход; если CID разбросаны — следующий тип
+
+    return bytes(out) if removed_total == len(want) else None
+
+
 def _cmap_bf_style(body: bytes) -> Optional[Tuple[bytes, bytes]]:
     """Читает конвенции EOL и межтокенного разделителя из существующего
     beginbfrange/beginbfchar-блока ЭТОГО ToUnicode CMap-потока — тот же
@@ -317,6 +476,195 @@ def _cmap_bf_style(body: bytes) -> Optional[Tuple[bytes, bytes]]:
     if em is None:
         return None
     return em.group(2), em.group(1)
+
+
+# Предел записей в ОДНОМ bfrange/bfchar-блоке (ISO 32000, 9.10.3). Переполнять
+# нельзя — при превышении открывается новый блок ТОГО ЖЕ рода.
+_CMAP_MAX_BLOCK_ENTRIES = 100
+
+_BFRANGE_BLOCK_RE = re.compile(rb"(\d+)(\s+)beginbfrange(.*?)endbfrange", re.S)
+_BFCHAR_BLOCK_RE = re.compile(rb"(\d+)(\s+)beginbfchar(.*?)endbfchar", re.S)
+
+
+def _cmap_add_mappings(body: bytes, entries: List[Tuple[str, str]]) -> Optional[bytes]:
+    """Дописывает соответствия CID→Unicode в ToUnicode CMap ТЕМ ЖЕ РОДОМ блока,
+    каким таблицу пишет сам генератор этого файла.
+
+    `entries` — список (cid_hex, unicode_hex), оба по 4 hex-символа.
+
+    Найдено 2026-08-06: прежняя версия приклеивала ОТДЕЛЬНЫЙ блок
+    `beginbfchar` перед `endcmap` — сознательно, чтобы не пересчитывать
+    счётчик существующего блока. Но генератор Halyk пишет ВСЮ таблицу
+    исключительно через `beginbfrange` вырожденными диапазонами
+    (`<0013><0013><0030>`) и `beginbfchar` не эмитит нигде — замер на всех 6
+    реальных файлах (h6.pdf: 53 bfrange, 0 bfchar). Оба блока валидны по
+    спецификации, но чужой род блока — ровно тот класс признака, что и
+    критерий 4 «стиль сериализации операторов», причём самый заметный из
+    известных: присутствие `beginbfchar` в Halyk-документе видно САМО ПО
+    СЕБЕ, без эталона для сравнения.
+
+    Поэтому род блока не хардкодится ни в ту, ни в другую сторону, а
+    ЧИТАЕТСЯ из файла (тот же принцип, что `_op_separators`/`_w_array_
+    insert_sorted`): есть bfrange — дописываем вырожденные диапазоны в него,
+    иначе дописываем в bfchar. Возвращает новое тело потока либо None, если
+    конвенцию установить не удалось (отказ вместо угадывания).
+    """
+    style = _cmap_bf_style(body)
+    if style is None or not entries:
+        return None
+    eol, sep = style
+
+    use_range = _BFRANGE_BLOCK_RE.search(body) is not None
+    block_re = _BFRANGE_BLOCK_RE if use_range else _BFCHAR_BLOCK_RE
+    kw = b"bfrange" if use_range else b"bfchar"
+
+    def render(cid_hex: str, uni_hex: str) -> bytes:
+        head = f"<{cid_hex}>".encode("ascii")
+        if use_range:
+            # Вырожденный диапазон — ровно та форма, какой генератор пишет
+            # КАЖДУЮ свою запись (первый и последний код диапазона совпадают).
+            head += sep + f"<{cid_hex}>".encode("ascii")
+        return head + sep + f"<{uni_hex}>".encode("ascii") + eol
+
+    blocks = list(block_re.finditer(body))
+    if not blocks:
+        return None
+    last = blocks[-1]
+    count = int(last.group(1))
+
+    # Влезает в последний блок — дописываем в него и обновляем ЕГО счётчик.
+    if count + len(entries) <= _CMAP_MAX_BLOCK_ENTRIES:
+        insert_at = last.end() - len(b"end" + kw)
+        payload = b"".join(render(c, u) for c, u in entries)
+        new_body = body[:insert_at] + payload + body[insert_at:]
+        # Счётчик правим ПОСЛЕ вставки, по смещениям из того же снимка: она
+        # находится позже начала блока, поэтому его границы не сдвинулись.
+        return (
+            new_body[:last.start(1)]
+            + str(count + len(entries)).encode("ascii")
+            + new_body[last.end(1):]
+        )
+
+    # Не влезает — открываем НОВЫЙ блок того же рода сразу за последним
+    # (несколько блоков в одном CMap валидны и для генератора естественны).
+    payload = (
+        str(len(entries)).encode("ascii") + last.group(2) + b"begin" + kw + eol
+        + b"".join(render(c, u) for c, u in entries)
+        + b"end" + kw + eol
+    )
+    return body[:last.end()] + eol + payload + body[last.end():]
+
+
+def _cmap_reorder(body: bytes, order: List[str]) -> Optional[bytes]:
+    """Переставляет записи ToUnicode в порядок `order` (список CID-hex).
+
+    Замер 2026-08-07 на всех 6 оригиналах: порядок записей в ToUnicode ТОЧНО
+    совпадает с порядком ПЕРВОГО ПОЯВЛЕНИЯ CID в тексте страниц — 0 инверсий
+    в 12 таблицах из 12, при 100% покрытии (каждый перечисленный CID реально
+    напечатан). Генератор выкладывает subset по мере вёрстки, поэтому это не
+    случайность, а конвенция, различимая БЕЗ эталона: достаточно прочитать
+    таблицу и текст одного и того же файла.
+
+    В результатах инверсии появлялись на 16 связках из 24 — и по ДВУМ разным
+    причинам, а не только из-за дописывания CID: (а) `_cmap_add_mappings`
+    дописывает новые CID в конец, `_cmap_remove_mappings` убирает старые из
+    середины; (б) сама ЗАМЕНА ТЕКСТА двигает первое появление цифры по
+    документу — поэтому инверсии были и в Regular-таблице, которую мы не
+    патчим вовсе (h6 — 2, HALYKformat3 — 10, hformat5 — 3). Чинить (а) в
+    отдельности значило бы закрыть половину признака.
+
+    Перестановка делается над ГОТОВЫМИ байтовыми записями, а не перерисовкой
+    из полей: тогда стиль (EOL, пробелы между hex-токенами, длина hex)
+    сохраняется тождественно, чем бы он ни был. Структура блоков не трогается
+    — сколько блоков и по сколько записей было, столько и остаётся (важно:
+    настоящие файлы держат ВСЕ записи в ОДНОМ `beginbfrange`, даже когда их
+    117 или 123, то есть предел в 100 записей генератор не соблюдает).
+
+    Возвращает новое тело либо None — при любом сомнении (невырожденный
+    диапазон, разнородные хвосты записей, несовпадение самопроверки).
+    """
+    blocks: List[Tuple[re.Match, bool]] = [
+        (m, True) for m in _BFRANGE_BLOCK_RE.finditer(body)
+    ] + [(m, False) for m in _BFCHAR_BLOCK_RE.finditer(body)]
+    if not blocks:
+        return None
+    blocks.sort(key=lambda b: b[0].start())
+
+    entry_re_range = re.compile(
+        rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<[0-9A-Fa-f]+>([^<]*)"
+    )
+    entry_re_char = re.compile(rb"<([0-9A-Fa-f]+)>\s*<[0-9A-Fa-f]+>([^<]*)")
+
+    per_block: List[List[bytes]] = []
+    cids: List[str] = []
+    tails: set = set()
+    for m, is_range in blocks:
+        payload = m.group(3)
+        rx = entry_re_range if is_range else entry_re_char
+        found = list(rx.finditer(payload))
+        if not found:
+            return None
+        # Самопроверка: записи обязаны покрывать payload целиком, встык, после
+        # общего префикса. Иначе в блоке есть что-то, чего мы не понимаем, —
+        # переставлять такое нельзя.
+        prefix = payload[:found[0].start()]
+        if prefix.strip():
+            return None
+        pos = found[0].start()
+        for em in found:
+            if em.start() != pos:
+                return None
+            pos = em.end()
+        if pos != len(payload):
+            return None
+        texts = []
+        for em in found:
+            if is_range and em.group(1) != em.group(2):
+                return None  # невырожденный диапазон — по CID не переставить
+            tails.add(em.group(3) if is_range else em.group(2))
+            texts.append(payload[em.start():em.end()])
+            cids.append(em.group(1).decode("ascii").upper())
+        per_block.append(texts)
+
+    # Хвосты записей должны быть одинаковы, иначе перестановка сдвинула бы
+    # чужой разделитель (например, у последней записи перед endbfrange).
+    if len(tails) != 1:
+        return None
+
+    flat = [t for texts in per_block for t in texts]
+    if len(flat) != len(cids):
+        return None
+
+    by_cid = {}
+    for c, t in zip(cids, flat):
+        if c in by_cid:
+            return None  # дубль CID — порядок неоднозначен
+        by_cid[c] = t
+
+    rank = {c: i for i, c in enumerate(order)}
+    # Не встреченные в тексте CID — в хвост, сохраняя прежний относительный
+    # порядок. В оригиналах таких нет вовсе (покрытие 100%), поэтому это
+    # только защита, а не штатный путь.
+    new_cids = sorted(cids, key=lambda c: (rank.get(c, len(rank)), cids.index(c)))
+    if new_cids == cids:
+        return body
+
+    out = bytearray(body)
+    idx = 0
+    # Правим блоки С КОНЦА, чтобы смещения ранее найденных не поехали.
+    counts = [len(t) for t in per_block]
+    starts = [b[0].start(3) for b in blocks]
+    ends = [b[0].end(3) for b in blocks]
+    prefixes = [b[0].group(3)[:len(b[0].group(3)) - sum(len(t) for t in texts)]
+                for b, texts in zip(blocks, per_block)]
+    new_payloads = []
+    for cnt, pref in zip(counts, prefixes):
+        chunk = new_cids[idx:idx + cnt]
+        idx += cnt
+        new_payloads.append(pref + b"".join(by_cid[c] for c in chunk))
+    for start, end, payload in sorted(zip(starts, ends, new_payloads), reverse=True):
+        out[start:end] = payload
+    return bytes(out)
 
 
 # ─── Dataclasses ───────────────────────────────────────────────────────────
@@ -930,30 +1278,32 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
             new_val = -_realistic_round(abs(tx.shyghys) * k * (1 + noise), original=abs(tx.shyghys))
             tx.new_shyghys = new_val
             print(f"  [SEIZ] {tx.op_date} {tx.shyghys:,.2f} → {new_val:,.2f} (K={k:.4f})")
-        elif (
-            tx.currency == "KZT"
-            # «Сумма операции» должна быть в ТОЙ ЖЕ валюте, что и субсчёт
-            # списания, иначе разница между ними — курс, а не комиссия.
-            # Реальный случай (HALYKformat2): «Автоконвертация» с op_amount
-            # -8,85 USD и Расходом -4 548,02 ₸ (курс 513,9 ₸/$) нормализовалась
-            # в -8,85 ₸ — расход занижался, а в выписке оставалась строка, где
-            # 8,85 USD равны 8,85 ₸. Гейт по tx.currency этого не ловит: на
-            # строке-переносе она перезаписана ledger-тегом «(KZT)».
-            and tx.op_currency == tx.currency
-            and tx.shyghys < 0
-            and tx.op_amount_val is not None
-            and abs(abs(tx.op_amount_val) - abs(tx.shyghys)) > 0.005
-        ):
-            # «Сумма операции» и «Расход в валюте счета» расходятся на скрытую
-            # комиссию, зашитую прямо в шаблон (напр. -103 000,00 / -103 200,00),
-            # хотя колонка «Комиссия» показывает 0,00 — деньги «теряются в
-            # никуда» и выписка выглядит внутренне противоречивой. Приводим
-            # Расход к Сумме операции (единственному полю, которое реально
-            # означает сумму перевода); дельта автоматически уходит в
-            # new_total_shyghys/new_closing_balance ниже, как и для SEIZURE/SALARY.
-            new_val = -abs(tx.op_amount_val)
-            tx.new_shyghys = new_val
-            print(f"  [FEE-NORM] {tx.op_date} Расход {tx.shyghys:,.2f} → {new_val:,.2f} (=Сумма операции)")
+        # ── [FEE-NORM] УДАЛЁН 2026-08-06: он стирал признак настоящей выписки ──
+        # Здесь стояла «нормализация скрытой комиссии»: если «Расход в валюте
+        # счета» превышал «Сумму операции», расход приводился к сумме операции.
+        # Обоснование было «деньги теряются в никуда, выписка внутренне
+        # противоречива» — и оно оказалось НЕВЕРНЫМ, что показал прямой замер
+        # по всем 6 реальным файлам:
+        #
+        #   файл           строк с разницей   сама разница   колонка «Комиссия»
+        #   HALYKformat1          17            ровно 200 ₸        0,00
+        #   HALYKformat2          60            ровно 200 ₸        0,00
+        #   HALYKformat3          23            ровно 200 ₸        0,00
+        #   HALYKformat4           2            ровно 200 ₸        0,00
+        #   h6                    17            ровно 200 ₸        0,00
+        #   hformat5              23         200 ₸ (17) / 150 (6)  0,00
+        #
+        # То есть «расход больше суммы операции ровно на 150/200 ₸ при нулевой
+        # колонке комиссии» — это КОНВЕНЦИЯ ФОРМАТА, одинаковая во всех шести
+        # подлинных документах, а не артефакт шаблона. Нормализация убирала её
+        # начисто: в оригиналах 17-60 таких строк, в наших результатах — РОВНО
+        # НОЛЬ на каждом файле и каждой цели. Отсутствие того, что есть у всех
+        # настоящих выписок, — самостоятельный признак правки, причём
+        # различимый без эталона (проверка: `check_fee_rows_preserved`).
+        #
+        # Поэтому расход НЕ трогаем вовсе. Баланс от этого не страдает: он и в
+        # оригинале считается по колонке расхода, включающей эти 150/200 ₸.
+        # НЕ ВОЗВРАЩАТЬ без нового замера, опровергающего таблицу выше.
         else:
             tx.new_shyghys = tx.shyghys
             if (
@@ -1103,12 +1453,21 @@ def recalculate_halyk(stmt: HalykStatementData, target_monthly_income: float) ->
 def _try_patch_bold_digit_glyphs(
     ff2_bytes: bytes,
     digit_cids: Dict[str, str],
+    needed_digits: Optional[set] = None,
 ) -> Optional[Tuple[bytes, Dict[str, float]]]:
     """Пытается вписать в Bold-subset шрифт недостающие глифы цифр 0-9.
 
     digit_cids — {цифра: CID в виде 4-символьного hex}, тот же формат, что
     ключи avail_cids_map (обычно {'0': '0013', ..., '9': '001C'}, но
     вычисляется вызывающей стороной из FROM_UNICODE, а не жёстко здесь).
+
+    needed_digits — если задан, вшиваются ТОЛЬКО перечисленные цифры (те,
+    что реально появятся в жирном тексте). Subset настоящего файла плотный —
+    что в нём есть, то и напечатано (замер: 4 из 4 реальных файлов с жирными
+    цифрами), — поэтому глиф, не встречающийся ни в одном напечатанном
+    числе, сам по себе признак правки, различимый без эталона. Gate доверия
+    ниже при этом по-прежнему сверяет ВСЕ присутствующие цифры, а не только
+    нужные: сузить область доверия значило бы ослабить саму проверку.
 
     Возвращает (новые байты FontFile2, {cid_hex: 500.0}) для реально
     допатченных цифр, либо None — если патчить нечего, или "gate" не
@@ -1155,6 +1514,12 @@ def _try_patch_bold_digit_glyphs(
             else:
                 return None  # другой мастер-шрифт — не доверяем НИЧЕМУ
 
+        # Сужаем до реально нужных ПОСЛЕ полного прохода gate выше: он обязан
+        # был сверить каждую присутствующую цифру, независимо от того, какие
+        # из недостающих мы собираемся вшивать.
+        if needed_digits is not None:
+            missing_digits = [d for d in missing_digits if d in needed_digits]
+
         if not verified_match or not missing_digits:
             return None
 
@@ -1171,10 +1536,12 @@ def _try_patch_bold_digit_glyphs(
 # ─── Сырая замена байт ─────────────────────────────────────────────────────
 
 def _process_halyk_pdf_once(
-    input_bytes: bytes, target_monthly_income: float
-) -> Tuple[bytes, int, Dict[int, Dict[str, float]]]:
+    input_bytes: bytes,
+    target_monthly_income: float,
+    compress_stream: Callable[[bytes], bytes] = zlib.compress,
+) -> Tuple[bytes, int, Dict[int, Dict[str, float]], int]:
     """Один проход обработки. Возвращает (результат, число подмен шрифта,
-    вшитые глифы).
+    вшитые глифы, число стёртых токенов-минусов).
 
     Второй элемент — сколько раз пришлось нарисовать число ЧУЖИМ (Regular)
     шрифтом вместо жирного, потому что в жирном subset'е не оказалось нужного
@@ -1186,6 +1553,13 @@ def _process_halyk_pdf_once(
     реально были вшиты недостающие глифы цифр в этом прогоне (Task 3/4) —
     используется только для отчётности автотестов (LAST_RUN_INFO), не
     прод-логикой.
+
+    Четвёртый элемент — сколько токенов-минусов было СТЁРТО (входящий остаток
+    перешёл из минуса в плюс, см. ветку `decoded_blocks == ["-"]`). Каждое
+    стирание законно уменьшает число «Td … Tj» на единицу, поэтому
+    `style_check` обязан знать это число, иначе он считает корректный
+    результат отклонением почерка (в настоящем файле с положительным
+    остатком токена минуса нет вовсе — именно на него мы и равняемся).
     """
     from collections import deque as _deque
 
@@ -1438,6 +1812,40 @@ def _process_halyk_pdf_once(
     print(f"\n[Halyk] Подготовлено {sum(len(q) for q in replacement_queue.values())} замен "
           f"в {len(replacement_queue)} ключах")
 
+    # ── Какие цифры ДЕЙСТВИТЕЛЬНО понадобятся жирному шрифту ──────────────
+    # Subset настоящего файла ПЛОТНЫЙ: замер на 4 реальных файлах с жирными
+    # цифрами — что есть в /W, то и напечатано в документе, ноль лишних, 4 из
+    # 4. Значит вшивать ВСЕ недостающие цифры подряд нельзя: глиф, которого
+    # нет ни в одном напечатанном числе, — признак, видимый БЕЗ эталона
+    # (замер h6 ×1.05: в subset появлялись цифры 1 и 7, которых в новом
+    # тексте нет вовсе). Ограничиваем патч теми цифрами, что реально войдут
+    # в жирный текст.
+    #
+    # Жирным в этом формате набрана СТРОКА ИТОГОВ — то есть ровно два
+    # переписываемых значения: итог прихода и итог расхода. Остальные
+    # HDR-слоты (входящий/исходящий остаток) стоят в шапке и набраны Regular
+    # — замер: «Кіріс қалдығы: -61,68» на HALYKformat1 имеет шрифт
+    # 'Times New Roman', а не 'Times New Roman,Bold'. Включать их в набор
+    # нельзя: их цифры вшивались бы в ЖИРНЫЙ subset, не появляясь ни в одном
+    # напечатанном жирным числе (поймано `check_bold_subset_tightness` —
+    # HALYKformat1 ×2 вшивал «4», HALYKformat3 — «3», обе не нужны).
+    #
+    # Третья ячейка строки итогов (комиссия, «-1 200,00») не переписывается
+    # вовсе — её цифры уже есть в оригинальном subset'е по построению.
+    #
+    # Если этот вывод когда-нибудь окажется неверен для нового файла (жирной
+    # окажется ячейка, чьих цифр мы не вшили), результатом будет подмена
+    # шрифта в строке итогов — её ловит `check_bold_row_uniform`. То есть
+    # ошибка этой эвристики ГРОМКАЯ, а не тихая.
+    _BOLD_TOTAL_TYPES = ("TOTAL_KIRI_S", "TOTAL_SHYGHYS")
+    _bold_needed_digits: set = set()
+    for _k, _q in replacement_queue.items():
+        if not _k.startswith("HDR:"):
+            continue
+        for _val, _typ in _q:
+            if _typ in _BOLD_TOTAL_TYPES:
+                _bold_needed_digits.update(ch for ch in _fmt(abs(_val)) if ch.isdigit())
+
     # ── Regex для Td/Tj ───────────────────────────────────────────────────
     # Группа 3 — необязательная встроенная смена шрифта/кегля МЕЖДУ Td и <hex>Tj
     # (напр. "12 Td /F0 8 Tf <hex> Tj") — реальная строка "Всего:" этого
@@ -1455,6 +1863,7 @@ def _process_halyk_pdf_once(
     raw = bytearray(input_bytes)
     total_replaced = 0
     font_substitutions = 0
+    minus_erased = 0
     cumulative_offset = 0
 
     # ── Патч Bold-шрифта: вшиваем недостающие глифы цифр, если gate
@@ -1522,13 +1931,15 @@ def _process_halyk_pdf_once(
         if b"/CIDToGIDMap" in _cidobj_bytes and _c2g_m is None:
             continue
 
-        _result = _try_patch_bold_digit_glyphs(_ff2_bytes, _digit_cids)
+        _result = _try_patch_bold_digit_glyphs(
+            _ff2_bytes, _digit_cids, _bold_needed_digits
+        )
         if _result is None:
             continue
         _patched_ff2, _added_widths = _result
 
         # Готовим содержимое правки FontFile2 (ничего в raw ещё не пишем).
-        _new_compressed = zlib.compress(_patched_ff2)
+        _new_compressed = compress_stream(_patched_ff2)
         _new_length = len(_new_compressed)
         _new_length1 = len(_patched_ff2)
         _new_header = re.sub(rb"/Length\s+\d+", f"/Length {_new_length}".encode(), _header)
@@ -1608,33 +2019,19 @@ def _process_halyk_pdf_once(
             _tu_body = zlib.decompress(_tu_compressed) if _tu_is_flate else bytes(_tu_compressed)
         except zlib.error:
             continue
-        _endcmap_idx = _tu_body.rfind(b"endcmap")
-        if _endcmap_idx < 0:
-            continue
-        # Отдельный beginbfchar/endbfchar блок перед endcmap — не трогаем
-        # уже существующий bfrange-блок (не нужно пересчитывать его счётчик
-        # диапазонов), несколько bfchar/bfrange блоков в одном CMap валидны
-        # по спецификации (ISO 32000). EOL и разделитель между hex-токенами
-        # ЧИТАЮТСЯ из уже существующего bfrange/bfchar-блока этого же потока
-        # (см. _cmap_bf_style) — не хардкодятся: h6.pdf/HALYKformat1.pdf оба
-        # пишут "beginbfrange\r\n<023C><023C><0412>\r\n..." (CRLF, без
-        # пробела между токенами), а прежний код вставлял "\n" и пробел —
-        # видимое расхождение почерка ровно того класса, который вся эта
-        # ветка призвана убрать (см. CLAUDE.md, критерий 4).
-        _bf_style = _cmap_bf_style(_tu_body)
-        if _bf_style is None:
-            continue
-        _entry_eol, _token_sep = _bf_style
-        _bfchar_block = (
-            f"{len(_tu_entries)} beginbfchar".encode("ascii") + _entry_eol
-            + b"".join(
-                f"<{_cid}>".encode("ascii") + _token_sep + f"<{ord(_ch):04X}>".encode("ascii") + _entry_eol
-                for _cid, _ch in _tu_entries
-            )
-            + b"endbfchar" + _entry_eol
+        # Дописываем соответствия CID→Unicode ТЕМ ЖЕ родом блока, каким
+        # таблицу пишет сам генератор (bfrange вырожденными диапазонами у
+        # всех 6 реальных файлов), и его же EOL/разделителями — см.
+        # _cmap_add_mappings. Прежняя версия приклеивала отдельный блок
+        # beginbfchar, которого генератор Halyk не эмитит нигде: чужой род
+        # блока виден в документе САМ ПО СЕБЕ, без эталона для сравнения
+        # (см. verify_halyk_file.check_cmap_block_style).
+        _new_tu_body = _cmap_add_mappings(
+            _tu_body, [(_cid, f"{ord(_ch):04X}") for _cid, _ch in _tu_entries]
         )
-        _new_tu_body = _tu_body[:_endcmap_idx] + _bfchar_block + _tu_body[_endcmap_idx:]
-        _new_tu_compressed = zlib.compress(_new_tu_body) if _tu_is_flate else _new_tu_body
+        if _new_tu_body is None:
+            continue
+        _new_tu_compressed = compress_stream(_new_tu_body) if _tu_is_flate else _new_tu_body
         _new_tu_header = re.sub(
             rb"/Length\s+\d+", f"/Length {len(_new_tu_compressed)}".encode(), _tu_header
         )
@@ -1738,6 +2135,59 @@ def _process_halyk_pdf_once(
         except zlib.error:
             continue
 
+        # ── Зазор «число → соседний токен той же строки», КАК ЕГО ПИШЕТ САМ
+        # ФАЙЛ. Меряется по ОРИГИНАЛЬНОМУ потоку до единой правки: берём пары
+        # «денежный Tj → следующий Td с dy=0» и считаем (dx соседа − ширина
+        # числа по реальным /W). Замер 2026-08-06 на всех 6 файлах даёт РОВНО
+        # 2.0 pt, причём независимо от кегля — тогда как прежний хардкод
+        # «0.30 × кегль» давал 2.4 при кегле 8, 2.88 при 9.6 и 3.04 при 10.13.
+        # Именно эти значения и появлялись в результатах (HALYKformat4: 2.4;
+        # HALYKformat2: 2.88/3.04) при чистых 2.0 во всех оригиналах.
+        # Берём МОДУ, а не среднее: одна нетипичная пара не должна смещать
+        # конвенцию. Если пар нет вовсе — оставляем None, и ветка переноса
+        # ниже честно откатывается на прежнюю оценку.
+        _measured_gap = [None]
+        try:
+            _gap_tally: Dict[float, int] = {}
+            for _gm in re.finditer(
+                rb"(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+Td\s*(?:/F\d+\s+[\d.]+\s+Tf\s*)?"
+                rb"<([0-9A-Fa-f]+)>\s*Tj\s*(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+Td",
+                decompressed,
+            ):
+                if float(_gm.group(5)) != 0.0:
+                    continue  # сосед на своей строке — это не зазор
+                _gh = _gm.group(3).decode("ascii").upper()
+                _gt = "".join(TO_UNICODE.get(_gh[_i:_i + 4], "?") for _i in range(0, len(_gh), 4))
+                if not re.fullmatch(r"-?\d[\d  ]*(?:,\d{2})?", _gt.strip()):
+                    continue
+                _gtf = None
+                for _c in re.finditer(rb"/F(\d+)\s+([\d.]+)\s+Tf", decompressed[: _gm.start()]):
+                    _gtf = _c
+                if _gtf is None:
+                    continue
+                _gfn = "F" + _gtf.group(1).decode()
+                _gsz = float(_gtf.group(2))
+                _gdw = _xref_digit_w.get(xref_id, {}).get(_gfn)
+                _gsw = _xref_space_w.get(xref_id, {}).get(_gfn)
+                _gcw = _xref_comma_w.get(xref_id, {}).get(_gfn)
+                if _gdw is None or _gsw is None:
+                    continue
+                _gw = 0.0
+                for _ch in _gt:
+                    if _ch in ("\xa0", " "):
+                        _gw += _gsw / 1000.0 * _gsz
+                    elif _ch == ",":
+                        _gw += (_gcw if _gcw is not None else _gsw) / 1000.0 * _gsz
+                    elif _ch.isdigit():
+                        _gw += _gdw / 1000.0 * _gsz
+                _gval = round(float(_gm.group(4)) - _gw, 2)
+                if _gval >= 0:
+                    _gap_tally[_gval] = _gap_tally.get(_gval, 0) + 1
+            if _gap_tally:
+                _measured_gap[0] = max(_gap_tally.items(), key=lambda kv: kv[1])[0]
+        except Exception:  # noqa: BLE001
+            _measured_gap[0] = None
+
         # Знак "−" у отрицательных сумм в этом документе иногда выводится
         # ОТДЕЛЬНЫМ Tj перед цифрами, а не склеен с ними в одном текстовом ране
         # (встречается и в legacy, и в nav-формате — напр. изъятия у Kazakh-формата
@@ -1761,6 +2211,30 @@ def _process_halyk_pdf_once(
         # искомого, это прямое доказательство, что текущая ячейка принадлежит
         # ДРУГОЙ операции с тем же значением — тогда слот не берём.
         _prev_tok_hist = [None, None]
+
+        # ── Центрирование ЯЧЕЙКИ «минус + цифры» ──────────────────────────
+        # Отрицательная сумма в центрированной колонке таблицы верстается
+        # ДВУМЯ токенами: минус на СОБСТВЕННОЙ (dy≠0) позиции — он и задаёт
+        # левый край ячейки, — и цифры сразу за ним (dy=0). Ветка
+        # центрирования работает только для dy≠0, поэтому цифры попадали в
+        # ветку «продолжение строки» и оставались ЛЕВО-выровненными: левый
+        # край не двигался, число росло вправо, и центр ячейки уезжал ровно
+        # на половину прироста ширины (замер на HALYKformat1: колонка 240.60
+        # → 242.60/243.60/244.60 при ×1.05/×5/×20, та же картина на 407.46).
+        #
+        # Чтобы сохранить центр, влево на Δ/2 должен уехать ВЕСЬ пара-токен,
+        # то есть сам минус. Но минус идёт в потоке РАНЬШЕ цифр, и на момент
+        # его обработки будущая ширина числа ещё не известна (её определяют
+        # очередь замен и десяток защитных проверок ниже — повторять их в
+        # «заглядывании вперёд» значило бы держать две копии хрупкой логики).
+        # Поэтому Δ записывают САМИ цифры, когда замена ФАКТИЧЕСКИ произошла,
+        # а сдвиг применяется пост-проходом по k-му токену-минусу — порядок
+        # токенов в результате тот же, что и во входе, поэтому нумерация
+        # однозначна. Так исключено расхождение «минус сдвинут, а число не
+        # заменилось».
+        _minus_ord = [0]           # сколько токенов-минусов уже встречено
+        _minus_deltas: Dict[int, float] = {}  # ординал минуса → прирост ширины
+        _last_minus = [None]       # ординал последнего минуса, если он dy≠0
 
         # Накопленный "долг" по X для цепочек токенов на одной визуальной строке
         # (Td с dy=0 — не своя колонка таблицы, а продолжение той же строки, как
@@ -1798,7 +2272,7 @@ def _process_halyk_pdf_once(
         _absorb = [None]
 
         def replace_callback(match):
-            nonlocal total_replaced, font_substitutions
+            nonlocal total_replaced, font_substitutions, minus_erased
             x_str = match.group(1).decode("ascii")
             y_str = match.group(2).decode("ascii")
             _inline_tf_raw = match.group(3)  # b"/F0 8 Tf " или None
@@ -1895,6 +2369,11 @@ def _process_halyk_pdf_once(
             _prev_lone_minus[0] = decoded_blocks == ["-"]
 
             if decoded_blocks == ["-"]:
+                # Нумеруем токены-минусы в порядке следования; ячейкой считаем
+                # только тот, что стоит на СОБСТВЕННОЙ позиции (dy≠0) — минус
+                # внутри текущей строки (dy=0) левого края ячейки не задаёт.
+                _minus_ord[0] += 1
+                _last_minus[0] = _minus_ord[0] if not is_same_line else None
                 # Отдельный токен-минус перед числом (см. _prev_lone_minus).
                 # Если следующее число — это OPENING (входящий остаток,
                 # единственный тип замены, где знак может смениться с "−" на
@@ -1902,6 +2381,33 @@ def _process_halyk_pdf_once(
                 # иначе перед новым (уже положительным) числом останется
                 # "мёртвый" знак минуса. Для остальных типов (SEIZURE и т.п.)
                 # знак всегда сохраняется, поэтому проверяем именно typ.
+                #
+                # Токен минуса УДАЛЯЕТСЯ ЦЕЛИКОМ, а число занимает его место —
+                # ровно та структура, какой генератор верстает изначально
+                # положительный остаток. Замер на реальных файлах:
+                #
+                #   HALYKformat3 (12,51, положительный): 'остаток:' →
+                #       dx=30.2031 '12,51'                    — ДВА токена
+                #   hformat5     (-85,00, отрицательный):  'остаток:' →
+                #       dx=30.2031 '-' → dx=2.6641 '85,00'    — ТРИ токена
+                #
+                # то есть ЛЕВЫЙ КРАЙ значения у генератора стоит на одном и том
+                # же dx независимо от знака, а минус занимает начало этого
+                # места. Две прежние версии этого кода оставляли на месте
+                # минуса «невидимку» — сперва CID NBSP, затем пустую строку
+                # <>Tj — и обе сохраняли его ГОРИЗОНТАЛЬНЫЙ СЛОТ: число
+                # оставалось на 2.66 pt (ширина минуса) правее, чем в
+                # настоящем положительном файле, а в текстовом слое строка
+                # шапки распадалась на три прогона вместо одного
+                # ('Кіріс қалдығы:' + ' ' + '1,00' против цельного
+                # 'Кіріс қалдығы: -61,68' у оригинала).
+                #
+                # Сдвиг выражен ЧЕРЕЗ ДВА Td, уже лежащих в потоке
+                # (`current_x - dx_числа`), а не через ширину глифа минуса:
+                # _hw() считает минус по ширине цифры (4.0 pt), тогда как
+                # реальный минус этого шрифта — 2.664 pt, и опора на метрику
+                # промахнулась бы на 1.3 pt. «Поставить число туда, где стоял
+                # минус» верно независимо от того, какой глиф там был.
                 _next_m = td_pattern.search(decompressed, match.end())
                 if _next_m is not None:
                     _nh = _next_m.group(4).decode("ascii").upper()
@@ -1910,10 +2416,33 @@ def _process_halyk_pdf_once(
                     _nclean = re.sub(r"[^0-9]", "", _ntext)
                     if _nclean:
                         _nq = replacement_queue.get("HDR:" + _nclean)
-                        if _nq and _nq[0][1] == "OPENING":
-                            _blank_hex = FROM_UNICODE.get("\xa0") or FROM_UNICODE.get(" ")
-                            if _blank_hex:
-                                return _unchanged(hex_override=_blank_hex)
+                        if _nq and _nq[0][1] == "OPENING" and float(_next_m.group(2)) == 0.0:
+                            # Число должно встать ТУДА, где стоял минус:
+                            # его собственный dx (N) плюс поправка до dx
+                            # минуса (M) с учётом входящего сдвига (A) —
+                            # emitted_N + N = M + A.
+                            _nx = float(_next_m.group(1))
+                            _pending_x_shift[0] = current_x + x_adjust - _nx
+                            # Вклад удалённого токена (M) исчезает из накопления
+                            # Td строки, поэтому вычитаем его из _line_shift ДО
+                            # того, как следующий токен добавит туда свой
+                            # x_adjust. Итог: _line_shift сместится ровно на
+                            # (A − N), и ближайший перенос строки (dy≠0), где
+                            # x_adjust = −_line_shift, вернёт строку на исходную
+                            # левую границу. Без этой строки следующая строка
+                            # шапки («Шығыс қалдығы:»/«Исходящий остаток:»)
+                            # уезжала влево ровно на M — 339.99 → 306.23 pt на
+                            # HALYKformat1, поймано замером x0 её спана.
+                            if is_same_line:
+                                _line_shift[0] -= current_x
+                            minus_erased += 1
+                            # Этого токена в РЕЗУЛЬТАТЕ не будет, значит он не
+                            # занимает номер в нумерации пост-прохода (тот
+                            # считает минусы уже в выходном потоке). Иначе все
+                            # последующие ячейки получили бы чужую Δ.
+                            _minus_ord[0] -= 1
+                            _last_minus[0] = None
+                            return b""
                 return _unchanged()
 
             # Находим числовую зону
@@ -2147,6 +2676,19 @@ def _process_halyk_pdf_once(
                 # ширины, которую породила именно эта замена.
                 _pending_x_shift[0] = width_delta
 
+                # Цифры центрированной ячейки, чей левый край задаёт отдельный
+                # токен-минус: сообщаем прирост ширины пост-проходу, который
+                # сдвинет ЭТОТ минус влево на половину прироста и тем сохранит
+                # центр ячейки (см. _minus_deltas выше). Регистрируем здесь —
+                # то есть только когда замена ДЕЙСТВИТЕЛЬНО состоялась и Δ
+                # известна точно, а не предсказана заглядыванием вперёд.
+                if (
+                    preceded_by_lone_minus
+                    and _last_minus[0] is not None
+                    and abs(width_delta) > 0.0005
+                ):
+                    _minus_deltas[_last_minus[0]] = width_delta
+
                 # Переполнение правого края: фактический левый край токена =
                 # оригинальный кумулятивный X + все наши сдвиги на этой строке
                 # (= _line_shift после += x_adjust). Второе вхождение остатка в
@@ -2159,15 +2701,31 @@ def _process_halyk_pdf_once(
                 # в том же BT-блоке: тогда его строка и принимает наше число.
                 if _active_fsize and _active_fname:
                     emitted_left = _abs_x_orig[0] + _line_shift[0]
-                    # Абсолютная ширина числа для контроля выезда и для отступа
-                    # подтягиваемого "KZT;": _hw калибрована под сдвиги (относит.
-                    # дельты) и занижает абсолют (не считает запятую, узкая цифра),
-                    # из-за чего "KZT;" налезал на число. Здесь — прямая оценка под
-                    # пропорциональный шрифт шапки: цифра ≈0.5em, разделитель ≈0.27em.
-                    # формат числа — только цифры и разделители (пробел/nbsp/запятая)
-                    new_num_w = sum(
-                        (0.50 if c.isdigit() else 0.27) for c in formatted_num
-                    ) * _active_fsize
+                    # Абсолютная ширина числа — для контроля выезда за кромку и
+                    # для отступа подтягиваемого "KZT;".
+                    #
+                    # Здесь стояла ПРИБЛИЖЁННАЯ оценка (цифра ≈0.50em,
+                    # разделитель ≈0.27em) с оговоркой, что «_hw занижает
+                    # абсолют, не считает запятую». Оговорка УСТАРЕЛА: `_hw`
+                    # с тех пор получила ширину запятой из /W и стала точной —
+                    # проверено прямым сличением с отрисовкой (замер
+                    # 2026-08-06 на HALYKformat4: `229 172,00` → расчёт 36.000
+                    # при измеренной ширине спана 36.00; `-75 790,00` → 34.664
+                    # при 34.66). А приближение промахивалось на
+                    # 0.02em × число разделителей: у «KZT;» это давало зазор
+                    # 2.48 вместо 2.0 при трёх разделителях и 2.64 при
+                    # четырёх — ровно тот остаток, что был виден после
+                    # исправления самого зазора.
+                    #
+                    # Откат на приближение оставлен только для случая, когда
+                    # реальных ширин из /W нет вовсе (тогда `_hw` сама уходит
+                    # на грубую модель и абсолют ей считать нельзя).
+                    if _real_digit_w1000 is not None and _real_space_w1000 is not None:
+                        new_num_w = _hw(formatted_num)
+                    else:
+                        new_num_w = sum(
+                            (0.50 if c.isdigit() else 0.27) for c in formatted_num
+                        ) * _active_fsize
                     max_right = _page_width - 4.0
 
                     # Число-продолжение ОТДЕЛЬНОГО minus-токена (preceded_by_lone_minus)
@@ -2228,7 +2786,17 @@ def _process_halyk_pdf_once(
                         if _can_wrap:
                             _nx_dx = float(_nxt.group(1))
                             _nx_dy = float(_nxt.group(2))
-                            gap = 0.30 * _active_fsize  # пробел между числом и "KZT;"
+                            # Зазор берём ИЗМЕРЕННЫЙ у самого файла (мода по
+                            # его же парам «число → сосед той же строки»), а
+                            # не долю кегля: см. _measured_gap выше — хардкод
+                            # 0.30×кегль давал 2.88/3.04 там, где документ
+                            # пишет 2.0. Откат на прежнюю формулу только если
+                            # мерить было не по чему.
+                            gap = (
+                                _measured_gap[0]
+                                if _measured_gap[0] is not None
+                                else 0.30 * _active_fsize
+                            )
                             # Число уходит в начало следующей строки: его новый Td
                             # (относительно предыдущего токена «валюте:») = дойти до
                             # текущего origin + доп. смещение следующего токена к
@@ -2283,14 +2851,30 @@ def _process_halyk_pdf_once(
 
                 if _sib_m is not None:
                     # (B) Строка шапки — ЛЕВОЕ выравнивание: левый край числа
-                    # остаётся на месте (не центрируем). Сосед ("KZT;" и далее)
-                    # пересчитывается АБСОЛЮТНО от реальной ширины нового числа
-                    # + фиксированный зазор — самовосстанавливается независимо
-                    # от накопленного в истории документа дефицита исходного dx.
+                    # остаётся на месте (не центрируем), а сосед ("KZT;" и
+                    # далее) сдвигается ровно на изменение ширины числа — и
+                    # тем САМ ЗАЗОР между ними сохраняется таким, каким его
+                    # написал генератор.
+                    #
+                    # Раньше здесь сосед ставился абсолютно: «ширина нового
+                    # числа + зазор», где зазор ГАДАЛСЯ как 0.30 × кегль.
+                    # Замер (2026-08-06) показал, что генератор пишет зазор
+                    # ровно 2.0 pt независимо от кегля, а формула давала 2.4
+                    # при кегле 8, 2.88 при 9.6 и 3.04 при 10.13 — ровно те
+                    # значения, что видны в результатах (HALYKformat4: 2.4;
+                    # HALYKformat2: 2.88 и 3.04), при том что во ВСЕХ
+                    # оригиналах зазор только 2.0. Хардкод «доли кегля» — тот
+                    # же класс ошибки, что `_fmt_coord`/`_op_separators`
+                    # когда-то устранили в сериализации: конвенцию надо
+                    # ПОВТОРЯТЬ за файлом, а не изобретать.
+                    #
+                    # Перенос ровно на разницу ширин делает это тождественно:
+                    # новый dx соседа = исходный dx + Δширины = новая ширина
+                    # числа + ИСХОДНЫЙ зазор, каким бы он ни был, и работает
+                    # даже когда у токена есть префикс/суффикс вокруг числа
+                    # (они входят в исходный dx и сокращаются).
                     new_x = current_x + x_adjust
-                    _sib_orig_dx = float(_sib_m.group(1))
-                    _sib_gap = 0.30 * _active_fsize
-                    _pending_x_shift[0] = (_hw(formatted_num) + _sib_gap) - _sib_orig_dx
+                    _pending_x_shift[0] = width_delta
                 else:
                     # (A) Ячейка таблицы — ЦЕНТРИРОВАНИЕ. Раньше широкое число
                     # ужималось по кеглю, чтобы вписаться в узкую колонку
@@ -2387,10 +2971,50 @@ def _process_halyk_pdf_once(
 
         new_decompressed = td_pattern.sub(replace_callback, decompressed)
 
+        # ── Пост-проход: центрируем ячейки «минус + цифры» ────────────────
+        # Цифры зарегистрировали прирост ширины Δ по ординалу своего минуса
+        # (см. _minus_deltas). Здесь сдвигаем k-й токен-минус влево на Δ/2:
+        # левый край ячейки уходит влево ровно настолько, насколько число
+        # выросло вправо, и ЦЕНТР ячейки остаётся прежним. Цифры двигать не
+        # нужно — их Td задан ОТНОСИТЕЛЬНО минуса, они уезжают вместе с ним.
+        # Порядок токенов в результате тот же, что во входе (замены —
+        # один-к-одному), поэтому нумерация совпадает.
+        if _minus_deltas:
+            _minus_hex = (FROM_UNICODE.get("-") or "").upper()
+            if _minus_hex:
+                # Регистр hex-цифр не фиксирован конвенцией, но IGNORECASE на
+                # весь шаблон нельзя — он распространился бы и на Td/Tj и стал
+                # бы матчить чужие операторы. Регистронезависимость строго на
+                # сам CID: каждая буквенная цифра — явной парой вариантов.
+                _hex_pat = b"".join(
+                    (f"[{c.upper()}{c.lower()}]".encode("ascii") if c.isalpha()
+                     else c.encode("ascii"))
+                    for c in _minus_hex
+                )
+                _minus_tok_re = re.compile(
+                    rb"(-?\d+\.?\d*)(\s+-?\d+\.?\d*\s+Td\s*(?:/F\d+\s+[\d.]+\s+Tf\s*)?<"
+                    + _hex_pat
+                    + rb">\s*Tj)"
+                )
+
+                _seen = [0]
+
+                def _shift_minus(m):
+                    _seen[0] += 1
+                    _d = _minus_deltas.get(_seen[0])
+                    if _d is None:
+                        return m.group(0)
+                    return (
+                        _fmt_coord(float(m.group(1)) - _d / 2.0).encode("ascii")
+                        + m.group(2)
+                    )
+
+                new_decompressed = _minus_tok_re.sub(_shift_minus, new_decompressed)
+
         if new_decompressed == decompressed:
             continue
 
-        new_compressed = zlib.compress(new_decompressed)
+        new_compressed = compress_stream(new_decompressed)
 
         old_stream_len = len(raw_stream_data)
         new_stream_len = len(new_compressed)
@@ -2426,7 +3050,7 @@ def _process_halyk_pdf_once(
     if cumulative_offset != 0 or _newly_available_cids:
         result = _rebuild_xref_table(result)
 
-    return result, font_substitutions, _newly_available_cids
+    return result, font_substitutions, _newly_available_cids, minus_erased
 
 
 # Сколько раз перебрать ±3% шум, пытаясь получить итоги без «недостающих» цифр.
@@ -2449,6 +3073,398 @@ LAST_RUN_INFO: Dict[str, object] = {}
 # чистый вариант достижим, он выпадает в пределах первых нескольких попыток;
 # там, где нет, — не выпадает ни разу из 100.
 _MIN_ATTEMPTS_TO_PROVE = 8
+
+_TRAILER_ID_RE = re.compile(rb"(/ID\s*\[\s*<)([0-9A-Fa-f]+)(>\s*<)([0-9A-Fa-f]+)(>\s*\])")
+
+
+def _prune_bold_orphan_glyphs(
+    pdf_bytes: bytes,
+    compress_stream: Callable[[bytes], bytes] = zlib.compress,
+) -> bytes:
+    """Убирает из Bold-subset цифры, которые в ГОТОВОМ документе не рисуются.
+
+    Subset подлинного файла плотный: что лежит в шрифте, то и напечатано —
+    замер на всех 4 реальных файлах с жирными цифрами, ноль лишних, 4 из 4.
+    После замены текста часть цифр, использовавшихся ОРИГИНАЛОМ, перестаёт
+    употребляться, и subset становится «шире» документа — признак правки,
+    различимый без эталона.
+
+    Работает по ГОТОВЫМ байтам (вызывается последним, когда весь текст уже
+    переписан), поэтому множество «реально нарисованных» CID — не прогноз, а
+    факт. Для этого формата такой скан ПОЛОН: все 6 файлов рисуют текст
+    исключительно через `<hex>Tj` — ни одного `TJ`-массива, `()Tj`, `'` или
+    `"` (замер 2026-08-06). Если такой оператор всё же встретится, функция
+    ОТКАЗЫВАЕТСЯ работать целиком: неполный скан мог бы счесть используемый
+    глиф лишним и снести ширину реально печатаемой цифре.
+
+    Отказ — всегда «ничего не менять»: возвращается вход без изменений.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:  # noqa: BLE001
+        return pdf_bytes
+    # font_key = (cid_xref, ff2_xref, tounicode_xref)
+    present: Dict[Tuple[int, int, Optional[int]], set] = {}
+    used: Dict[Tuple[int, int, Optional[int]], set] = {}
+    try:
+        _, from_uni = build_dynamic_cmap(doc)
+        digit_cids = {from_uni[c].upper() for c in "0123456789" if c in from_uni}
+        if len(digit_cids) != 10:
+            return pdf_bytes
+        for pno in range(doc.page_count):
+            pobj = doc.xref_object(doc[pno].xref)
+            bold: Dict[str, Tuple[int, int, Optional[int]]] = {}
+            for fname, fxref in re.findall(r"/F(\d+)\s+(\d+)\s+0\s+R", pobj):
+                fobj = doc.xref_object(int(fxref))
+                bm = re.search(r"/BaseFont\s*/(\S+)", fobj)
+                if not bm or ("Bold" not in bm.group(1) and ",B" not in bm.group(1)):
+                    continue
+                dm = re.search(r"/DescendantFonts\s*\[?\s*(\d+)\s+0\s+R", fobj)
+                if not dm:
+                    continue
+                cid_xref = int(dm.group(1))
+                cobj = doc.xref_object(cid_xref)
+                fm = re.search(r"/FontFile2\s+(\d+)\s+0\s+R", doc.xref_object(cid_xref))
+                if not fm:
+                    dsc = re.search(r"/FontDescriptor\s+(\d+)\s+0\s+R", cobj)
+                    if not dsc:
+                        continue
+                    fm = re.search(r"/FontFile2\s+(\d+)\s+0\s+R", doc.xref_object(int(dsc.group(1))))
+                    if not fm:
+                        continue
+                tum = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", fobj)
+                key = (cid_xref, int(fm.group(1)), int(tum.group(1)) if tum else None)
+                bold["F" + fname] = key
+                if key not in present:
+                    wm = re.search(r"/W\s*\[(.*?)\]\s*(?:/|>>)", cobj, re.S)
+                    if not wm:
+                        return pdf_bytes
+                    have = set()
+                    for em in re.finditer(r"(\d+)\s*\[\s*[\d\s]+\]", wm.group(1)):
+                        h = f"{int(em.group(1)):04X}"
+                        if h in digit_cids:
+                            have.add(h)
+                    present[key] = have
+                    used[key] = set()
+            if not bold:
+                continue
+            buf = b""
+            for cx in doc[pno].get_contents():
+                try:
+                    buf += zlib.decompress(doc.xref_stream_raw(cx))
+                except Exception:  # noqa: BLE001
+                    try:
+                        buf += doc.xref_stream(cx)
+                    except Exception:  # noqa: BLE001
+                        return pdf_bytes  # поток не прочитан — скан неполон
+            # Скан полон только для <hex>Tj; любой иной показ текста — отказ.
+            if re.search(rb"\]\s*TJ|\)\s*Tj|[^A-Za-z0-9]'\s|\"\s", buf):
+                return pdf_bytes
+            cur = None
+            for m in re.finditer(rb"/F(\d+)\s+[\d.]+\s+Tf|<([0-9A-Fa-f]+)>\s*Tj", buf):
+                if m.group(1) is not None:
+                    cur = "F" + m.group(1).decode()
+                elif cur in bold:
+                    h = m.group(2).decode("ascii").upper()
+                    for j in range(0, len(h), 4):
+                        if h[j:j + 4] in digit_cids:
+                            used[bold[cur]].add(h[j:j + 4])
+    except Exception:  # noqa: BLE001
+        return pdf_bytes
+    finally:
+        doc.close()
+
+    raw = bytearray(pdf_bytes)
+    pruned_any = False
+    for key, have in present.items():
+        cid_xref, ff2_xref, tu_xref = key
+        orphans = have - used.get(key, set())
+        if not orphans:
+            continue
+
+        # ── Готовим ВСЕ правки из одного снимка raw и применяем либо все,
+        # либо ни одной — та же дисциплина атомарности, что у вшивания.
+        ff2_pos = raw.find(f"{ff2_xref} 0 obj".encode())
+        cid_pos = raw.find(f"{cid_xref} 0 obj".encode())
+        if ff2_pos < 0 or cid_pos < 0:
+            continue
+        stream_kw = raw.find(b"stream", ff2_pos)
+        data_start = stream_kw + len(b"stream")
+        if raw[data_start:data_start + 2] == b"\r\n":
+            data_start += 2
+        elif raw[data_start:data_start + 1] == b"\n":
+            data_start += 1
+        endstream_pos = raw.find(b"endstream", data_start)
+        header = bytes(raw[ff2_pos:stream_kw])
+        lm = re.search(rb"/Length\s+(\d+)", header)
+        if not lm:
+            continue
+        old_len = int(lm.group(1))
+        comp = bytes(raw[data_start:data_start + old_len])
+        is_flate = b"/FlateDecode" in header
+        try:
+            font_bytes = zlib.decompress(comp) if is_flate else comp
+            # Пустые байты глифа = глиф исчезает; _patch_truetype_glyphs сам
+            # перестроит glyf/loca, сдвинет последующие таблицы и пересчитает
+            # контрольные суммы (та же функция, что вшивает глифы, — обратное
+            # направление той же операции, отдельного кода не требует).
+            new_font = _patch_truetype_glyphs(
+                font_bytes, {int(c, 16): b"" for c in orphans}
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        new_comp = compress_stream(new_font) if is_flate else new_font
+        new_header = re.sub(rb"/Length\s+\d+", f"/Length {len(new_comp)}".encode(), header)
+        new_header = re.sub(rb"/Length1\s+\d+", f"/Length1 {len(new_font)}".encode(), new_header)
+        stream_sep = bytes(raw[stream_kw + len(b"stream"):data_start])
+        trailing = bytes(raw[data_start + old_len:endstream_pos])
+        ff2_new = new_header + b"stream" + stream_sep + new_comp + trailing
+
+        endobj_pos = raw.find(b"endobj", cid_pos)
+        cidobj = bytes(raw[cid_pos:endobj_pos])
+        # /W — ВЛОЖЕННЫЙ массив ("[3[250]11[333]…]"), поэтому конец ищем
+        # счётчиком вложенности, а не первой попавшейся "]" (та закрывает
+        # первую же запись [250]). Тот же приём, что в ветке вшивания выше.
+        w_m = re.search(rb"/W\s*\[", cidobj)
+        if not w_m:
+            continue
+        bracket = w_m.end() - 1
+        depth = 0
+        close = None
+        for j in range(bracket, len(cidobj)):
+            ch = cidobj[j:j + 1]
+            if ch == b"[":
+                depth += 1
+            elif ch == b"]":
+                depth -= 1
+                if depth == 0:
+                    close = j
+                    break
+        if close is None:
+            continue
+        cid_new = _w_array_remove(cidobj, bracket, close, orphans)
+        if cid_new is None:
+            continue
+
+        tu_region = None
+        if tu_xref is not None:
+            tu_pos = raw.find(f"{tu_xref} 0 obj".encode())
+            if tu_pos >= 0:
+                tu_kw = raw.find(b"stream", tu_pos)
+                tu_start = tu_kw + len(b"stream")
+                if raw[tu_start:tu_start + 2] == b"\r\n":
+                    tu_start += 2
+                elif raw[tu_start:tu_start + 1] == b"\n":
+                    tu_start += 1
+                tu_end = raw.find(b"endstream", tu_start)
+                tu_header = bytes(raw[tu_pos:tu_kw])
+                tlm = re.search(rb"/Length\s+(\d+)", tu_header)
+                if tlm:
+                    tu_old = int(tlm.group(1))
+                    tu_comp = bytes(raw[tu_start:tu_start + tu_old])
+                    tu_flate = b"/FlateDecode" in tu_header
+                    try:
+                        tu_body = zlib.decompress(tu_comp) if tu_flate else tu_comp
+                    except zlib.error:
+                        tu_body = None
+                    if tu_body is not None:
+                        tu_body_new = _cmap_remove_mappings(tu_body, orphans)
+                        if tu_body_new is not None:
+                            tu_comp_new = (
+                                compress_stream(tu_body_new) if tu_flate else tu_body_new
+                            )
+                            tu_header_new = re.sub(
+                                rb"/Length\s+\d+",
+                                f"/Length {len(tu_comp_new)}".encode(),
+                                tu_header,
+                            )
+                            tu_sep = bytes(raw[tu_kw + len(b"stream"):tu_start])
+                            tu_tail = bytes(raw[tu_start + tu_old:tu_end])
+                            tu_region = (
+                                tu_pos,
+                                tu_end,
+                                tu_header_new + b"stream" + tu_sep + tu_comp_new + tu_tail,
+                            )
+        if tu_xref is not None and tu_region is None:
+            continue  # ToUnicode не поддался — не рассинхронизируем его с /W
+
+        regions = [(ff2_pos, endstream_pos, ff2_new), (cid_pos, endobj_pos, cid_new)]
+        if tu_region is not None:
+            regions.append(tu_region)
+        regions.sort(key=lambda r: r[0], reverse=True)
+        if any(regions[i][0] < regions[i + 1][1] for i in range(len(regions) - 1)):
+            continue
+        for start, end, new_bytes in regions:
+            raw[start:end] = new_bytes
+        pruned_any = True
+        print(
+            f"[Halyk] Из Bold-subset убраны неиспользуемые цифры "
+            f"(шрифт xref {ff2_xref}): {sorted(orphans)}"
+        )
+
+    return bytes(raw) if pruned_any else pdf_bytes
+
+
+def _reorder_tounicode_to_text(
+    pdf_bytes: bytes,
+    compress_stream: Callable[[bytes], bytes] = zlib.compress,
+) -> bytes:
+    """Приводит порядок записей ToUnicode к порядку первого появления CID в тексте.
+
+    Вызывается ПОСЛЕДНИМ — по готовым байтам, когда весь текст уже переписан
+    и осиротевшие глифы уже удалены, — потому что порядок первого появления
+    определяется ИТОГОВЫМ документом, а не исходным. См. `_cmap_reorder`
+    о самом признаке и замерах.
+
+    Имена шрифтовых ресурсов (`/F0`, `/F1`) ЛОКАЛЬНЫ ДЛЯ СТРАНИЦЫ — на одной
+    странице `F0` это Regular, на другой тем же именем может быть Bold, —
+    поэтому каждый `Tj` привязывается к активному `Tf` В ПРЕДЕЛАХ СВОЕЙ
+    страницы. Пренебрежение этим и было ошибкой первого замера: CID Regular и
+    Bold пересекаются, общий проход смешивал их и показывал сотни «инверсий»
+    даже на нетронутых оригиналах.
+
+    Как и `_prune_bold_orphan_glyphs`, скан полон только для `<hex>Tj`; любой
+    иной способ показа текста — полный отказ (возврат входа без изменений),
+    потому что неполный скан переставил бы записи по неверному порядку.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:  # noqa: BLE001
+        return pdf_bytes
+    order: Dict[int, List[str]] = {}
+    seen: Dict[int, set] = {}
+    try:
+        for pno in range(doc.page_count):
+            page = doc[pno]
+            fmap: Dict[str, int] = {}
+            for f in page.get_fonts(full=True):
+                fobj = doc.xref_object(f[0], compressed=True) or ""
+                tm = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", fobj)
+                if tm:
+                    fmap[f[4]] = int(tm.group(1))
+            if not fmap:
+                continue
+            buf = b""
+            for cx in page.get_contents():
+                try:
+                    buf += doc.xref_stream(cx)
+                except Exception:  # noqa: BLE001
+                    return pdf_bytes  # поток не прочитан — скан неполон
+            if re.search(rb"\]\s*TJ|\)\s*Tj|[^A-Za-z0-9]'\s|\"\s", buf):
+                return pdf_bytes
+            cur: Optional[int] = None
+            for m in re.finditer(rb"/(F\d+)\s+[\d.]+\s+Tf|<([0-9A-Fa-f]+)>\s*Tj", buf):
+                if m.group(1) is not None:
+                    cur = fmap.get(m.group(1).decode("ascii"))
+                    continue
+                if cur is None:
+                    continue
+                h = m.group(2).decode("ascii").upper()
+                lst = order.setdefault(cur, [])
+                st = seen.setdefault(cur, set())
+                for j in range(0, len(h), 4):
+                    c = h[j:j + 4]
+                    if c not in st:
+                        st.add(c)
+                        lst.append(c)
+    except Exception:  # noqa: BLE001
+        return pdf_bytes
+    finally:
+        doc.close()
+
+    raw = bytearray(pdf_bytes)
+    changed = False
+    for tu_xref, cid_order in sorted(order.items(), reverse=True):
+        tu_pos = raw.find(f"{tu_xref} 0 obj".encode())
+        if tu_pos < 0:
+            continue
+        tu_kw = raw.find(b"stream", tu_pos)
+        if tu_kw < 0:
+            continue
+        tu_start = tu_kw + len(b"stream")
+        if raw[tu_start:tu_start + 2] == b"\r\n":
+            tu_start += 2
+        elif raw[tu_start:tu_start + 1] == b"\n":
+            tu_start += 1
+        tu_end = raw.find(b"endstream", tu_start)
+        tu_header = bytes(raw[tu_pos:tu_kw])
+        lm = re.search(rb"/Length\s+(\d+)", tu_header)
+        if not lm or tu_end < 0:
+            continue
+        tu_old = int(lm.group(1))
+        tu_comp = bytes(raw[tu_start:tu_start + tu_old])
+        tu_flate = b"/FlateDecode" in tu_header
+        try:
+            tu_body = zlib.decompress(tu_comp) if tu_flate else tu_comp
+        except zlib.error:
+            continue
+        new_body = _cmap_reorder(tu_body, cid_order)
+        if new_body is None or new_body == tu_body:
+            continue
+        new_comp = compress_stream(new_body) if tu_flate else new_body
+        new_header = re.sub(
+            rb"/Length\s+\d+", f"/Length {len(new_comp)}".encode(), tu_header
+        )
+        tu_sep = bytes(raw[tu_kw + len(b"stream"):tu_start])
+        tu_tail = bytes(raw[tu_start + tu_old:tu_end])
+        raw[tu_pos:tu_end] = new_header + b"stream" + tu_sep + new_comp + tu_tail
+        changed = True
+    return bytes(raw) if changed else pdf_bytes
+
+
+def _prune_and_fix(
+    pdf_bytes: bytes,
+    compress_stream: Callable[[bytes], bytes] = zlib.compress,
+) -> bytes:
+    """Удаляет осиротевшие глифы и приводит xref в порядок.
+
+    Вынесено отдельно, потому что удаление меняет длины трёх объектов и
+    обязано сопровождаться перестройкой xref — забыть её означало бы отдать
+    файл с битыми смещениями. Обе операции всегда идут парой.
+    """
+    pruned = _prune_bold_orphan_glyphs(pdf_bytes, compress_stream)
+    # Переупорядочивание ToUnicode идёт ПОСЛЕ удаления осиротевших глифов:
+    # порядок первого появления считается по ИТОГОВОМУ набору записей, иначе
+    # удалённый CID успел бы занять место в порядке.
+    reordered = _reorder_tounicode_to_text(pruned, compress_stream)
+    if reordered is pdf_bytes:
+        return pdf_bytes
+    return _rebuild_xref_table(reordered)
+
+
+def _regenerate_trailer_id(
+    pdf_bytes: bytes,
+    compress_stream: Callable[[bytes], bytes] = zlib.compress,
+) -> bytes:
+    """Пересчитывает /ID трейлера заново, а не клонирует его из оригинала.
+
+    Найдено 2026-08-06: `process_pdf_bytes_raw`/`_rebuild_xref_table` по всей
+    архитектуре (см. CLAUDE.md, "Сохраняет ОРИГИНАЛЬНЫЕ: ... ID") намеренно
+    не трогают `/ID` — это патчит байты на месте, а не пересобирает документ.
+    Для Halyk это оказалось видимым признаком: реальный генератор (iText)
+    пересчитывает `/ID` при каждой самостоятельной сборке, а у результата он
+    побайтово совпадал с оригиналом при другом размере файла на всех 25
+    проверенных связках файл×цель — то есть правили байты поверх исходника,
+    а не пересобирали документ. Kaspi Gold/Kaspi ИП сюда намеренно не входят
+    (то же архитектурное решение там уже проверено форензически как
+    незаметное — трогать без отдельного разбора не нужно).
+
+    Новое значение вычисляется от итоговых байт документа (после всех
+    патчей — контент, xref, глифы), поэтому детерминированно меняется вместе
+    с содержимым и никогда не совпадает с оригиналом. Оба элемента пары
+    делаются РАЗНЫМИ (не клонами друг друга) — на 6 реальных файлах у 5 из 6
+    ID[0]==ID[1], но у HALYKformat1.pdf они различны, то есть жёсткого
+    правила "всегда одинаковые" в реальных данных нет, и его не стоит вводить
+    искусственно.
+    """
+    pdf_bytes = _prune_and_fix(pdf_bytes, compress_stream)
+    m = _TRAILER_ID_RE.search(pdf_bytes)
+    if not m or len(m.group(2)) != 32 or len(m.group(4)) != 32:
+        return pdf_bytes  # нестандартный trailer — не трогаем, безопасный no-op
+    id0 = hashlib.md5(pdf_bytes + b"\x00").hexdigest().upper()
+    id1 = hashlib.md5(pdf_bytes + b"\x01").hexdigest().upper()
+    new_trailer = m.group(1) + id0.encode("ascii") + m.group(3) + id1.encode("ascii") + m.group(5)
+    return pdf_bytes[:m.start()] + new_trailer + pdf_bytes[m.end():]
 
 
 def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes:
@@ -2480,23 +3496,34 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
     файла из-за этого было бы хуже: всё остальное в нём корректно.
     """
     LAST_RUN_INFO.clear()
-    result, subs, glyphs_patched = _process_halyk_pdf_once(input_bytes, target_monthly_income)
+    # Компрессор выбирается ОДИН раз на прогон и по ОРИГИНАЛУ: он должен
+    # повторять почерк генератора этого файла, а не наш собственный.
+    compress_stream = _pick_stream_compressor(input_bytes)
+    LAST_RUN_INFO["native_compressor"] = compress_stream is not zlib.compress
+    result, subs, glyphs_patched, minus_erased = _process_halyk_pdf_once(
+        input_bytes, target_monthly_income, compress_stream
+    )
     attempts = 1
     if subs == 0:
         LAST_RUN_INFO.update(attempts=1, min_substitutions=0, unavoidable=False,
-                              glyphs_patched=glyphs_patched)
-        return result
+                              glyphs_patched=glyphs_patched, minus_erased=minus_erased)
+        return _regenerate_trailer_id(result, compress_stream)
     for attempt in range(2, _BOLD_GLYPH_RETRIES + 1):
-        cand, cand_subs, cand_glyphs_patched = _process_halyk_pdf_once(input_bytes, target_monthly_income)
+        cand, cand_subs, cand_glyphs_patched, cand_minus_erased = _process_halyk_pdf_once(
+            input_bytes, target_monthly_income, compress_stream
+        )
         attempts = attempt
         if cand_subs == 0:
             print(f"[Halyk] Подмена шрифта в строке итогов не понадобилась "
                   f"(попытка {attempt} из {_BOLD_GLYPH_RETRIES})")
             LAST_RUN_INFO.update(attempts=attempt, min_substitutions=0, unavoidable=False,
-                                  glyphs_patched=cand_glyphs_patched)
-            return cand
+                                  glyphs_patched=cand_glyphs_patched,
+                                  minus_erased=cand_minus_erased)
+            return _regenerate_trailer_id(cand, compress_stream)
         if cand_subs < subs:
-            result, subs, glyphs_patched = cand, cand_subs, cand_glyphs_patched
+            result, subs, glyphs_patched, minus_erased = (
+                cand, cand_subs, cand_glyphs_patched, cand_minus_erased
+            )
     # Ни одна из попыток не дала чистого варианта — это и есть ДОКАЗАТЕЛЬСТВО
     # неизбежности, полученное измерением, а не рассуждением «в числе есть
     # недостающая цифра» (последнее верно всегда и потому ничего не значит).
@@ -2516,11 +3543,12 @@ def process_halyk_pdf(input_bytes: bytes, target_monthly_income: float) -> bytes
         min_substitutions=subs,
         unavoidable=attempts >= _MIN_ATTEMPTS_TO_PROVE,
         glyphs_patched=glyphs_patched,
+        minus_erased=minus_erased,
     )
     print(f"[Halyk] ⚠️ Не удалось избежать подмены шрифта за {_BOLD_GLYPH_RETRIES} "
           f"попыток: осталось {subs} — в жирном subset'е нет нужных цифр, и "
           f"итоговые суммы этой цели их не обходят ни при одном розыгрыше.")
-    return result
+    return _regenerate_trailer_id(result, compress_stream)
 
 
 # ─── Валидация ────────────────────────────────────────────────────────────────
