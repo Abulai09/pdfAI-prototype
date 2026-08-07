@@ -18,6 +18,7 @@ a = Analysis(
         ('halyk_bold_digits.py', '.'),
         ('pdfsharp_deflate.py', '.'),
         ('kaspi_ip_data_service.py', '.'),
+        ('kaspi_ip_glyphs.py', '.'),
         ('templates', 'templates'),
     ],
     hiddenimports=[
