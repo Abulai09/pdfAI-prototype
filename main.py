@@ -38,6 +38,7 @@ from halyk_pdf_service import (
     detect_halyk_format, process_halyk_pdf, validate_halyk, NoScalableIncomeError,
 )
 from kaspi_ip_pdf_service import detect_kaspi_ip_format, process_kaspi_ip_pdf, validate_kaspi_ip
+import kaspi_ip_data_service as kaspi_ip_data
 import fitz
 
 app = FastAPI(title="PDF.AI")
@@ -790,6 +791,53 @@ async def process_business_endpoint(
             status_code=500,
             content={"error": f"Ошибка обработки: {str(e)}"},
         )
+
+
+@app.get("/kaspi-ip-data-defaults")
+async def kaspi_ip_data_defaults():
+    """Значения по умолчанию для формы реквизитов. Считаются на сервере,
+    чтобы форма не зависела от часового пояса браузера."""
+    return kaspi_ip_data.default_fields().__dict__
+
+
+@app.post("/process-kaspi-ip-data")
+async def process_kaspi_ip_data_endpoint(
+    account: str = Form(...),
+    period_from: str = Form(...),
+    period_to: str = Form(...),
+    last_movement: str = Form(...),
+    iin: str = Form(...),
+    client_name: str = Form(...),
+):
+    fields = kaspi_ip_data.KaspiIPFields(
+        account=account.strip(),
+        period_from=period_from.strip(),
+        period_to=period_to.strip(),
+        last_movement=last_movement.strip(),
+        iin=iin.strip(),
+        client_name=client_name.strip(),
+    )
+    errors = kaspi_ip_data.validate_fields(fields)
+    if errors:
+        return JSONResponse(status_code=400, content={"error": "; ".join(errors)})
+
+    try:
+        out = kaspi_ip_data.substitute_fields(kaspi_ip_data.load_template(), fields)
+    except kaspi_ip_data.TemplateNotFoundError as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    except kaspi_ip_data.SubstitutionError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": f"Ошибка обработки: {e}"})
+
+    _journal_add("kaspi_ip_template.pdf", 0, 0, "РЕКВИЗИТЫ", "ok")
+    return StreamingResponse(
+        io.BytesIO(out),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=kaspi_ip_data.pdf"},
+    )
 
 
 if __name__ == "__main__":
