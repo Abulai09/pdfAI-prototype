@@ -13,6 +13,12 @@ a = Analysis(
         ('business_pdf_service.py', '.'),
         ('halyk_pdf_service.py', '.'),
         ('kaspi_ip_pdf_service.py', '.'),
+        # Импортируются halyk_pdf_service. Без них .exe падает на импорте —
+        # ровно та ошибка, что уже была допущена для двух модулей выше.
+        ('halyk_bold_digits.py', '.'),
+        ('pdfsharp_deflate.py', '.'),
+        ('kaspi_ip_data_service.py', '.'),
+        ('templates', 'templates'),
     ],
     hiddenimports=[
         'uvicorn.logging',

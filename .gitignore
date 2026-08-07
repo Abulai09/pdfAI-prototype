@@ -32,3 +32,6 @@ verify_any_report.json
 
 # Собранный дистрибутив (см. build/dist/ выше — тот же класс артефакта)
 dist.zip
+
+# Встроенный шаблон Kaspi ИП — настоящая выписка, в git не кладём
+templates/
