@@ -236,6 +236,8 @@ def criteria_halyk(raw: bytes, out_bytes: bytes) -> dict[str, list[str]]:
         "4a род блока CMap": vhal.check_cmap_block_style(raw, out_bytes),
         "4b компрессор потоков": vhal.check_stream_compressor(raw, out_bytes),
         "4c порядок ToUnicode": vhal.check_cmap_text_order(raw, out_bytes),
+        "4d форма /ID": vhal.check_trailer_id_shape(raw, out_bytes),
+        "4e checkSumAdjustment": vhal.check_font_checksum_convention(raw, out_bytes),
     }
 
 

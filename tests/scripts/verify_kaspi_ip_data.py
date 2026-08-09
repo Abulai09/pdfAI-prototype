@@ -59,6 +59,7 @@ import fitz  # noqa: E402
 
 import kaspi_ip_data_service as kid  # noqa: E402
 from verify_kaspi_ip_file import find_line_overlaps, style_check  # noqa: E402
+from verify_halyk_file import check_font_checksum_convention  # noqa: E402
 
 CASES = [
     kid.KaspiIPFields("KZ11722S000099887766", "01.02.2025", "01.02.2026",
@@ -216,6 +217,12 @@ def check_case(template: bytes, fields: kid.KaspiIPFields) -> tuple:
 
     if _fonts(out) != _fonts(template):
         issues.append("набор (шрифт, кегль) изменился")
+
+    # Вшивание глифов правит FontFile2, поэтому сюда приходит тот же признак,
+    # что закрыт для Halyk 2026-08-09: у шаблона (iTextSharp) поле
+    # head.checkSumAdjustment = 24E1ABA5 и правилу TrueType не удовлетворяет,
+    # а честный пересчёт делал бы результат вернее оригинала.
+    issues += check_font_checksum_convention(template, out)
 
     issues += style_check(template, out)
     return issues, guards

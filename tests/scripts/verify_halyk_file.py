@@ -1138,6 +1138,162 @@ def check_rounding_escalation(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
     return issues[:10]
 
 
+_TRAILER_ID = re.compile(rb"/ID\s*\[\s*<([0-9A-Fa-f]*)>\s*<([0-9A-Fa-f]*)>\s*\]")
+
+
+def _trailer_ids(pdf_bytes: bytes) -> tuple[str, str] | None:
+    m = _TRAILER_ID.findall(pdf_bytes)
+    if not m:
+        return None
+    return m[-1][0].decode("ascii").upper(), m[-1][1].decode("ascii").upper()
+
+
+def _is_dotnet_guid_v4(hex_id: str) -> bool:
+    """Форма `System.Guid.NewGuid().ToByteArray()`, которой пишет генератор.
+
+    .NET сериализует первые три поля GUID little-endian, поэтому нибл версии
+    уезжает с позиции 12 (как в RFC 4122) на 14, а нибл варианта остаётся на
+    16. Замер 2026-08-09: все 6 оригиналов корпуса раскрываются в канонический
+    UUIDv4 именно при такой раскладке (например h6:
+    `935AC2EF…` → `EFC25A93-9AB9-4062-8226-DDC9FA193F47`).
+    """
+    return (
+        len(hex_id) == 32
+        and hex_id[14] == "4"
+        and hex_id[16].lower() in "89ab"
+    )
+
+
+def check_trailer_id_shape(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """`/ID` результата обязан иметь ту же форму, что у генератора.
+
+    Найдено 2026-08-09. `_regenerate_trailer_id` (правка 2026-08-06, сама по
+    себе верная: одинаковый `/ID` при другом размере файла выдавал правку
+    байтов поверх исходника) брала обе половины из `hashlib.md5`. MD5-дайджест
+    равномерно случаен и нибблов версии/варианта UUID не имеет вовсе, поэтому
+    признак не исчез, а сменился на противоположный: у оригиналов `/ID` —
+    настоящий `Guid.NewGuid()`, у результата — шум.
+
+    Замер на корпусе: форма UUIDv4 у 6 оригиналов из 6 и у 1 результата из 25
+    (случайное попадание, вероятность 1/64 на связку). Равные половины — у 5
+    оригиналов из 6 и у 0 результатов из 25.
+
+    Проверяется ОТ ОРИГИНАЛА, а не жёстким «всегда UUIDv4 и всегда равны»:
+    равенство половин — конвенция конкретного файла (у `HALYKformat1` они
+    различны, документ пересохраняли), и её надо повторять, а не вводить
+    искусственно. Та же дисциплина, что у `_op_separators`.
+    """
+    orig, out = _trailer_ids(orig_bytes), _trailer_ids(out_bytes)
+    if orig is None or out is None:
+        return []  # нестандартный trailer — сравнивать не с чем
+    issues = []
+    if _is_dotnet_guid_v4(orig[0]) and not _is_dotnet_guid_v4(out[0]):
+        issues.append(
+            f"/ID[0] оригинала — Guid v4 ({orig[0]}), у результата нет: {out[0]} "
+            f"(версия {out[0][14] if len(out[0]) > 14 else '?'}, "
+            f"вариант {out[0][16] if len(out[0]) > 16 else '?'})"
+        )
+    if _is_dotnet_guid_v4(orig[1]) and not _is_dotnet_guid_v4(out[1]):
+        issues.append(f"/ID[1] оригинала — Guid v4 ({orig[1]}), у результата нет: {out[1]}")
+    if (orig[0] == orig[1]) != (out[0] == out[1]):
+        issues.append(
+            "равенство половин /ID не как в оригинале: было "
+            f"{'равны' if orig[0] == orig[1] else 'различны'}, стало "
+            f"{'равны' if out[0] == out[1] else 'различны'}"
+        )
+    if orig == out:
+        issues.append("/ID совпал с оригиналом — документ не пересобран, а пропатчен")
+    return issues
+
+
+def _ttf_sum32(data: bytes) -> int:
+    if len(data) % 4:
+        data += b"\0" * (4 - len(data) % 4)
+    return sum(
+        int.from_bytes(data[i:i + 4], "big") for i in range(0, len(data), 4)
+    ) & 0xFFFFFFFF
+
+
+def _font_head_checksums(pdf_bytes: bytes) -> dict[int, tuple[int, int]]:
+    """{xref FontFile2: (хранимое checkSumAdjustment, значение по правилу)}."""
+    out = {}
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        xrefs = []
+        for x in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(x, compressed=False)
+            except Exception:
+                continue
+            m = re.search(r"/FontFile2\s+(\d+)\s+0\s+R", obj or "")
+            if m:
+                xrefs.append(int(m.group(1)))
+        for x in xrefs:
+            try:
+                font = doc.xref_stream(x)
+            except Exception:
+                continue
+            if not font or len(font) < 12:
+                continue
+            num = int.from_bytes(font[4:6], "big")
+            for i in range(num):
+                rec = 12 + 16 * i
+                if font[rec:rec + 4] != b"head":
+                    continue
+                off = int.from_bytes(font[rec + 8:rec + 12], "big")
+                if off + 12 > len(font):
+                    break
+                stored = int.from_bytes(font[off + 8:off + 12], "big")
+                zeroed = font[:off + 8] + b"\0\0\0\0" + font[off + 12:]
+                proper = (0xB1B0AFBA - _ttf_sum32(zeroed)) & 0xFFFFFFFF
+                out[x] = (stored, proper)
+                break
+    finally:
+        doc.close()
+    return out
+
+
+def check_font_checksum_convention(orig_bytes: bytes, out_bytes: bytes) -> list[str]:
+    """`head.checkSumAdjustment` обязан остаться таким же «неправильным».
+
+    Найдено 2026-08-09, и признак вывернут наизнанку: настоящий генератор поле
+    НЕ пересчитывает — копирует таблицу `head` из мастер-шрифта как есть,
+    поэтому во всех 6 файлах корпуса лежит одно и то же значение (`8FDAEDF6`
+    у Regular, `DB3BA7A3` у Bold) и правило TrueType
+    `checkSumAdjustment == (0xB1B0AFBA − sum32(шрифт с обнулённым полем))`
+    не сходится НИ РАЗУ — 12 подшрифтов из 12. Наш патчер глифов считал его
+    честно, и сходимость правила оказалась отличием результата от оригинала.
+
+    Контрольные суммы ОТДЕЛЬНЫХ таблиц сюда не входят намеренно: замер
+    показал 9 верных из 9 и у оригиналов, и у результатов, то есть их
+    генератор считает правильно и пересчитывать их обязательно.
+
+    Сравнение идёт от оригинала: если попадётся файл, чей генератор поле
+    всё-таки считает, проверка обязана это принять.
+    """
+    base = _font_head_checksums(orig_bytes)
+    if not base:
+        return []
+    if all(stored == proper for stored, proper in base.values()):
+        return []  # генератор этого файла сам считает поле верно
+    issues = []
+    for xref, (stored, proper) in sorted(_font_head_checksums(out_bytes).items()):
+        was = base.get(xref)
+        if was is None:
+            continue
+        if was[0] != was[1] and stored == proper:
+            issues.append(
+                f"об.{xref}: head.checkSumAdjustment пересчитан ({stored:08X}), "
+                f"а у оригинала лежало унаследованное {was[0]:08X}"
+            )
+        elif stored != was[0]:
+            issues.append(
+                f"об.{xref}: head.checkSumAdjustment изменён "
+                f"{was[0]:08X} → {stored:08X}, хотя генератор его не трогает"
+            )
+    return issues
+
+
 def render_pages(pdf_bytes: bytes, out_dir: Path, label: str, pages: list[int], dpi: int = 150) -> None:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     for pn in pages:
@@ -1205,6 +1361,8 @@ def run_one(path: Path, multipliers: list[float], out_dir: Path, render: bool) -
             + check_fee_rows_preserved(raw, out_bytes)
             + check_stream_compressor(raw, out_bytes)
             + check_cmap_text_order(raw, out_bytes)
+            + check_trailer_id_shape(raw, out_bytes)
+            + check_font_checksum_convention(raw, out_bytes)
         )
         # Сообщения с префиксом «[guard]» — не провал: это случаи, чью
         # неустранимость движок ДОКАЗАЛ измерением (см. check_bold_row_uniform).

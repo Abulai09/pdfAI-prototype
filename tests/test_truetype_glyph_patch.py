@@ -143,7 +143,32 @@ def test_patch_pads_odd_length_glyph_to_even():
     assert _read_truetype_glyph(patched, 1) == b"XX"
 
 
-def test_patch_shifts_following_tables_and_recomputes_checksum():
+def _table_entry(font: bytes, tag: bytes) -> tuple[int, int, int]:
+    """(checksum из table directory, offset, length) таблицы `tag`."""
+    for i in range(int.from_bytes(font[4:6], "big")):
+        rec = 12 + 16 * i
+        if font[rec:rec + 4] == tag:
+            return struct.unpack(">LLL", font[rec + 4:rec + 16])
+    raise AssertionError(f"таблица {tag!r} не найдена")
+
+
+def test_patch_shifts_following_tables_and_keeps_inherited_checksum():
+    """Суммы ОТДЕЛЬНЫХ таблиц пересчитываются, глобальная — наследуется.
+
+    Изменено 2026-08-09. Раньше здесь проверялось
+    `_ttf_checksum(patched) == 0xB1B0AFBA`, то есть что патчер честно
+    пересчитывает `head.checkSumAdjustment` по правилу TrueType. Замер на
+    реальных корпусах показал, что настоящие генераторы этого не делают:
+    во всех 6 файлах Halyk (PDFsharp) и в шаблоне Kaspi ИП (iTextSharp)
+    поле несёт значение мастер-шрифта и правилу не удовлетворяет — 12
+    подшрифтов из 12. Честный пересчёт делал результат ВЕРНЕЕ оригинала,
+    и эта верность была отличием (см. CLAUDE.md, раздел от 2026-08-09).
+
+    Утверждение не снято, а заменено на более сильное: поле обязано остаться
+    ПОБАЙТОВО тем же, что было во входном шрифте. Возврат пересчёта зажигает
+    этот тест сразу — фикстура собирает шрифт с корректным значением, и
+    после изменения glyf правильное значение уже другое.
+    """
     import io
     # Use only valid glyph data: empty simple glyphs
     glyphs = [b"", b"\x00\x00\x00\x00" * 25]  # glyph 1 is 100 bytes, empty glyph format
@@ -161,9 +186,20 @@ def test_patch_shifts_following_tables_and_recomputes_checksum():
     tt = TTFont(io.BytesIO(patched))
     assert tt["maxp"].numGlyphs == 2
 
-    # головной чек-сумма формула: сумма всего файла == магическая константа
-    total = _ttf_checksum(patched)
-    assert total == 0xB1B0AFBA
+    # Записи glyf/loca в table directory пересчитаны — их генератор считает верно
+    for tag in (b"glyf", b"loca"):
+        checksum, offset, length = _table_entry(patched, tag)
+        assert checksum == _ttf_checksum(patched[offset:offset + length]), (
+            f"{tag!r}: запись в table directory не пересчитана"
+        )
+
+    # head.checkSumAdjustment унаследован от входного шрифта, а не пересчитан
+    _c_old, head_old, _l = _table_entry(font, b"head")
+    _c_new, head_new, _l2 = _table_entry(patched, b"head")
+    assert patched[head_new + 8:head_new + 12] == font[head_old + 8:head_old + 12]
+    assert _ttf_checksum(patched) != 0xB1B0AFBA, (
+        "правило TrueType сошлось — значит поле всё-таки пересчитали"
+    )
 
 
 def test_patch_out_of_range_gid_raises():

@@ -3260,7 +3260,10 @@ def _patch_truetype_glyphs(font_bytes: bytes, glyph_patches: Dict[int, bytes]) -
     не трогая ничего вокруг: нетронутые глифы и все остальные таблицы
     остаются побайтово идентичны входу, только сдвигаются на дельту длины,
     если физически расположены в файле после glyf. Пересчитывает checksum
-    записей glyf/loca в table directory и глобальный head.checkSumAdjustment.
+    записей glyf/loca в table directory, но НЕ трогает глобальный
+    head.checkSumAdjustment — генераторы обрабатываемых файлов его не
+    обновляют, и честный пересчёт делал результат вернее оригинала
+    (подробности и замер — в CLAUDE.md, раздел от 2026-08-09).
 
     Кидает ValueError при любой неожиданной структуре (композитный глиф там,
     где не ожидался; GID вне диапазона; отсутствие нужных таблиц) — не
@@ -3351,12 +3354,19 @@ def _patch_truetype_glyphs(font_bytes: bytes, glyph_patches: Dict[int, bytes]) -
             tag, checksum, offset, length = e
             buf[off:off + 16] = struct.pack(">4sLLL", tag.encode("ascii"), checksum & 0xFFFFFFFF, offset, length)
 
-        new_head_offset = by_tag["head"][2]
-        buf[new_head_offset + 8:new_head_offset + 12] = b"\x00\x00\x00\x00"
-        total = _ttf_checksum(bytes(buf))
-        adjustment = (0xB1B0AFBA - total) & 0xFFFFFFFF
-        buf[new_head_offset + 8:new_head_offset + 12] = struct.pack(">L", adjustment)
-
+        # head.checkSumAdjustment СОЗНАТЕЛЬНО НЕ ПЕРЕСЧИТЫВАЕТСЯ (2026-08-09).
+        # Настоящие генераторы этих файлов копируют таблицу `head` из
+        # мастер-шрифта как есть и поле не обновляют: во всех 6 файлах корпуса
+        # Halyk лежит одно и то же значение (8FDAEDF6 у Regular, DB3BA7A3 у
+        # Bold), и правило TrueType
+        #   checkSumAdjustment == (0xB1B0AFBA − sum32(шрифт с обнулённым полем))
+        # не сходится ни у одного из 12 подшрифтов. Честный пересчёт делал
+        # результат ВЕРНЕЕ оригинала, и именно эта верность его и выдавала —
+        # признак того же рода, что почерк сжатия потоков.
+        #
+        # Контрольные суммы отдельных таблиц (glyf/loca выше) пересчитывать,
+        # наоборот, ОБЯЗАТЕЛЬНО: замер показал 9 верных записей из 9 и у
+        # оригиналов, и у результатов — их генератор считает правильно.
         return bytes(buf)
     except ValueError:
         raise

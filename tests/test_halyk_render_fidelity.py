@@ -244,3 +244,71 @@ class TestGeometryAndTotals:
             for mult, raw, out in _outputs(path):
                 issues = _quiet(vhal.check_totals_match_rows, raw, out)
                 assert not issues, f"{path.name} x{mult}: {issues}"
+
+
+class TestTrailerIdShape:
+    """`/ID` результата обязан выглядеть как у генератора (найдено 2026-08-09)."""
+
+    @requires_corpus
+    def test_originals_are_dotnet_guid_v4(self):
+        """Оракул, записанный по замеру, а не по догадке.
+
+        `/ID[0]` — настоящий `Guid.NewGuid()` у 6 файлов из 6. `/ID[1]` тоже,
+        но ровно там, где он равен первому (5 из 6). Исключение —
+        `HALYKformat1`: документ пересохраняли, и его `/ID[1]`
+        (`C50F3CBE…`) уже не Guid, а хеш — обычная конвенция обновления PDF.
+        Отсюда и устройство `check_trailer_id_shape`: форма требуется от той
+        половины, у которой она была В ЭТОМ файле, а не от обеих всегда.
+        """
+        guid_second = 0
+        for path in HALYK_FILES:
+            ids = vhal._trailer_ids(path.read_bytes())
+            assert ids is not None, f"{path.name}: /ID не найден"
+            assert vhal._is_dotnet_guid_v4(ids[0]), f"{path.name}: /ID[0]={ids[0]}"
+            assert vhal._is_dotnet_guid_v4(ids[1]) == (ids[0] == ids[1]), (
+                f"{path.name}: /ID[1]={ids[1]} — форма не совпала с равенством половин"
+            )
+            guid_second += ids[0] == ids[1]
+        assert guid_second == len(HALYK_FILES) - 1, (
+            f"ожидался ровно один пересохранённый файл, найдено "
+            f"{len(HALYK_FILES) - guid_second}"
+        )
+
+    @requires_corpus
+    def test_result_keeps_the_shape(self):
+        for path in HALYK_FILES:
+            for mult, raw, out in _outputs(path):
+                issues = vhal.check_trailer_id_shape(raw, out)
+                assert not issues, f"{path.name} x{mult}: {issues}"
+
+    @requires_corpus
+    def test_result_id_still_differs_from_original(self):
+        """Форму чиним, но не ценой возврата к клонированию /ID оригинала."""
+        for path in HALYK_FILES:
+            raw = path.read_bytes()
+            for mult, _raw, out in _outputs(path):
+                assert vhal._trailer_ids(out) != vhal._trailer_ids(raw), (
+                    f"{path.name} x{mult}: /ID склонирован из оригинала"
+                )
+
+
+class TestFontChecksumConvention:
+    """`head.checkSumAdjustment` генератор не пересчитывает — и мы не должны."""
+
+    @requires_corpus
+    def test_originals_never_satisfy_the_truetype_rule(self):
+        """Оракул: 12 подшрифтов из 12 несут унаследованное значение."""
+        for path in HALYK_FILES:
+            sums = vhal._font_head_checksums(path.read_bytes())
+            assert sums, f"{path.name}: FontFile2 не найден"
+            for xref, (stored, proper) in sums.items():
+                assert stored != proper, (
+                    f"{path.name} об.{xref}: правило внезапно сходится ({stored:08X})"
+                )
+
+    @requires_corpus
+    def test_result_keeps_the_inherited_value(self):
+        for path in HALYK_FILES:
+            for mult, raw, out in _outputs(path):
+                issues = vhal.check_font_checksum_convention(raw, out)
+                assert not issues, f"{path.name} x{mult}: {issues}"
