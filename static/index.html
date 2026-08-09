@@ -247,6 +247,7 @@
                 <div class="tabs">
                     <button class="tab-btn active" data-tab="score"><span class="tab-icon">⚡</span> Скоринг</button>
                     <button class="tab-btn" data-tab="business"><span class="tab-icon">🏢</span> Бизнес</button>
+                    <button class="tab-btn" data-tab="ipdata"><span class="tab-icon">🪪</span> Реквизиты</button>
                     <button class="tab-btn" data-tab="verify"><span class="tab-icon">🔍</span> Проверка</button>
                 </div>
                 <!-- SCORE TAB -->
@@ -296,6 +297,40 @@
                         <span id="businessBtnText">🏢 Запустить Бизнес-скоринг</span>
                     </button>
                     <div class="status" id="businessStatus"></div>
+                </div>
+                <!-- IP DATA TAB -->
+                <div class="tab-content" id="tab-ipdata">
+                    <div class="form-group">
+                        <label class="form-label">Лицевой счёт</label>
+                        <input class="input" id="ipAccount" type="text" placeholder="KZ00000A000000000000" maxlength="20" />
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Период</label>
+                        <div style="display:flex; gap:8px;">
+                            <input class="input" id="ipPeriodFrom" type="text" placeholder="ДД.ММ.ГГГГ" />
+                            <input class="input" id="ipPeriodTo" type="text" placeholder="ДД.ММ.ГГГГ" />
+                        </div>
+                        <div class="calc-tag" id="ipPeriodWarn"></div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Дата последнего движения</label>
+                        <input class="input" id="ipLastMovement" type="text" placeholder="ДД.ММ.ГГГГ ЧЧ:ММ" />
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">ИИН/БИН</label>
+                        <input class="input" id="ipIin" type="text" inputmode="numeric" placeholder="000000000000" maxlength="12" />
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Наименование клиента</label>
+                        <input class="input" id="ipClientName" type="text" placeholder="ИП ИВАНОВ ИВАН ИВАНОВИЧ" />
+                        <div class="calc-tag">Формат: ИП/ТОО, затем Фамилия Имя Отчество — из него выводятся
+                            короткие формы для строк таблицы («Иван Иванович И.»). Суммы, даты операций
+                            и назначения платежей не меняются.</div>
+                    </div>
+                    <button class="btn btn-primary" id="ipDataBtn" onclick="doIpData()">
+                        <span id="ipDataBtnText">🪪 Сформировать выписку</span>
+                    </button>
+                    <div class="status" id="ipDataStatus"></div>
                 </div>
                 <!-- VERIFY TAB -->
                 <div class="tab-content" id="tab-verify">
@@ -751,6 +786,74 @@ async function loadJournal() {
 function changePage(delta) {
     _journalPage = Math.max(1, _journalPage + delta);
     loadJournal();
+}
+
+/* ===== KASPI IP DATA (РЕКВИЗИТЫ) =====
+   Период шаблона: операции датированы 18.07.2025 – 18.07.2026. Даты операций
+   мы не сдвигаем, поэтому если введённый период их не покрывает — часть
+   строк окажется за его границами. Предупреждаем, но не блокируем. */
+const IP_TEMPLATE_FROM = '18.07.2025', IP_TEMPLATE_TO = '18.07.2026';
+
+function ipParseDate(s) {
+    const m = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec((s || '').trim());
+    return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
+}
+
+function ipCheckPeriod() {
+    const from = ipParseDate(document.getElementById('ipPeriodFrom').value);
+    const to = ipParseDate(document.getElementById('ipPeriodTo').value);
+    const el = document.getElementById('ipPeriodWarn');
+    if (!from || !to) { el.textContent = ''; return; }
+    const tf = ipParseDate(IP_TEMPLATE_FROM), tt = ipParseDate(IP_TEMPLATE_TO);
+    el.textContent = (from > tf || to < tt)
+        ? '⚠️ Часть операций (' + IP_TEMPLATE_FROM + ' – ' + IP_TEMPLATE_TO + ') выйдет за границы периода.'
+        : '';
+}
+
+['ipPeriodFrom', 'ipPeriodTo'].forEach(id =>
+    document.getElementById(id).addEventListener('input', ipCheckPeriod));
+
+appFetch('/kaspi-ip-data-defaults').then(r => r.json()).then(d => {
+    document.getElementById('ipPeriodFrom').value = d.period_from;
+    document.getElementById('ipPeriodTo').value = d.period_to;
+    document.getElementById('ipLastMovement').value = d.last_movement;
+    ipCheckPeriod();
+});
+
+async function doIpData() {
+    const btn = document.getElementById('ipDataBtn');
+    const btnText = document.getElementById('ipDataBtnText');
+    btn.disabled = true;
+    btnText.innerHTML = '<span class="spinner"></span> Формируем...';
+    document.getElementById('ipDataStatus').className = 'status';
+
+    const fd = new FormData();
+    fd.append('account', document.getElementById('ipAccount').value);
+    fd.append('period_from', document.getElementById('ipPeriodFrom').value);
+    fd.append('period_to', document.getElementById('ipPeriodTo').value);
+    fd.append('last_movement', document.getElementById('ipLastMovement').value);
+    fd.append('iin', document.getElementById('ipIin').value);
+    fd.append('client_name', document.getElementById('ipClientName').value);
+
+    try {
+        const resp = await appFetchForm('/process-kaspi-ip-data', fd);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            setStatus('ipDataStatus', err.error || 'Ошибка обработки', false);
+            btn.disabled = false;
+            btnText.textContent = '🪪 Сформировать выписку';
+            return;
+        }
+        const blob = await resp.blob();
+        const fname = _filenameFromResponse(resp, 'kaspi_ip_data.pdf');
+        const saved = await savePdfBlob(blob, fname);
+        setStatus('ipDataStatus', saved ? '✅ Выписка сформирована — файл сохранён' : '⚠ Сохранение отменено', saved);
+        loadJournal();
+    } catch (e) {
+        setStatus('ipDataStatus', 'Ошибка сети: ' + e.message, false);
+    }
+    btn.disabled = false;
+    btnText.textContent = '🪪 Сформировать выписку';
 }
 
 /* ===== INIT ===== */
