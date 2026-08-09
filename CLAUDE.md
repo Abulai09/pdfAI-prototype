@@ -468,7 +468,7 @@ pytest tests/test_halyk_pdf_service.py -k test_process_then_validate_passes -v  
 pytest tests/test_serialization_style.py                                        # no fixtures needed
 ```
 
-`tests/fixtures/` is not present in every checkout of this repo — it holds real, unmodified bank PDFs and is deliberately gitignored (`.gitignore`: `tests/fixtures/`, "Реальные PDF-выписки для тестов: никогда не коммитим"). **A missing fixture is a SKIP, not a failure** — `tests/conftest.py` turns "file not found under `tests/fixtures/`" into `pytest.skip` with the reason spelled out, so a red run means something is actually broken and nothing else. On a fixtures-less checkout the suite is **71 passed / 69 skipped / 0 failed** (was 43 passed before 2026-08-04's two fixture-free test files — `test_kaspi_ip_rounding_policy.py` +17, `test_kaspi_ip_coordinate_precision.py` +11); supply fixtures for the three per-format files below (`test_pdf_service.py`, `test_halyk_pdf_service.py`, `test_kaspi_ip_pdf_service.py`) and the skips turn into real runs. Do not re-introduce the old habit of diffing the `FAILED` list against a memorized baseline — there is no baseline of failures any more.
+`tests/fixtures/` is not present in every checkout of this repo — it holds real, unmodified bank PDFs and is deliberately gitignored (`.gitignore`: `tests/fixtures/`, "Реальные PDF-выписки для тестов: никогда не коммитим"). **A missing fixture is a SKIP, not a failure** — `tests/conftest.py` turns "file not found under `tests/fixtures/`" into `pytest.skip` with the reason spelled out, so a red run means something is actually broken and nothing else. On a checkout with neither `tests/fixtures/` nor `templates/kaspi_ip.pdf` the suite is **146 passed / 86 skipped / 0 failed**; with the Kaspi ИП template present it is **162 passed / 70 skipped** (the 16 tests in `test_kaspi_ip_data_substitution.py` are gated on the template by a module-level `pytestmark`, same skip-not-fail principle as fixtures). Supply fixtures for the three per-format files below (`test_pdf_service.py`, `test_halyk_pdf_service.py`, `test_kaspi_ip_pdf_service.py`) and the skips turn into real runs. Do not re-introduce the old habit of diffing the `FAILED` list against a memorized baseline — there is no baseline of failures any more.
 
 The hook deliberately catches **two** exception types: `path.read_bytes()` raises the builtin `FileNotFoundError`, while `fitz.open(path)` raises `pymupdf.FileNotFoundError`, which subclasses `RuntimeError` (**not** the builtin) and leaves `.filename` empty — its path is only in the message text. Both spellings occur across the three per-format test files. Anything outside `tests/fixtures/` still fails normally, so a production code path that loses its own file is not silently skipped.
 
@@ -485,6 +485,7 @@ python tests/scripts/verify_any_file.py <file.pdf> [...] [--targets 1.05,2,5] [-
 python tests/scripts/verify_gold_file.py <file.pdf> [<file2.pdf> ...] [--targets 1.05,2,10] [--render]
 python tests/scripts/verify_halyk_file.py <file.pdf> [...]      # same CLI
 python tests/scripts/verify_kaspi_ip_file.py <file.pdf> [...]   # same CLI
+python tests/scripts/verify_kaspi_ip_data.py                    # подстановка реквизитов: без аргументов, шаблон встроенный
 python tests/scripts/print_fixture_targets.py                   # recompute floor-safe fixture targets
 ```
 
@@ -499,6 +500,7 @@ Each script takes one or more paths to an **original, unprocessed** PDF of its f
 ## Environment variables
 
 - `PDFAI_DB_PATH` — path to SQLite journal (default: `journal.db` in cwd)
+- `PDFAI_KASPI_IP_TEMPLATE` — путь к шаблону выписки Kaspi ИП (default: `templates/kaspi_ip.pdf`)
 - `PDFAI_STATIC_DIR` — path to static files directory (default: `static`)
 
 ## Quality criteria — the 5 things that matter for ANY generated PDF
@@ -550,7 +552,9 @@ main.py
 ├── pdf_service_downscale.py  (Kaspi Gold downscale, imports from pdf_service)
 ├── business_pdf_service.py   (Kaspi business turnover certs, standalone)
 ├── halyk_pdf_service.py      (Halyk Bank personal statements, standalone)
-└── kaspi_ip_pdf_service.py   (Kaspi ИП / sole-proprietor account statements, standalone)
+├── kaspi_ip_pdf_service.py   (Kaspi ИП / sole-proprietor account statements, standalone)
+└── kaspi_ip_data_service.py  (подстановка реквизитов во встроенный шаблон Kaspi ИП)
+    └── kaspi_ip_glyphs.py    (замороженные контуры Arial, включая компоненты составных глифов)
 
 halyk_pdf_service.py additionally imports two data/algorithm modules of its own:
 ├── halyk_bold_digits.py      (frozen Times New Roman Bold digit glyph bytes)
@@ -648,6 +652,50 @@ Separate module for Kaspi Bank ИП account "Выписка по счету" sta
 
 All three personal/sole-proprietor formats (Kaspi Gold, Halyk, Kaspi ИП) now share the same downscale floor contract via `pdf_service_downscale.IncomeTooLowError` — `main.py:/process`'s single `except IncomeTooLowError` handler and the frontend's generic `min_desired_income`-triggered "Подставить минимум?" prompt work unchanged regardless of which module raised it.
 
+### Подстановка реквизитов в шаблон Kaspi ИП (`kaspi_ip_data_service.py`)
+
+Отдельный режим: пользователь не задаёт целевой доход, а вводит **свои реквизиты**, и программа выдаёт выписку Kaspi ИП с ними. Суммы, даты операций, назначения платежей, шрифт и позиции остаются ровно такими, как в шаблоне. Шаблон встроенный (`templates/kaspi_ip.pdf`, папка в `.gitignore`, путь переопределяется `PDFAI_KASPI_IP_TEMPLATE`), пользователь ничего не загружает. Вкладка «Реквизиты» в `static/index.html`, эндпоинты `POST /process-kaspi-ip-data` и `GET /kaspi-ip-data-defaults`.
+
+**Конвенция токена.** Весь текст шаблона рисуется как `1 0 0 1 X Y Tm [/Fx N Tf] (CID-байты) Tj` — кроме подписи отчёта на стр. 100, которая позиционируется через `Td` и потому в `_TOKEN_RE` не попадает вовсе. Для замены это неважно: правится содержимое скобочной строки, а не координата, поэтому `_replace_cid_strings` ищет по CID-байтам во всех потоках и позиции не трогает. Экранирование обязательно, а не косметика: у буквы «в» CID `025C`, младший байт которого — сам обратный слэш.
+
+**Поля шапки** (`substitute_fixed_length`) — замена РОВНО той же длины, ни одна координата не пересчитывается:
+
+| Поле | Формат | Длина | Вхождений |
+| --- | --- | --- | --- |
+| Лицевой счёт | `KZ` + 2 цифры + 16 буквоцифр | всегда 20 | **13** |
+| Период | `ДД.ММ.ГГГГ - ДД.ММ.ГГГГ` | всегда 23 | 1 |
+| Дата последнего движения | `ДД.ММ.ГГГГ ЧЧ:ММ` | всегда 16 | 1 |
+| ИИН/БИН | 12 цифр | всегда 12 | **17** |
+| Наименование клиента | произвольный текст | переменная | 1 |
+
+Счёт и ИИН меняются **везде**, включая 28 вхождений внутри «Назначения платежа», а не только 2 в шапке — отсюда 13 и 17. Метки ищутся по тексту (`Лицевой счет:` и т. д.), а не по зашитому Y: конвенция читается из самого файла.
+
+**Шрифт.** Один на весь документ — `OJSMTG+ArialMT`, ресурс `F1`, `/CIDToGIDMap /Identity`; второго шрифта, из которого можно было бы позаимствовать глиф, нет вовсе. Subset — 133 символа, и **все 133 совпали байт-в-байт с `C:\Windows\Fonts\arial.ttf`** при сверке по GID, поэтому недостающие глифы вшиваются тем же приёмом и тем же gate'ом «сверь присутствующие, потом доверяй», что уже отлажен для жирных цифр Halyk. Чего в subset'е нет: заглавных `Щ`, `Ъ`, `Ы`, `Ю` и латинской `W` — не редкость, `Ы` в казахских ФИО встречается постоянно. **Составные глифы вшиваются транзитивно, вместе с компонентами** (`А`→`A`, `Ё`→`E`+dieresis, `Й`→`uni0418`+breve, `Э`→`uni0404` — 27 таких символов в наборе); поэтому проверки «плотности subset'а», как у Halyk, здесь СОЗНАТЕЛЬНО нет: компонент по построению никогда не показывается самостоятельным CID, и такая проверка краснела бы на корректной работе.
+
+**Компрессор менять не нужно.** Все 103 потока шаблона воспроизводятся `zlib.compress(данные, 6)` побайтово — `iTextSharp` пишет ровно как python-zlib. Это противоположность Halyk (`PDFsharp`, 0 из 56), где ради того же признака понадобился отдельный порт компрессора.
+
+**Имя клиента напечатано ЧЕТЫРЬМЯ способами, и подстановка только шапки оставляла 246 вхождений чужого имени.** Найдено 2026-08-09 проверкой результата: шапка подставлялась верно, ИИН заменялся все 17 раз, но в тех же ячейках рядом с **новым** ИИН стояло **старое** имя. Замер на шаблоне (`ИП АБЛАЕВА НАГИМА ТУРЕХАНОВНА`):
+
+| Форма | Сколько | Где |
+| --- | --- | --- |
+| `ИП АБЛАЕВА НАГИМА ТУРЕХАНОВНА` | 1 | шапка |
+| `Нагима Турехановна А.` | **181** | колонка контрагента, одна строка 87.7 pt |
+| `Нагима А.` | **61** | там же, 37.3 pt |
+| `ИП АБЛАЕВА НАГИМА` + `ТУРЕХАНОВНА БИН/ИИН` + ИИН | **3** | ячейка, обёрнутая на 3 строки |
+| `Отчет сформирован пользователем Аблаева Нагима Турехановна 18.07.2026 13:45` | 1 | подпись, стр. 100 |
+
+Все 243 вхождения «Нагима» — это ровно три строки целиком; ни одна не является подстрокой другой и ни одна не встречается внутри «Назначения платежа», поэтому байтовая замена безопасна (закреплено `test_template_has_the_measured_derived_forms`).
+
+`derive_name_forms()` выводит короткие формы позиционно: снять правовую форму из закрытого списка `_LEGAL_PREFIXES` (снимать любое первое слово нельзя — у «КАСПИЙ ПЁТР» потерялась бы фамилия), дальше `Фамилия Имя Отчество`. **Оракул правила — сам шаблон:** применённое к его наименованию, оно обязано дать напечатанные в нём строки. `substitute_derived_names` выводит СТАРЫЕ формы из наименования обрабатываемого документа, а не из зашитых констант, поэтому на шаблоне другого владельца заменится его имя, а если правило перестанет воспроизводить формы — они просто не найдутся, и функция ничего не испортит. Порядок в `substitute_fields` важен: вшивание → шапка фиксированной длины → **производные формы (пока в шапке ещё старое имя, из которого они выводятся)** → имя шапки.
+
+Дату в подписи **нельзя** менять отдельной подстрокой: «18.07.2026» стоит и в датах операций, слепая замена испортила бы таблицу. Меняется составная строка «подпись + дата», уникальная по построению; новая дата — конец введённого периода (решение пользователя 2026-08-09: иначе отчёт утверждает, что сформирован через полгода после периода, за который выдан).
+
+Ширина: колонка контрагента отведена под **227.6 pt** при кегле 8, и это значение ОДИНАКОВО у всех 242 ячеек (min = median = max по замеру зазора до соседней ячейки ИИК) — фиксированная сетка таблицы, а не свойство строки. Ячейки лево-выровнены и соседей на строке не имеют, поэтому координата начала не пересчитывается, а ширина нужна только чтобы отказать, а не нарисовать имя поверх ИИК.
+
+**Что осталось открытым.** Три обёрнутые на три строки ячейки контрагента не заменяются — перевёрстка узкой многострочной ячейки отложена (решение пользователя 2026-08-09), тот же класс, что отложенная «сумма в назначении платежа» выше. Граница закреплена тестом `test_wrapped_counterparty_cells_are_a_known_gap` и печатается батареей как `[guard]`, а не как провал. Второе ограничение — позиционный разбор ФИО: на наименовании, которое ФИО не является («ТОО ЩЕРБАКОВ И ПАРТНЁРЫ»), он даст осмысленную по построению, но бессмысленную по сути строку; принято сознательно, формат — выписка ИП, где поле почти всегда ФИО.
+
+**Батарея:** `python tests/scripts/verify_kaspi_ip_data.py` — три набора реквизитов (включая казахское ФИО с `Қ`/`ы` и не-ФИО), на каждом все пять критериев. Прогнана мутационно, как требует конвенция: с отключённой заменой производных форм даёт 7 срабатываний, с отключённой заменой полей шапки — 8, с обеими правками на месте — `ВСЁ ОК`, exit 0.
+
 ### Running-balance non-negativity is checked at DAY boundaries, not per-transaction
 
 Kaspi/Halyk/Kaspi ИП statements have no intra-day timestamps, so the order of transactions sharing one date is arbitrary. Evaluating "balance ≥ 0" after _every_ transaction produced false overdrafts: a real unmodified `gold_statement.pdf` dipped to −54.17 ₸ at a single date (five debits rendered before two same-day credits that cover them), which made `/verify` reject a valid statement and tripped the recalc engine's correction loop over 54 tenge. The correct invariant is **balance ≥ 0 at each day boundary** — if a day starts and ends non-negative, some intra-day order (credits before debits) keeps it non-negative throughout. `pdf_service.min_dayend_balance()` (and `first_negative_dayend()`, which also returns the earliest negative day's date) implement this; `main.py:_verify_pdf`'s "Баланс ≥ 0" check and both recalc engines' running-balance walks use them. (ISI is a _soft_ check — reported in `_verify_pdf`'s `checks` but NOT added to `issues`, so it does not affect `passed` and never blocks `/process`.) `halyk_pdf_service`/`kaspi_ip_pdf_service` still use their own per-transaction walks (own tx attributes, calibrated against their own fixtures) — same intra-day false-positive class is theoretically possible there but was not reworked without those fixtures to verify against.
@@ -664,6 +712,8 @@ Since the 2026-08-03 fix above (single global `K` applied uniformly, not per-mon
 | ------------------------ | ------------------------------------------------------ |
 | `POST /process`          | Personal statement — upscale or downscale              |
 | `POST /process-business` | Business turnover certificate                          |
+| `POST /process-kaspi-ip-data` | Подстановка реквизитов во встроенный шаблон Kaspi ИП |
+| `GET /kaspi-ip-data-defaults` | Значения по умолчанию для формы реквизитов        |
 | `POST /verify`           | Validate a scored PDF (math + binary structure)        |
 | `POST /fix`              | Surgically fix balance/income mismatch in a scored PDF |
 | `GET /journal`           | Operation log (SQLite)                                 |
