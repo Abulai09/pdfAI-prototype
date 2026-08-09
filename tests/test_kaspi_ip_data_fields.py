@@ -100,3 +100,37 @@ def test_validate_rejects_unsupported_character():
     """В шрифте нет иероглифов — отказываем на вводе, а не молча рисуем пусто."""
     errs = kid.validate_fields(_ok_fields(client_name="ИП 東京"))
     assert any("недоступн" in e.lower() for e in errs)
+
+
+# --- производные формы имени -------------------------------------------------
+# В шаблоне имя клиента напечатано ЧЕТЫРЬМЯ разными способами, и подстановка
+# только полной формы из шапки оставляет остальные три от прежнего владельца
+# счёта. Правило вывода читается из самого шаблона: применённое к его же
+# наименованию, оно обязано дать ровно те строки, что там напечатаны.
+
+
+def test_derive_name_forms_from_full_fio():
+    """Правило обязано воспроизвести формы САМОГО шаблона — это его оракул."""
+    forms = kid.derive_name_forms("ИП АБЛАЕВА НАГИМА ТУРЕХАНОВНА")
+    assert forms.in_rows == "Нагима Турехановна А."
+    assert forms.short == "Нагима А."
+    assert forms.signature == "Аблаева Нагима Турехановна"
+
+
+def test_derive_name_forms_without_patronymic():
+    forms = kid.derive_name_forms("ИП ТЕСТОВ ТЕСТ")
+    assert forms.in_rows == "Тест Т."
+    assert forms.short == "Тест Т."
+    assert forms.signature == "Тестов Тест"
+
+
+def test_derive_name_forms_single_word_uses_it_everywhere():
+    """Разбирать нечего — все формы совпадают с самим наименованием."""
+    forms = kid.derive_name_forms("ТОО КАСПИЙ")
+    assert forms.in_rows == forms.short == forms.signature == "Каспий"
+
+
+def test_derive_name_forms_strips_only_known_legal_prefix():
+    """«ИП» — правовая форма, а не фамилия; «Каспий» в начале — фамилия."""
+    assert kid.derive_name_forms("ИП ПЕТРОВ ПЁТР").signature == "Петров Пётр"
+    assert kid.derive_name_forms("КАСПИЙ ПЁТР").signature == "Каспий Пётр"

@@ -92,6 +92,62 @@ def period_text(fields: KaspiIPFields) -> str:
     return f"{fields.period_from} - {fields.period_to}"
 
 
+# Правовые формы, которые в этом поле стоят ПЕРЕД фамилией и частью имени не
+# являются. Список закрытый: снимать любое первое слово нельзя, иначе у
+# «КАСПИЙ ПЁТР» фамилия потеряется.
+_LEGAL_PREFIXES = ("ИП", "ТОО", "АО", "КХ", "ПК", "ЧП")
+
+
+@dataclass(frozen=True)
+class NameForms:
+    """Четыре написания имени клиента, встречающиеся в шаблоне.
+
+    Замер на шаблоне (`ИП АБЛАЕВА НАГИМА ТУРЕХАНОВНА`): полная форма стоит в
+    шапке 1 раз, `Нагима Турехановна А.` — 181 раз и `Нагима А.` — 61 раз в
+    колонке контрагента, `Аблаева Нагима Турехановна` — 1 раз в подписи
+    отчёта. Заменять только шапку значит оставить 243 вхождения имени
+    прежнего владельца счёта рядом с уже подставленным ИИН.
+    """
+    full: str
+    in_rows: str
+    short: str
+    signature: str
+
+
+def derive_name_forms(client_name: str) -> NameForms:
+    """Выводит производные написания имени из наименования клиента.
+
+    Правило снято с самого шаблона и им же проверяется: применённое к его
+    наименованию, оно обязано дать те строки, что в нём напечатаны (см.
+    `test_derive_name_forms_from_full_fio`). Разбор позиционный —
+    «Фамилия Имя Отчество» после правовой формы, — поэтому на наименовании,
+    которое не является ФИО («ТОО ЩЕРБАКОВ И ПАРТНЁРЫ»), он даст осмысленную
+    по построению, но бессмысленную по сути строку. Это принятое ограничение
+    (решение пользователя 2026-08-09): формат — выписка ИП, где поле почти
+    всегда ФИО, а альтернатива требовала бы двух дополнительных полей ввода.
+    """
+    full = " ".join((client_name or "").split())
+    words = full.split()
+    if words and words[0].upper() in _LEGAL_PREFIXES:
+        words = words[1:]
+
+    if len(words) < 2:
+        one = words[0].capitalize() if words else full
+        return NameForms(full=full, in_rows=one, short=one, signature=one)
+
+    surname, given = words[0], words[1]
+    patronymic = words[2] if len(words) > 2 else ""
+    initial = f"{surname[0].upper()}."
+    short = f"{given.capitalize()} {initial}"
+    in_rows = f"{given.capitalize()} {patronymic.capitalize()} {initial}" if patronymic else short
+    return NameForms(
+        full=full,
+        in_rows=in_rows,
+        short=short,
+        signature=" ".join(w.capitalize() for w in words),
+    )
+
+
 def _parse(value: str, fmt: str):
     try:
         return datetime.datetime.strptime(value, fmt)
@@ -300,48 +356,25 @@ def substitute_fixed_length(pdf_bytes: bytes, fields: KaspiIPFields) -> bytes:
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        _, from_unicode = build_dynamic_cmap(doc)
         tokens = _page_tokens(doc, 0)
-        old_account = _find_value_token(tokens, _LABEL_ACCOUNT)["text"]
-        old_iin = _find_value_token(tokens, _LABEL_IIN)["text"]
-        old_period = _find_value_token(tokens, _LABEL_PERIOD)["text"]
-        old_moved = _find_value_token(tokens, _LABEL_LAST_MOVEMENT)["text"]
-
         pairs = [
-            (old_account, fields.account),
-            (old_iin, fields.iin),
-            (old_period, period_text(fields)),
-            (old_moved, fields.last_movement),
+            (_find_value_token(tokens, _LABEL_ACCOUNT)["text"], fields.account),
+            (_find_value_token(tokens, _LABEL_IIN)["text"], fields.iin),
+            (_find_value_token(tokens, _LABEL_PERIOD)["text"], period_text(fields)),
+            (_find_value_token(tokens, _LABEL_LAST_MOVEMENT)["text"],
+             fields.last_movement),
         ]
-        for old, new in pairs:
-            if len(old) != len(new):
-                raise SubstitutionError(
-                    f"длина значения изменилась: {old!r} ({len(old)}) → "
-                    f"{new!r} ({len(new)}); подстановка этой длины не выполняется "
-                    f"без пересчёта вёрстки"
-                )
-
-        replacements = [
-            (_escape_pdf_string(_encode_cid(old, from_unicode)),
-             _escape_pdf_string(_encode_cid(new, from_unicode)))
-            for old, new in pairs
-        ]
-        streams = {}
-        for pno in range(doc.page_count):
-            for xref in doc[pno].get_contents():
-                if xref not in streams:
-                    streams[xref] = doc.xref_stream(xref)
     finally:
         doc.close()
 
-    raw = bytearray(pdf_bytes)
-    for xref, body in streams.items():
-        new_body = body
-        for old_cid, new_cid in replacements:
-            new_body = new_body.replace(old_cid, new_cid)
-        if new_body != body:
-            _replace_stream(raw, xref, new_body, zlib.compress)
-    return _rebuild_xref_table(bytes(raw))
+    for old, new in pairs:
+        if len(old) != len(new):
+            raise SubstitutionError(
+                f"длина значения изменилась: {old!r} ({len(old)}) → "
+                f"{new!r} ({len(new)}); подстановка этой длины не выполняется "
+                f"без пересчёта вёрстки"
+            )
+    return _replace_cid_strings(pdf_bytes, pairs)
 
 
 def _font_objects(doc) -> tuple:
@@ -593,20 +626,120 @@ def _text_width_pt(text: str, advances: Dict[str, float], size: float) -> float:
     return sum(advances.get(ch, 0.5) for ch in text) * size
 
 
+# Замер на шаблоне: колонка контрагента отведена под 227.6 pt при кегле 8, и
+# это значение ОДИНАКОВО у всех 242 ячеек (min = median = max по замеру зазора
+# до соседней ячейки ИИК) — то есть это фиксированная сетка таблицы, а не
+# свойство конкретной строки. Ячейка лево-выровнена и соседей на строке не
+# имеет, поэтому координата начала не пересчитывается; ширина нужна только
+# чтобы отказать, а не нарисовать имя поверх ИИК.
+MAX_ROW_NAME_WIDTH_PT = 227.6
+
+_ROW_FONT_SIZE = 8.0
+
+# Дата в подписи отчёта. Заменять её отдельной подстрокой НЕЛЬЗЯ: «18.07.2026»
+# стоит и в датах операций, и слепая замена испортила бы таблицу. Поэтому
+# меняется составная строка «подпись + дата», уникальная по построению.
+_SIGNATURE_DATE_RE = r"\s+(\d{2}\.\d{2}\.\d{4})"
+
+
+def _replace_cid_strings(pdf_bytes: bytes, pairs: List[Tuple[str, str]]) -> bytes:
+    """Заменяет строки во ВСЕХ потоках содержимого, сравнивая CID-байты.
+
+    Позиции не трогаются: правится только содержимое скобочной строки, а
+    `Tm`/`Td` остаются прежними. Для лево-выровненных ячеек без соседей это
+    и есть верное поведение — длина текста меняется, якорь нет.
+    """
+    if not pairs:
+        return pdf_bytes
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        _, from_unicode = build_dynamic_cmap(doc)
+        replacements = [
+            (_escape_pdf_string(_encode_cid(old, from_unicode)),
+             _escape_pdf_string(_encode_cid(new, from_unicode)))
+            for old, new in pairs
+        ]
+        streams = {}
+        for pno in range(doc.page_count):
+            for xref in doc[pno].get_contents():
+                if xref not in streams:
+                    streams[xref] = doc.xref_stream(xref)
+    finally:
+        doc.close()
+
+    raw = bytearray(pdf_bytes)
+    for xref, body in streams.items():
+        new_body = body
+        for old_cid, new_cid in replacements:
+            new_body = new_body.replace(old_cid, new_cid)
+        if new_body != body:
+            _replace_stream(raw, xref, new_body, zlib.compress)
+    return _rebuild_xref_table(bytes(raw))
+
+
+def substitute_derived_names(pdf_bytes: bytes, fields: KaspiIPFields) -> bytes:
+    """Меняет производные написания имени в строках таблицы и в подписи.
+
+    Прежние формы не зашиты в код, а ВЫВОДЯТСЯ тем же правилом из наименования,
+    которое стоит в шапке обрабатываемого документа. Поэтому если однажды
+    подложат шаблон другого владельца, заменится его имя, а не чужое; а если
+    правило перестанет воспроизводить напечатанные формы, они просто не
+    найдутся, и функция ничего не испортит.
+
+    Вызывается ДО замены шапки: именно оттуда читается прежнее наименование.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        old_name = _find_value_token(_page_tokens(doc, 0), _LABEL_CLIENT)["text"]
+        _, from_unicode = build_dynamic_cmap(doc)
+        advances = _primary_glyph_advances(doc, from_unicode)
+        text = "\n".join(doc[i].get_text() for i in range(doc.page_count))
+    finally:
+        doc.close()
+
+    old = derive_name_forms(old_name)
+    new = derive_name_forms(fields.client_name)
+
+    for form in (new.in_rows, new.short):
+        width = _text_width_pt(form, advances, _ROW_FONT_SIZE)
+        if width > MAX_ROW_NAME_WIDTH_PT:
+            raise SubstitutionError(
+                f"производная форма имени {form!r} не помещается в строку "
+                f"таблицы: {width:.1f} pt при доступных "
+                f"{MAX_ROW_NAME_WIDTH_PT:.0f} pt"
+            )
+
+    # Подпись идёт первой: она самая длинная и содержит формы покороче как
+    # части, поэтому заменять её после них значило бы искать уже изменённое.
+    pairs: List[Tuple[str, str]] = []
+    m = re.search(re.escape(old.signature) + _SIGNATURE_DATE_RE, text)
+    if m:
+        pairs.append((m.group(0), f"{new.signature} {fields.period_to}"))
+    for old_form, new_form in ((old.in_rows, new.in_rows), (old.short, new.short)):
+        if old_form and old_form != new_form and old_form in text:
+            pairs.append((old_form, new_form))
+    return _replace_cid_strings(pdf_bytes, pairs)
+
+
 def substitute_fields(pdf_bytes: bytes, fields: KaspiIPFields) -> bytes:
     """Подставляет все пять реквизитов. Публичная точка входа модуля.
 
     Порядок важен: глифы вшиваются ПЕРВЫМИ, иначе `_encode_cid` не найдёт CID
     для новых символов имени. Поля фиксированной длины идут вторыми — они не
-    зависят от вшивания. Имя пишется последним, когда карта символов уже полна.
+    зависят от вшивания. Производные формы имени — третьими, пока в шапке ещё
+    стоит ПРЕЖНЕЕ наименование, из которого выводятся заменяемые строки.
+    Имя шапки пишется последним.
     """
     errors = validate_fields(fields)
     if errors:
         raise SubstitutionError("; ".join(errors))
 
     name = fields.client_name.strip()
-    working, _added = embed_missing_glyphs(pdf_bytes, set(name))
+    forms = derive_name_forms(name)
+    needed = set(name) | set(forms.in_rows) | set(forms.short) | set(forms.signature)
+    working, _added = embed_missing_glyphs(pdf_bytes, needed)
     working = substitute_fixed_length(working, fields)
+    working = substitute_derived_names(working, fields)
 
     doc = fitz.open(stream=working, filetype="pdf")
     try:

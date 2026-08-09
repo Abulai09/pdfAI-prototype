@@ -147,6 +147,98 @@ def test_substitute_fields_rejects_too_long_name():
     assert "не помещается" in str(e.value)
 
 
+# --- производные формы имени в теле документа --------------------------------
+# Замер на шаблоне: 181 × «Нагима Турехановна А.», 61 × «Нагима А.» в колонке
+# контрагента и 1 подпись отчёта. Все три — то же лицо, что и в шапке, поэтому
+# подстановка только шапки оставляла новый ИИН рядом со старым именем.
+
+OLD_IN_ROWS = "Нагима Турехановна А."
+OLD_SHORT = "Нагима А."
+OLD_SIGNATURE = "Аблаева Нагима Турехановна"
+
+
+def test_template_has_the_measured_derived_forms():
+    """Оракул правила вывода: формы шаблона = формы, выведенные из его шапки.
+
+    Если однажды подложат шаблон другого владельца, этот тест покраснеет
+    первым и покажет, что правило надо перепроверять, а не молча заменит
+    ноль вхождений.
+    """
+    text = _all_text(kid.load_template())
+    forms = kid.derive_name_forms("ИП АБЛАЕВА НАГИМА ТУРЕХАНОВНА")
+    assert (forms.in_rows, forms.short, forms.signature) == \
+           (OLD_IN_ROWS, OLD_SHORT, OLD_SIGNATURE)
+    assert text.count(OLD_IN_ROWS) == 181
+    assert text.count(OLD_SHORT) == 61
+    assert text.count(OLD_SIGNATURE) == 1
+
+
+def test_derived_names_replaced_in_transaction_rows():
+    out = kid.substitute_fields(kid.load_template(), NEW)
+    text = _all_text(out)
+    forms = kid.derive_name_forms(NEW.client_name)
+    # у «ИП ТЕСТОВ ТЕСТ» отчества нет, поэтому обе формы совпадают
+    assert forms.in_rows == forms.short == "Тест Т."
+    assert text.count("Тест Т.") == 181 + 61
+    assert OLD_IN_ROWS not in text
+    assert OLD_SHORT not in text
+
+
+def test_signature_gets_new_name_and_period_end():
+    """Дата в подписи привязана к концу периода: отчёт не может быть
+    сформирован через полгода после периода, за который он выдан."""
+    out = kid.substitute_fields(kid.load_template(), NEW)
+    text = _all_text(out)
+    assert "Отчет сформирован пользователем Тестов Тест 01.02.2026 13:45" in text
+    assert OLD_SIGNATURE not in text
+
+
+def test_signature_date_change_does_not_touch_operation_dates():
+    """«18.07.2026» стоит и в подписи, и в датах операций.
+
+    Слепая замена этой подстроки испортила бы таблицу, поэтому меняется
+    составная строка «имя + дата», уникальная по построению.
+    """
+    before = _all_text(kid.load_template())
+    after = _all_text(kid.substitute_fields(kid.load_template(), NEW))
+    op = lambda t: sorted(re.findall(r"\b\d{2}\.\d{2}\.20\d{2}\b", t))
+    expected = (
+        before.replace(OLD_PERIOD, "01.02.2025 - 01.02.2026")
+              .replace(OLD_MOVED, "31.01.2026 09:15")
+              .replace(f"{OLD_SIGNATURE} 18.07.2026", "Тестов Тест 01.02.2026")
+    )
+    assert op(after) == op(expected)
+
+
+def test_derived_substitution_keeps_amounts():
+    before = _all_text(kid.load_template())
+    after = _all_text(kid.substitute_fields(kid.load_template(), NEW))
+    money = lambda t: sorted(re.findall(r"\d[\d  ]*,\d{2}", t))
+    assert money(after) == money(before)
+
+
+def test_rejects_derived_name_too_wide_for_the_row_cell():
+    """Колонка контрагента отведена под 227.6 pt — отказ, а не наезд на ИИК."""
+    fields = kid.KaspiIPFields(
+        **{**NEW.__dict__, "client_name": "ИП ТЕСТОВ " + "О" * 30 + " " + "О" * 30}
+    )
+    with pytest.raises(kid.SubstitutionError) as e:
+        kid.substitute_fields(kid.load_template(), fields)
+    assert "строк" in str(e.value)
+
+
+def test_wrapped_counterparty_cells_are_a_known_gap():
+    """Три ячейки контрагента обёрнуты на три строки и НЕ заменяются.
+
+    Отложено сознательно (решение пользователя 2026-08-09): перевёрстка
+    узкой многострочной ячейки — тот же класс, что отложенная «сумма в
+    назначении платежа». Тест фиксирует границу, чтобы её снятие было
+    осознанным изменением, а не случайностью.
+    """
+    text = _all_text(kid.substitute_fields(kid.load_template(), NEW))
+    assert text.count("ИП АБЛАЕВА НАГИМА") == 3
+
+
 def test_substitute_fields_keeps_font_set():
     before = fitz.open(stream=kid.load_template(), filetype="pdf")
     after = fitz.open(stream=kid.substitute_fields(kid.load_template(), NEW), filetype="pdf")
