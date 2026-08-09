@@ -312,3 +312,53 @@ class TestFontChecksumConvention:
             for mult, raw, out in _outputs(path):
                 issues = vhal.check_font_checksum_convention(raw, out)
                 assert not issues, f"{path.name} x{mult}: {issues}"
+
+
+class TestXrefAlwaysRebuilt:
+    """xref обязан быть верным при ЛЮБОМ розыгрыше шума (найдено 2026-08-10).
+
+    `_process_halyk_pdf_once` перестраивал xref условно —
+    `if cumulative_offset != 0 or _newly_available_cids`. Накопитель считает
+    только сдвиги от замен в content-стримах, и когда растущие и
+    уменьшающиеся замены взаимно гасятся в ровно ноль, перестройка не
+    выполнялась, хотя отдельные объекты уже разъехались. Опасность этой
+    ветки была замечена и описана в комментарии рядом ещё в прошлой сессии,
+    но закрыта лишь частный случай (патч глифов) — общий остался.
+
+    Замер: `HALYKformat2 ×1.05` даёт битый xref на **6 сидах из 60**
+    (12, 14, 23, 29, 38, 49) — до 36 битых offsets из 47, PyMuPDF пишет
+    «expected object number» и «too many kids in page tree». Это не
+    экзотика, а каждый десятый прогон на этой связке.
+    """
+
+    BROKEN_SEEDS = (12, 14, 23, 29, 38, 49)
+
+    @requires_corpus
+    def test_xref_valid_on_seeds_that_used_to_break_it(self):
+        import random
+
+        path = HALYK_DIR / "HALYKformat2.pdf"
+        if not path.exists():
+            pytest.skip("HALYKformat2.pdf недоступен")
+        raw = path.read_bytes()
+        avg = _quiet(hal.validate_halyk, raw)["summary"]["avg_monthly_income"]
+        for seed in self.BROKEN_SEEDS:
+            random.seed(seed)
+            out = _quiet(hal.process_halyk_pdf, raw, target_monthly_income=avg * 1.05)
+            issues = _quiet(hal.validate_halyk, out)["issues"]
+            assert not [i for i in issues if "xref" in i], f"сид {seed}: {issues}"
+
+    def test_rebuild_xref_is_byte_idempotent(self):
+        """Обоснование безусловной перестройки: на файле с уже верным xref
+        она не меняет ни байта, поэтому не может создать расхождение стиля.
+        Проверено на 8 реальных файлах трёх форматов; здесь закреплено на
+        тех, что доступны в этом окружении."""
+        from pdf_service import _rebuild_xref_table
+
+        checked = 0
+        for path in HALYK_FILES:
+            raw = path.read_bytes()
+            assert _quiet(_rebuild_xref_table, raw) == raw, f"{path.name}: байты изменились"
+            checked += 1
+        if not checked:
+            pytest.skip("корпус недоступен")

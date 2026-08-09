@@ -1887,9 +1887,12 @@ def process_kaspi_ip_pdf(input_bytes: bytes, target_monthly_income: float) -> by
             if dq:
                 print(f"  [leftover SUMMARY] digits={digits!r} остались={list(dq)}")
 
-    result = bytes(raw)
-    if cumulative_offset != 0:
-        result = _rebuild_xref_table(result)
+    # Перестраиваем БЕЗУСЛОВНО (2026-08-10) — тот же класс, что закрыт в
+    # halyk_pdf_service и pdf_service: сумма сдвигов обращается в ноль, когда
+    # растущие и уменьшающиеся замены гасят друг друга, и тогда xref остаётся
+    # от прежнего состояния при уже разъехавшихся объектах. Вызов идемпотентен
+    # на файле с верным xref, поэтому безусловность ничего не стоит.
+    result = _rebuild_xref_table(bytes(raw))
     return result
 
 
