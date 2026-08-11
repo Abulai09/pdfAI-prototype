@@ -1278,23 +1278,31 @@ def first_negative_dayend(
 
 def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> StatementData:
     """
-    Пересчитывает выписку с единым коэффициентом на весь период:
+    Пересчитывает выписку с единым коэффициентом на весь период.
 
-    1. Группирует SALARY транзакции (Пополнение) по месяцам
+    1. Группирует SALARY транзакции (Пополнение) по месяцам.
     2. Единый K = target_monthly_income / текущий_ср._доход_мес, применяется
-       РАВНОМЕРНО ко всем месяцам — сохраняет естественную помесячную
-       неравномерность реального файла (не K_month = target/доход_месяца,
-       которое выравнивало бы каждый месяц к одной и той же сумме)
-    3. Применяет K × (1 ± ε) к каждой зарплатной транзакции
-    4. Расходы (sign=-1) НЕ масштабируются (K_exp = 1.0) — банк сверяет
-       расходные категории с собственной базой Kaspi
-    5. Возвраты (is_refund=True, sign=+1) НЕ масштабируются
-    6. Пересчитывает running balance по цепочке
-    
+       РАВНОМЕРНО ко всем месяцам (см. комментарий в git-истории про
+       «выравнивание убивало естественный разброс дохода»).
+    3. Применяет K × (1 ± ε) к каждой зарплатной транзакции.
+    4. balance_end ЗАМОРОЖЕН (== stmt.balance_end оригинала, не пересчитывается
+       вовсе) — «Доступно на …» и справка ₸/USD/EUR (cert-формат) остаются
+       байт-в-байт оригиналом. Расход становится ПРОИЗВОДНОЙ величиной:
+       new_total_expense := balance_start + new_total_income − balance_end,
+       и именно он определяет, во сколько раз растут расходные транзакции
+       и категории шапки (см. _scale_debit_transactions_exact,
+       _scale_expense_categories).
+    5. Возвраты (is_refund=True, sign=+1) НЕ масштабируются.
+    6. Если running balance просаживается ниже нуля в середине периода — не
+       поднимаем зарплату (это раньше двигало balance_end, что теперь
+       запрещено), а ПЕРЕНОСИМ часть расходного прироста ПОЗЖЕ дня дефицита
+       — общая сумма расхода не меняется, меняется только распределение во
+       времени.
+
     ФОРМУЛЫ ИТОГОВ (как в Kaspi):
       total_income  = Σ(salary tx.new_amount)  — без возвратов!
-      total_expense = Σ(sign==-1 tx.new_amount) - Σ(refund tx.new_amount)  — НЕТТО
-      balance_end   = balance_start + Σ(sign=+1) - Σ(sign==-1)
+      total_expense = balance_start + new_total_income − balance_end (ФИКСИРОВАН)
+      balance_end   = stmt.balance_end оригинала (НЕ ПЕРЕСЧИТЫВАЕТСЯ)
     """
     salary_transactions = [t for t in stmt.transactions if t.is_salary]
     refund_transactions = [t for t in stmt.transactions if t.is_refund]
@@ -1305,22 +1313,14 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
 
     current_salary_income = sum(t.amount for t in salary_transactions)
     current_refund_total = sum(t.amount for t in refund_transactions)
-    
+
     # ── Группировка SALARY доходов по месяцам ──
     monthly_income: Dict[str, float] = {}
-    monthly_txs: Dict[str, List[Transaction]] = {}
-    
     for tx in salary_transactions:
         mk = _get_month_key(tx.date) or "unknown"
         monthly_income[mk] = monthly_income.get(mk, 0) + tx.amount
-        if mk not in monthly_txs:
-            monthly_txs[mk] = []
-        monthly_txs[mk].append(tx)
-    
-    n_months = len([k for k in monthly_income if k != "unknown"])
-    if n_months == 0:
-        n_months = 1
-    
+
+    n_months = len([k for k in monthly_income if k != "unknown"]) or 1
     current_monthly_avg = current_salary_income / max(n_months, 1)
     global_K = target_monthly_income / current_monthly_avg
 
@@ -1328,15 +1328,13 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
         print("[Engine] ⚠️ Текущий доход = 0")
         return stmt
 
-    # Защита от K < 1: масштабировать доход ВНИЗ нет смысла —
-    # это уменьшает income, итоговый баланс уходит в минус, и PDF сломан.
-    # Минимум K = 1.0 (оставляем оригинальные суммы).
     if global_K < 1.0:
-        print(f"[Engine] ⚠️ Цель ({target_monthly_income:,.0f}) < текущего дохода/мес ({current_monthly_avg:,.0f}). K={global_K:.4f} < 1 — клипуем до 1.0")
+        print(f"[Engine] ⚠️ Цель ({target_monthly_income:,.0f}) < текущего дохода/мес "
+              f"({current_monthly_avg:,.0f}). K={global_K:.4f} < 1 — клипуем до 1.0")
         global_K = 1.0
 
     print(f"\n{'═' * 60}")
-    print(f"  ДВИЖОК ПЕРЕСЧЁТА (единый K, разброс по месяцам сохраняется)")
+    print(f"  ДВИЖОК ПЕРЕСЧЁТА (единый K, balance_end заморожен)")
     print(f"{'═' * 60}")
     print(f"  Текущий ср. зарплатный/мес: {current_monthly_avg:>14,.2f} ₸")
     print(f"  Целевой доход/мес:          {target_monthly_income:>14,.2f} ₸")
@@ -1345,193 +1343,124 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
     print(f"  Зарплатных транзакций:      {len(salary_transactions)}")
     print(f"  Возвратов (не масштабируем): {len(refund_transactions)} (Σ={current_refund_total:,.2f} ₸)")
     print(f"{'═' * 60}")
-    
-    # ── Единый K на весь период (НЕ помесячный) ──
-    # РАНЬШЕ здесь считался K_month = target / month_income для КАЖДОГО
-    # месяца отдельно — это гарантированно выравнивало все месяцы к одному
-    # уровню (K_month × month_income == target для любого месяца), убивая
-    # естественную помесячную неравномерность реального файла: любая
-    # настоящая выписка «прыгает» по месяцам (где-то густо, где-то пусто), а
-    # плоское выравнивание превращало это в подозрительно одинаковую сумму
-    # каждый месяц — визуальный tell того же класса, что и «круглые/
-    # реалистичные цифры» (см. критерий 3 в CLAUDE.md). ISI в Kaspi Gold —
-    # мягкий сигнал (не блокирует passed, см. main._verify_pdf), поэтому
-    # здесь безопасно применять ОДИН и тот же K ко всем месяцам сразу:
-    # пропорции между месяцами остаются ТЕ ЖЕ, что и в реальном оригинале,
-    # просто равномерно масштабированные к целевому среднему. global_K уже
-    # заранее клипнут к минимуму 1.0 (см. выше), поэтому ни один месяц не
-    # может уменьшиться относительно оригинала при равномерном применении —
-    # старая помесячная защита _clip_k_to_one больше не нужна.
-    print(f"\n  Единый K на весь период: {global_K:.4f} (без помесячного выравнивания)")
-    month_K: Dict[str, float] = {}
-    for mk in sorted(monthly_income.keys()):
-        month_K[mk] = global_K
-        if mk != "unknown":
-            mi = monthly_income[mk]
-            print(f"    {mk}: доход {mi:>14,.2f} → ×{global_K:.4f} ≈ {mi * global_K:>14,.2f}")
 
-    # ── Расходы: НЕ масштабируем ──
-    # Банк (Отбасы) верифицирует расходные категории с базой Kaspi.
-    # Любое изменение расходов → статус 6 LG (отклонение).
-    # Поэтому K_exp ВСЕГДА = 1.0 — расходы остаются оригинальными.
-    original_er = stmt.total_expense / max(current_salary_income, 1)
-    projected_total_income = target_monthly_income * n_months
-    projected_er = stmt.total_expense / max(projected_total_income, 1)
-    
-    print(f"\n  ER оригинальный:  {original_er:.3f}")
-    print(f"  ER проекция:      {projected_er:.3f}")
-    print(f"  K_exp (расходы):  1.0000 (расходы НЕ масштабируются)")
+    # ── Единый K на весь период (НЕ помесячный) — см. git log для истории бага ──
+    month_K: Dict[str, float] = {mk: global_K for mk in monthly_income}
 
-    # ── Шаг 1: Масштабирование транзакций с дисперсией ──
-    # Только salary (sign=+1, is_salary) масштабируются.
-    # Расходы (sign=-1), возвраты и прочие — остаются без изменений.
-    print(f"\n  Масштабирование транзакций:")
+    # ── Шаг 1: Масштабирование зарплатных транзакций ──
     for tx in stmt.transactions:
         if tx.sign == 1 and tx.is_salary and not tx.is_refund:
             mk = _get_month_key(tx.date) or "unknown"
             k = month_K.get(mk, global_K)
             epsilon = random.uniform(-0.03, 0.03)
             tx.new_amount = _round_to_natural(tx.amount * k * (1 + epsilon), original=tx.amount)
-        else:
-            # Возвраты, расходы, non-salary income — без изменений
+        elif tx.sign == 1:
+            # Возвраты и прочий non-salary доход — без изменений
             tx.new_amount = tx.amount
+        # sign == -1 (расход) обрабатывается ниже, отдельным проходом
 
-    # ── Шаг 2: Running balance ──
-    # ВАЖНО: Транзакции в Kaspi PDF идут от НОВЫХ к СТАРЫМ (09.02.26 → 10.02.25)
-    # Для running balance считаем от balance_start (самая ранняя дата) ВПЕРЁД,
-    # т.е. идём по транзакциям в ОБРАТНОМ порядке. Минимум замеряем на границах
-    # дней (см. min_dayend_balance): внутридневной порядок операций произволен,
-    # и дип в −54 ₸ между дебетами и покрывающими их кредитами ТОГО ЖЕ дня —
-    # не реальный овердрафт, а лишь перестановка внутри даты.
-    current_rb = stmt.balance_start
-    for tx in reversed(stmt.transactions):
-        current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
-        tx.new_balance_after = current_rb
-    min_rb, _ = min_dayend_balance(stmt.transactions, stmt.balance_start, "new_amount")
-
-    # ── Шаг 3: Если баланс уходит в минус — ПОДНИМАЕМ доход в дефицитном месяце ──
-    # «Горбатый» доход: у выписки есть месяц с очень крупным зарплатным доходом,
-    # который тратится в том же месяце. Плоское выравнивание к цели около
-    # среднего срезает этот месяц ниже, чем нужно для покрытия его же расходов,
-    # и running balance уходит в минус в СЕРЕДИНЕ периода. Расходы трогать
-    # нельзя (банк их сверяет), поэтому единственный способ вернуть баланс в
-    # плюс — ПОДНЯТЬ зарплату в месяце дефицита (и, если нужно, в более ранних).
-    #
-    # РАНЬШЕ здесь была обратная (ошибочная) логика: salary УМЕНЬШАЛИ ×0.97,
-    # что углубляло дефицит, гнало итоговый баланс в глубокий минус и приводило
-    # к ложному floor-отказу (post_check_negative_balance) даже там, где валидный
-    # результат достижим. downscale-модуль всегда поднимал ×1.02 — это и есть
-    # верное направление. Поднятие дохода всегда сходится: лишние деньги дефицит
-    # только закрывают, а на баланс ≥ 0 в остальных точках это не влияет.
-    #
-    # Как и прежде, корректируем только если дефицит СОЗДАН нашим масштабированием
-    # (тождество баланса на уровне транзакций у оригинала сходится). Если оригинал
-    # сам «структурно дефицитен» на уровне транзакций (напр. self-transfer суммы
-    # в шапке, но не в виде «Пополнение»-транзакций) — не вмешиваемся.
-    individual_income_total = sum(tx.amount for tx in stmt.transactions if tx.sign == 1)
-    individual_expense_total = sum(tx.amount for tx in stmt.transactions if tx.sign == -1)
-    original_min_rb_deficit = individual_income_total + stmt.balance_start - individual_expense_total
-    min_rb, neg_date = first_negative_dayend(stmt.transactions, stmt.balance_start, "new_amount")
-    if min_rb < 0 and original_min_rb_deficit >= -1.0:
-        print(f"\n  ⚠️ Баланс уходил в минус: {min_rb:,.2f} ₸ (первый дефицитный день ~{neg_date})")
-        print(f"  Корректируем: поднимаем зарплату на/до точки дефицита")
-        prev_min = None
-        for attempt in range(80):
-            min_rb, neg_date = first_negative_dayend(stmt.transactions, stmt.balance_start, "new_amount")
-            if min_rb >= -0.01:
-                print(f"  ✅ Баланс скорректирован за {attempt} итераций, мин: {min_rb:,.2f} ₸")
-                break
-            # Дефицит на границе дня neg_date можно закрыть ТОЛЬКО доходом,
-            # пришедшим НЕ ПОЗЖЕ этой даты (более поздняя зарплата на эту точку
-            # не влияет). Поднимаем зарплату в МЕСЯЦЕ дефицита, но лишь ту, что
-            # датирована ≤ neg_date (тот самый «горб»); если такой в этом месяце
-            # нет — расширяемся на всю зарплату ≤ neg_date. Ограничение «≤ дата»
-            # критично: без него зарплата, пришедшая ПОСЛЕ дефицита, растёт до
-            # бесконечности, не сдвигая баланс (runaway).
-            neg_mk = _get_month_key(neg_date)
-            neg_key = _date_sort_key(neg_date)
-            eligible = [
-                tx for tx in stmt.transactions
-                if tx.sign == 1 and tx.is_salary and not tx.is_refund
-                and _date_sort_key(tx.date) <= neg_key
-            ]
-            targeted = [tx for tx in eligible if _get_month_key(tx.date) == neg_mk] or eligible
-            if not targeted:
-                # Дефицит без единой зарплатной транзакции до него — поднять
-                # нечего, ниже сработает safety-net (raise IncomeTooLowError).
-                print(f"  ⚠️ Нет зарплаты до точки дефицита {neg_date} — коррекция невозможна")
-                break
-            # _round_to_natural (не round(x, 2)!) — реальные зарплатные суммы
-            # Kaspi Gold всегда целые тенге в «человеческом» шаге (см. её
-            # докстринг); голый round(x, 2) после нескольких итераций ×1.05
-            # оставляет произвольные копейки (проверено на реальном файле:
-            # 100 из 561 зарплатных транзакций получали копейки вроде
-            # "232 682,62 ₸" — визуально выдаёт результат как посчитанный по
-            # формуле, а не настоящую зарплатную проводку).
-            for tx in targeted:
-                # original=tx.amount (истинный оригинал, не уже округлённый
-                # tx.new_amount с прошлой итерации) — иначе шаг «съезжает» с
-                # реальной круглости исходной суммы на каждой итерации ×1.05.
-                tx.new_amount = _round_to_natural(tx.new_amount * 1.05, original=tx.amount)
-            # Guard от зависания: если минимум не улучшается — прекращаем.
-            if prev_min is not None and min_rb <= prev_min + 0.01:
-                print(f"  ⚠️ Коррекция не сходится (мин застрял на {min_rb:,.2f} ₸) — стоп")
-                break
-            prev_min = min_rb
-        else:
-            print(f"  ⚠️ Коррекция не сошлась за 80 итераций, мин: {min_rb:,.2f} ₸")
-        # Финальный пересчёт running balance после коррекции
-        current_rb = stmt.balance_start
-        for tx in reversed(stmt.transactions):
-            current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
-            tx.new_balance_after = current_rb
-    elif min_rb < 0:
-        print(f"\n  ℹ️ Running balance минус ({min_rb:,.2f} ₸) — структурная особенность PDF."
-              f" Оригинал тоже дефицитен ({original_min_rb_deficit:,.2f} ₸). Не корректируем.")
-
-    # ── Итоги (формулы Kaspi) ──
-    # Kaspi считает "Пополнения" как НЕТТО:
-    #   Пополнения = Σ(+ Пополнение) − Σ(− Пополнение)
-    # Отрицательные «Пополнение» (Возврат Х.) — это отмены пополнений, и Kaspi
-    # вычитает их из суммарной категории. Если их игнорировать, header будет
-    # завышен на величину возврата → tx-уровень не сойдётся (Δ = +возврат).
     salary_income_pos = sum(
-        tx.new_amount for tx in stmt.transactions
-        if tx.is_salary and not tx.is_refund
+        tx.new_amount for tx in stmt.transactions if tx.is_salary and not tx.is_refund
     )
     refund_topups_neg = sum(
         tx.amount for tx in stmt.transactions
         if tx.description == "Пополнение" and tx.sign == -1
     )
     stmt.new_total_income = round(salary_income_pos - refund_topups_neg, 2)
-    
-    # Расходы: оставляем ОРИГИНАЛЬНЫЕ из header PDF (вычислены по уравнению баланса).
-    # НЕ пересчитываем через expense_categories — там дублируются строки типа
-    # «Переводы» и «Переводы на свои счета» (одинаковый ключ → перезапись).
-    # stmt.total_expense уже содержит корректное значение из parse_full_statement.
-    
-    # Balance: start + new_income - original_expense = end
-    stmt.new_balance_end = round(
-        stmt.balance_start + stmt.new_total_income - stmt.total_expense, 2
-    )
 
-    # «Доступно на …» в PDF Kaspi Gold обычно пишется БЕЗ знака вовсе (не
-    # «+5 356,25», а просто «5 356,25») — а глиф «-» для BALANCE_END/
-    # TOTAL_INCOME синтезировать негде: у "-" нет CID в CMap ОСНОВНОГО
-    # шрифта (from_unicode строится только из него — см. build_dynamic_cmap),
-    # он существует только в CMap доп. шрифта, использовать чужой CID в
-    # чужом шрифте — риск отрисовать не тот глиф. process_pdf_bytes_raw тогда
-    # молча оставил бы старый (положительный) текст — сумма выглядела бы как
-    # положительная, будучи на самом деле отрицательной (воспроизведено на
-    # реальном файле: near-noop таргет после коррекции running balance,
-    # «Шаг 3» выше, ушёл в -7 990 164,08 ₸, а в PDF осталась исходная
-    # положительная «5 356,25»). Как и в pdf_service_downscale (см. её
-    # докстринг: «никогда не получим отрицательный B_end — архитектурно, а не
-    # патчем cmap»), решаем на уровне пересчёта, а не байт-записи: если после
-    # ВСЕХ коррекций (включая «Шаг 3») баланс всё равно уходит в минус —
-    # запрошенный target для этой выписки небезопасен, поднимаем явную ошибку
-    # вместо тихой записи визуально неверного PDF.
-    if stmt.new_balance_end < 0:
+    # ── balance_end заморожен: используем ОРИГИНАЛЬНОЕ значение, никогда не
+    # присваиваем ему ничего производного от income/expense. ──
+    stmt.new_balance_end = stmt.balance_end
+
+    # ── Расход — производная величина: столько, сколько нужно, чтобы с
+    # ЗАМОРОЖЕННЫМ balance_end тождество баланса продолжало сходиться. ──
+    target_total_expense = round(
+        stmt.balance_start + stmt.new_total_income - stmt.new_balance_end, 2
+    )
+    if target_total_expense < 0:
+        # При upscale (K >= 1.0) невозможно: new_total_income >= исходного,
+        # значит target_total_expense >= исходного total_expense >= 0. Защита
+        # оставлена на случай будущих вызовов с необычными входными данными.
+        from pdf_service_downscale import IncomeTooLowError  # локальный импорт — избегаем цикла
+
+        raise IncomeTooLowError(
+            min_target_monthly_income=target_monthly_income,
+            current_expense=stmt.total_expense,
+            current_monthly_avg=current_monthly_avg,
+            n_months=n_months,
+            reason="post_check_negative_balance",
+            message=(
+                f"При замороженном балансе ({stmt.balance_end:,.0f} ₸) и "
+                f"доходе {stmt.new_total_income:,.0f} ₸ требуемый расход "
+                f"({target_total_expense:,.0f} ₸) отрицателен."
+            ),
+        )
+
+    _scale_debit_transactions_exact(stmt.transactions, target_total_expense)
+
+    # ── Running balance ──
+    current_rb = stmt.balance_start
+    for tx in reversed(stmt.transactions):
+        current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
+        tx.new_balance_after = current_rb
+
+    # ── Коррекция просадки: ПЕРЕНОСИМ расходный прирост во времени, а НЕ
+    # поднимаем доход (это раньше двигало balance_end — теперь запрещено).
+    # У расходной транзакции ДО дня дефицита ("донор") откатываем часть
+    # прироста к оригиналу; у расходной транзакции ПОСЛЕ дня дефицита
+    # ("приёмник") на ту же величину прирост увеличиваем — общая сумма
+    # расхода не меняется ни на тенге, меняется только момент, когда каждый
+    # тенге прироста "потрачен" в хронологии. ──
+    individual_income_total = sum(tx.amount for tx in stmt.transactions if tx.sign == 1)
+    individual_expense_total = sum(tx.amount for tx in stmt.transactions if tx.sign == -1)
+    original_min_rb_deficit = individual_income_total + stmt.balance_start - individual_expense_total
+    min_rb, neg_date = first_negative_dayend(stmt.transactions, stmt.balance_start, "new_amount")
+
+    if min_rb < 0 and original_min_rb_deficit >= -1.0:
+        print(f"\n  ⚠️ Баланс уходил в минус: {min_rb:,.2f} ₸ (первый дефицитный день ~{neg_date})")
+        print(f"  Корректируем: переносим расходный прирост с дней ДО дефицита на дни ПОСЛЕ")
+        prev_min = None
+        for attempt in range(80):
+            min_rb, neg_date = first_negative_dayend(stmt.transactions, stmt.balance_start, "new_amount")
+            if min_rb >= -0.01:
+                print(f"  ✅ Баланс скорректирован за {attempt} итераций, мин: {min_rb:,.2f} ₸")
+                break
+            neg_key = _date_sort_key(neg_date)
+            donors = [
+                tx for tx in stmt.transactions
+                if tx.sign == -1 and _date_sort_key(tx.date) <= neg_key
+                and tx.new_amount > tx.amount + 0.01
+            ]
+            receivers = [
+                tx for tx in stmt.transactions
+                if tx.sign == -1 and _date_sort_key(tx.date) > neg_key
+            ]
+            if not donors or not receivers:
+                print(f"  ⚠️ Нет донора/приёмника для переноса на {neg_date} — коррекция невозможна")
+                break
+            donor = max(donors, key=lambda t: t.new_amount - t.amount)
+            receiver = max(receivers, key=lambda t: t.amount)
+            step = min(donor.new_amount - donor.amount, max(1000.0, 0.05 * donor.new_amount))
+            donor.new_amount = round(donor.new_amount - step, 2)
+            receiver.new_amount = round(receiver.new_amount + step, 2)
+
+            current_rb = stmt.balance_start
+            for tx in reversed(stmt.transactions):
+                current_rb = round(current_rb + tx.sign * tx.new_amount, 2)
+                tx.new_balance_after = current_rb
+            min_rb, neg_date = first_negative_dayend(stmt.transactions, stmt.balance_start, "new_amount")
+
+            if prev_min is not None and min_rb <= prev_min + 0.01:
+                print(f"  ⚠️ Коррекция не сходится (мин застрял на {min_rb:,.2f} ₸) — стоп")
+                break
+            prev_min = min_rb
+        else:
+            print(f"  ⚠️ Коррекция не сошлась за 80 итераций, мин: {min_rb:,.2f} ₸")
+    elif min_rb < 0:
+        print(f"\n  ℹ️ Running balance минус ({min_rb:,.2f} ₸) — структурная особенность PDF."
+              f" Оригинал тоже дефицитен ({original_min_rb_deficit:,.2f} ₸). Не корректируем.")
+
+    if min_rb < -0.01 and original_min_rb_deficit >= -1.0:
         from pdf_service_downscale import IncomeTooLowError  # локальный импорт — избегаем цикла
 
         new_min = max(target_monthly_income, current_monthly_avg) * 1.10
@@ -1542,31 +1471,34 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
             n_months=n_months,
             reason="post_check_negative_balance",
             message=(
-                f"Не удалось удержать неотрицательный итоговый баланс при "
-                f"{target_monthly_income:,.0f} ₸/мес "
-                f"(получилось {stmt.new_balance_end:,.0f} ₸). Минимально "
+                f"Не удалось удержать неотрицательный running balance при "
+                f"{target_monthly_income:,.0f} ₸/мес с замороженным итоговым "
+                f"балансом (получилось min={min_rb:,.0f} ₸). Минимально "
                 f"рекомендуемый доход: {new_min:,.0f} ₸/мес."
             ),
         )
 
-    # Шапка стр.1 (cert-формат) физически не вмещает право-выровненное
-    # 10-значное число в своей ячейке «Сумма» (см. HeaderCellOverflowError).
-    # Проверяем ОБА поля, которые в неё пишутся, до тяжёлой записи PDF.
-    for _field_name, _val in (
-        ("total_income", stmt.new_total_income),
-        ("balance_end", stmt.new_balance_end),
-    ):
-        if abs(_val) > _HEADER_CELL_MAX_SAFE_VALUE:
+    # ── Guard'ы ёмкости ячеек шапки. balance_end больше не проверяем — он не
+    # пересчитывается и не может переполниться сверх того, чем уже был. ──
+    if abs(stmt.new_total_income) > _HEADER_CELL_MAX_SAFE_VALUE:
+        raise HeaderCellOverflowError(
+            field_name="total_income",
+            value=stmt.new_total_income,
+            max_safe_value=_HEADER_CELL_MAX_SAFE_VALUE,
+        )
+
+    # ── Категории расхода шапки — масштабируются пропорционально, сумма
+    # точно совпадает с target_total_expense (см. _scale_expense_categories). ──
+    stmt.new_expense_categories = _scale_expense_categories(
+        stmt.expense_categories, target_total_expense, stmt.total_expense
+    )
+    for cat, val in stmt.new_expense_categories.items():
+        if abs(val) > _HEADER_CELL_MAX_SAFE_VALUE:
             raise HeaderCellOverflowError(
-                field_name=_field_name,
-                value=_val,
+                field_name=f"expense_category:{cat}",
+                value=val,
                 max_safe_value=_HEADER_CELL_MAX_SAFE_VALUE,
             )
-
-    # Расходные категории заголовка: оставляем ОРИГИНАЛЬНЫМИ (не пересчитываем!)
-    if stmt.expense_categories:
-        for cat, old_val in stmt.expense_categories.items():
-            stmt.new_expense_categories[cat] = old_val  # без изменений!
 
     # ── Помесячная статистика нового дохода (только salary) ──
     new_monthly: Dict[str, float] = {}
@@ -1574,17 +1506,11 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
         if tx.is_salary:
             mk = _get_month_key(tx.date) or "unknown"
             new_monthly[mk] = new_monthly.get(mk, 0) + tx.new_amount
-    
-    print(f"\n  {'─' * 50}")
-    print(f"  Новый доход по месяцам:")
-    for mk in sorted(new_monthly.keys()):
-        deviation = (new_monthly[mk] - target_monthly_income) / target_monthly_income * 100
-        print(f"    {mk}: {new_monthly[mk]:>14,.2f} ₸ ({deviation:>+5.1f}%)")
-    
+
     new_avg = sum(new_monthly.values()) / max(len(new_monthly), 1)
     print(f"\n  Σ нового дохода:            {stmt.new_total_income:>14,.2f} ₸")
-    print(f"  Σ новых расходов:           {stmt.total_expense:>14,.2f} ₸")
-    print(f"  Новый баланс конец:         {stmt.new_balance_end:>14,.2f} ₸")
+    print(f"  Σ новых расходов:           {target_total_expense:>14,.2f} ₸")
+    print(f"  Баланс конец (заморожен):   {stmt.new_balance_end:>14,.2f} ₸")
     print(f"  Новый средний доход/мес:    {new_avg:>14,.2f} ₸")
     print(f"  Целевой:                    {target_monthly_income:>14,.2f} ₸")
     print(f"  {'─' * 50}")

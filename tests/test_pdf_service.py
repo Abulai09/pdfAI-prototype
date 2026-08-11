@@ -703,15 +703,12 @@ def test_first_negative_dayend_none_when_all_positive():
     assert neg_date is None
 
 
-def test_humped_income_recalculates_without_floor():
+def test_humped_income_no_longer_needs_floor_expense_absorbs_it():
     """«Горбатый» доход: крупный зарплатный месяц тратится в том же месяце.
-
-    Плоское выравнивание к цели около среднего срезает «горб» ниже, чем нужно
-    для покрытия его же расходов → running balance уходит в минус в середине
-    периода. Раньше движок УМЕНЬШАЛ salary (×0.97), углубляя дефицит, и падал
-    в IncomeTooLowError (ложный floor). Теперь ПОДНИМАЕТ доход в дефицитном
-    месяце → баланс ≥ 0 на всех границах дней, отказа нет.
-    """
+    РАНЬШЕ движок поднимал зарплату (Шаг 3), что двигало balance_end — теперь
+    balance_end заморожен, поэтому просадку чинит перенос РАСХОДА во времени:
+    расход месяца-«горба» растёт МЕНЬШЕ, чем позднее (после дня дефицита)
+    расходы, и итоговый баланс не сдвигается ни на тенге."""
     random.seed(0)
     # newest → oldest (как в PDF). Хронологически: 07 → 11 → 12; в каждом месяце
     # зарплата (раньше) предшествует расходу (позже) — валидный оригинал.
@@ -725,26 +722,67 @@ def test_humped_income_recalculates_without_floor():
     ]
     stmt = p.StatementData(
         balance_start=100_000.0,
-        balance_end=800_000.0,          # 100k + 12M(salary) - 11.3M(expense)
+        balance_end=800_000.0,          # 100k + 12M(salary) - 11.3M(expense) — ЗАМОРОЖЕН
         total_income=12_000_000.0,
         total_expense=11_300_000.0,
         transactions=txs,
     )
-    # avg salary = 12M / 3 мес = 4M; цель чуть выше среднего → upscale-путь,
-    # но плоское выравнивание срежет ноябрь (8M) до ~4.2M и сломает баланс.
     target = 4_200_000.0
 
-    # НЕ должно быть IncomeTooLowError
     result = p.recalculate_statement(stmt, target_monthly_income=target)
 
+    # balance_end НЕ ИЗМЕНИЛСЯ — это и есть новый инвариант
+    assert result.new_balance_end == 800_000.0
     # Баланс ≥ 0 на всех границах дней после коррекции
     min_rb, final_rb = p.min_dayend_balance(result.transactions, result.balance_start, "new_amount")
     assert min_rb >= -0.01, f"баланс ушёл в минус: {min_rb}"
-    assert result.new_balance_end >= 0, f"итоговый баланс отрицателен: {result.new_balance_end}"
-    # «Горб» (ноябрь) подняли ВЫШЕ плоской цели (4.2M), а не оставили срезанным
-    nov_salary = sum(t.new_amount for t in result.transactions
-                     if t.is_salary and (t.date or "").endswith("11.25"))
-    assert nov_salary > 4_300_000.0, f"ноябрьский горб не подняли: {nov_salary}"
+    assert round(final_rb, 2) == 800_000.0
+    # Тождество: Σ(sign=-1 new_amount) == balance_start + new_total_income - balance_end
+    debit_sum = round(sum(t.new_amount for t in result.transactions if t.sign == -1), 2)
+    expected_expense = round(result.balance_start + result.new_total_income - result.new_balance_end, 2)
+    assert debit_sum == expected_expense
+
+
+def test_recalculate_statement_freezes_balance_end_on_plain_upscale():
+    """Даже без просадки (обычный upscale без коррекции) balance_end не двигается,
+    а расходные транзакции вырастают, чтобы компенсировать выросший доход."""
+    random.seed(2)
+    txs = [
+        _tx_full("10.01.26", -1, 300_000.0, description="Покупка"),
+        _tx_full("05.01.26", +1, 1_000_000.0, is_salary=True, description="Пополнение"),
+    ]
+    stmt = p.StatementData(
+        balance_start=500_000.0,
+        balance_end=1_200_000.0,  # 500k + 1M - 300k
+        total_income=1_000_000.0,
+        total_expense=300_000.0,
+        transactions=txs,
+    )
+    result = p.recalculate_statement(stmt, target_monthly_income=2_000_000.0)
+
+    assert result.new_balance_end == 1_200_000.0
+    debit_tx = next(t for t in result.transactions if t.sign == -1)
+    assert debit_tx.new_amount > 300_000.0, "расход должен был вырасти вместе с доходом"
+
+
+def test_recalculate_statement_scales_expense_categories_proportionally():
+    random.seed(3)
+    txs = [
+        _tx_full("10.01.26", -1, 300_000.0, description="Покупка"),
+        _tx_full("05.01.26", +1, 1_000_000.0, is_salary=True, description="Пополнение"),
+    ]
+    stmt = p.StatementData(
+        balance_start=500_000.0,
+        balance_end=1_200_000.0,
+        total_income=1_000_000.0,
+        total_expense=300_000.0,
+        expense_categories={"Покупки": 300_000.0},
+        transactions=txs,
+    )
+    result = p.recalculate_statement(stmt, target_monthly_income=2_000_000.0)
+
+    expected_expense = round(result.balance_start + result.new_total_income - result.new_balance_end, 2)
+    assert round(sum(result.new_expense_categories.values()), 2) == expected_expense
 
 
 # ─── Downscale engine: успешное занижение при наличии запаса (без фикстур) ────
