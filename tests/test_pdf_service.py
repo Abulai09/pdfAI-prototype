@@ -582,7 +582,10 @@ def test_process_downscale_precheck_uses_correct_start_page_for_cert_format():
 # посчитанным при парсинге через уравнение баланса. new_balance_end считался
 # с этим неверным total_expense, ломая тождество на уровне транзакций.
 
-def test_downscale_preserves_balance_equation_expense_not_category_sum():
+def test_downscale_freezes_balance_and_scales_categories_to_match():
+    """balance_end заморожен и при downscale тоже: доход падает, а вместе с
+    ним падает и расход (категории шапки — пропорционально), чтобы
+    balance_start + new_income - new_expense == balance_end (неизменный)."""
     import random as _random
     import pdf_service_downscale as pd
     _random.seed(42)
@@ -590,24 +593,27 @@ def test_downscale_preserves_balance_equation_expense_not_category_sum():
     stmt = p.StatementData(
         balance_start=1_000_000.0,
         balance_end=1_000_000.0,
-        total_expense=500_000.0,  # верное значение — через уравнение баланса при парсинге
-        expense_categories={"Переводы": 300_000.0, "Покупки": 100_000.0},  # Σ=400000 != 500000 (дубли/неполнота шапки)
+        total_expense=500_000.0,
+        expense_categories={"Переводы": 300_000.0, "Покупки": 200_000.0},
+        expense_category_texts={"Переводы": "300 000,00", "Покупки": "200 000,00"},
     )
     stmt.transactions = [
         p.Transaction(index=0, sign=1, is_salary=True, is_refund=False,
-                      amount=1_000_000.0, date="01.06.26",
-                      original_amount_text="+ 1 000 000,00 ₸"),
+                      amount=1_500_000.0, date="01.06.26",
+                      original_amount_text="+ 1 500 000,00 ₸"),
         p.Transaction(index=1, sign=-1, is_salary=False, is_refund=False,
                       amount=500_000.0, date="01.06.26",
                       original_amount_text="- 500 000,00 ₸"),
     ]
+    # текущий ср. доход = 1.5M/мес; занижаем до 750k (в 2 раза), с запасом
+    # (balance_start большой, downscale-floor не мешает)
+    out = pd.recalculate_statement_downscale(stmt, 750_000.0)
 
-    out = pd.recalculate_statement_downscale(stmt, 500_000.0)
-
-    assert out.total_expense == 500_000.0, (
-        f"total_expense должен остаться значением из уравнения баланса "
-        f"(500000,0), а не суммой expense_categories (400000,0): {out.total_expense}"
-    )
+    assert out.new_balance_end == 1_000_000.0
+    expected_expense = round(out.balance_start + out.new_total_income - out.new_balance_end, 2)
+    assert round(sum(out.new_expense_categories.values()), 2) == expected_expense
+    debit_sum = round(sum(t.new_amount for t in out.transactions if t.sign == -1), 2)
+    assert debit_sum == expected_expense
 
 
 def test_stream_integrity_detects_actually_corrupted_stream():
@@ -803,18 +809,24 @@ def test_downscale_succeeds_with_slack():
         compute_min_target_monthly_income, IncomeTooLowError,
     )
 
+    # balance_end теперь ЗАМОРОЖЕН (см. recalculate_statement_downscale) — "запас
+    # на занижение" определяется тем, НАСКОЛЬКО МАЛО (balance_end - balance_start)
+    # относительно диапазона целей, а не тем, насколько расход мал относительно
+    # дохода (как было при старой, дорасходной модели). Здесь income ≈ expense
+    # (баланс почти не растёт за период), поэтому даже сильно заниженный доход
+    # оставляет требуемому расходу место остаться положительным.
     def make_stmt():
         txs = [
-            _tx_full("20.03.26", -1, 1_000_000.0, description="Покупка"),
+            _tx_full("20.03.26", -1, 4_700_000.0, description="Покупка"),
             _tx_full("10.03.26", +1, 5_000_000.0, is_salary=True, description="Пополнение"),
-            _tx_full("20.02.26", -1, 1_000_000.0, description="Покупка"),
+            _tx_full("20.02.26", -1, 4_700_000.0, description="Покупка"),
             _tx_full("10.02.26", +1, 5_000_000.0, is_salary=True, description="Пополнение"),
-            _tx_full("20.01.26", -1, 1_000_000.0, description="Покупка"),
+            _tx_full("20.01.26", -1, 4_700_000.0, description="Покупка"),
             _tx_full("10.01.26", +1, 5_000_000.0, is_salary=True, description="Пополнение"),
         ]
         return p.StatementData(
-            balance_start=2_000_000.0, balance_end=2_000_000.0 + 15_000_000.0 - 3_000_000.0,
-            total_income=15_000_000.0, total_expense=3_000_000.0, transactions=txs,
+            balance_start=2_000_000.0, balance_end=2_000_000.0 + 15_000_000.0 - 14_100_000.0,
+            total_income=15_000_000.0, total_expense=14_100_000.0, transactions=txs,
         )
 
     stmt = make_stmt()
