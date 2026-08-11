@@ -270,6 +270,65 @@ def check_variance_preserved(orig: "fitz.Document", out: "fitz.Document", start_
     return []
 
 
+def check_balance_frozen(orig: "fitz.Document", out: "fitz.Document") -> list[str]:
+    """«Доступно на …» и справка ₸/USD/EUR (cert-формат) обязаны остаться
+    ЧИСЛЕННО равны оригиналу на любой цели — recalculate_statement больше не
+    пересчитывает balance_end (см. docs/superpowers/specs/2026-08-11-
+    freeze-gold-balance-design.md)."""
+    issues = []
+    fmt = p.detect_statement_format(orig)
+    start_page = 1 if fmt == "cert" else 0
+
+    orig_stmt = p.parse_full_statement(orig, start_page=start_page)
+    out_stmt = p.parse_full_statement(out, start_page=start_page)
+    if abs(orig_stmt.balance_end - out_stmt.balance_end) > 0.01:
+        issues.append(
+            f"balance_end изменился: было {orig_stmt.balance_end:,.2f}, "
+            f"стало {out_stmt.balance_end:,.2f}"
+        )
+
+    if fmt == "cert":
+        orig_cert = p.parse_certificate_page(orig)
+        out_cert = p.parse_certificate_page(out)
+        for label, o_val, n_val in (
+            ("KZT", orig_cert.balance_kzt, out_cert.balance_kzt),
+            ("USD", orig_cert.balance_usd, out_cert.balance_usd),
+            ("EUR", orig_cert.balance_eur, out_cert.balance_eur),
+        ):
+            if o_val > 0 and abs(o_val - n_val) > 0.01:
+                issues.append(f"справка {label} изменилась: было {o_val:,.2f}, стало {n_val:,.2f}")
+
+    return issues
+
+
+def check_expense_categories_sum(out: "fitz.Document", start_page: int) -> list[str]:
+    """Сумма категорий расхода шапки (после обработки) обязана точно
+    совпадать с производным total_expense = balance_start + new_total_income
+    + refund_credit_total − balance_end — иначе видимая арифметика шапки не
+    сходится с балансовым тождеством (см. дизайн-документ, раздел про
+    категории). refund_credit_total (self-transfer/возвраты, is_refund=True,
+    sign=+1) пишутся по тождеству и не входят в «чистый» total_income шапки,
+    но реально увеличивают деньги на счёте — та же поправка, что и в
+    pdf_service.recalculate_statement (см. её комментарий у target_total_expense)."""
+    issues = []
+    stmt = p.parse_full_statement(out, start_page=start_page)
+    if not stmt.expense_categories:
+        return issues
+    refund_credit_total = sum(
+        t.amount for t in stmt.transactions if t.sign == 1 and t.is_refund
+    )
+    expected = round(
+        stmt.balance_start + stmt.total_income + refund_credit_total - stmt.balance_end, 2
+    )
+    actual = round(sum(stmt.expense_categories.values()), 2)
+    if abs(expected - actual) > 0.05:
+        issues.append(
+            f"Σ категорий расхода ({actual:,.2f}) ≠ производного total_expense "
+            f"({expected:,.2f}), Δ={actual - expected:+,.2f}"
+        )
+    return issues
+
+
 def check_rounding_escalation(orig: "fitz.Document", out: "fitz.Document", start_page: int) -> list[str]:
     """Критерий (добавлен 2026-08-03): если оригинальная сумма кратна крупному
     «человеческому» числу (5 000/10 000/.../1 000 000), результат должен
@@ -449,6 +508,8 @@ def geometry_check(pdf_bytes: bytes, orig_bytes: bytes) -> list[str]:
     issues.extend(check_natural_rounding(doc, start_page))
     issues.extend(check_variance_preserved(orig, doc, start_page))
     issues.extend(check_rounding_escalation(orig, doc, start_page))
+    issues.extend(check_balance_frozen(orig, doc))
+    issues.extend(check_expense_categories_sum(doc, start_page))
 
     # Стиль сериализации. Единственное расхождение, которое здесь НЕ считается
     # провалом, — лишний Tj от вынужденной подмены шрифта на стр.0: у части

@@ -1373,9 +1373,23 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
     stmt.new_balance_end = stmt.balance_end
 
     # ── Расход — производная величина: столько, сколько нужно, чтобы с
-    # ЗАМОРОЖЕННЫМ balance_end тождество баланса продолжало сходиться. ──
+    # ЗАМОРОЖЕННЫМ balance_end тождество баланса продолжало сходиться.
+    #
+    # stmt.new_total_income — «чистый» доход (без self-transfer/возвратов, см.
+    # is_refund), та же методология, что у печатаемого заголовка «Пополнения».
+    # Но is_refund-транзакции (self-transfer «Поступление»/«Зачисление» И
+    # возвраты покупок) пишутся в PDF ПО ТОЖДЕСТВУ (build_income_replacement_entries:
+    # value = tx.amount, не масштабируется) — их деньги реально проходят через
+    # счёт и должны быть покрыты расходом, иначе баланс на бумаге разъедется
+    # с суммой транзакций. Раньше (когда расход вообще не переписывался)
+    # старые байты уже несли этот излишек — теперь его нужно добавить явно.
+    refund_credit_total = sum(
+        tx.amount for tx in stmt.transactions if tx.sign == 1 and tx.is_refund
+    )
     target_total_expense = round(
-        stmt.balance_start + stmt.new_total_income - stmt.new_balance_end, 2
+        stmt.balance_start + stmt.new_total_income + refund_credit_total
+        - stmt.new_balance_end,
+        2,
     )
     if target_total_expense < 0:
         # При upscale (K >= 1.0) невозможно: new_total_income >= исходного,
@@ -1440,7 +1454,11 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
                 break
             donor = max(donors, key=lambda t: t.new_amount - t.amount)
             receiver = max(receivers, key=lambda t: t.amount)
-            step = min(donor.new_amount - donor.amount, max(1000.0, 0.05 * donor.new_amount))
+            # round(step, 2) ДО применения к обеим сторонам — иначе донор и
+            # приёмник округляют (new_amount ∓ step) НЕЗАВИСИМО и теряют доли
+            # копейки в разные стороны, накапливая дрейф за много итераций
+            # (найдено на реальном файле: Δ=-0.02 ₸ после долгой коррекции).
+            step = round(min(donor.new_amount - donor.amount, max(1000.0, 0.05 * donor.new_amount)), 2)
             donor.new_amount = round(donor.new_amount - step, 2)
             receiver.new_amount = round(receiver.new_amount + step, 2)
 
@@ -1717,6 +1735,44 @@ def build_income_replacement_entries(stmt: StatementData) -> Dict[str, Deque[Tup
         if key not in queue:
             queue[key] = _deque()
         queue[key].append((value, label))
+    return queue
+
+
+def build_expense_replacement_entries(stmt: StatementData) -> Dict[str, Deque[Tuple[float, str]]]:
+    """Строит очередь замен для РАСХОДНЫХ (sign=-1) транзакций.
+
+    Раньше расходы никогда не масштабировались (`tx.new_amount == tx.amount`
+    всегда), поэтому им не нужен был слот в очереди — писатель просто
+    оставлял их байты нетронутыми. Теперь (см. recalculate_statement/
+    recalculate_statement_downscale — balance_end заморожен, расход растёт
+    вместе с доходом) `tx.new_amount != tx.amount`, и каждая расходная
+    транзакция обязана зарезервировать РОВНО один слот — по той же причине,
+    что и salary-транзакции в build_income_replacement_entries: иначе
+    raw-byte сканер при встрече с оригинальными байтами "съедал" бы слот,
+    предназначенный для ДРУГОЙ транзакции с тем же текстом суммы.
+
+    Ключ с префиксом "OUT:" — низкоуровневый сканер process_pdf_bytes_raw
+    уже строит кандидатов с этим префиксом при виде декодированного минуса
+    (см. candidates.append(("OUT:" + clean_digits, False))), просто раньше
+    под этим ключом никогда ничего не лежало.
+    """
+    from collections import deque as _deque
+
+    def _clean(raw: str, prefix: str = "") -> str:
+        s = raw.replace(" ", "").replace("₸", "").replace("\xa0", "")
+        s = s.replace("+", "").replace("-", "")
+        return (prefix + s).strip()
+
+    queue: Dict[str, _deque] = {}
+    for tx in stmt.transactions:
+        if tx.sign != -1:
+            continue
+        key = _clean(tx.original_amount_text, prefix="OUT:")
+        if key == "OUT:":
+            continue
+        if key not in queue:
+            queue[key] = _deque()
+        queue[key].append((tx.new_amount, "TRANSACTION_OUT"))
     return queue
 
 
@@ -2198,6 +2254,21 @@ def process_pdf_bytes_raw(
             _hi = _tx.y_pdf_rounded - _Y_OFFSET + _Y_TOL
             page_refund_cs_ys.setdefault(_tx.page_num, set()).update(range(_lo, _hi + 1))
 
+    # Тот же Y-фильтр для расходных (sign=-1) строк — теперь они тоже
+    # масштабируются (см. build_expense_replacement_entries), поэтому
+    # подвержены ТОЙ ЖЕ ловушке «невидимых PDF-дублей» на других Y, что уже
+    # решена для salary/refund выше: без фильтра OUT:-очередь может отдать
+    # значение не той физической ячейке (найдено на реальном файле —
+    # gold5.pdf, где парсер видит рендер-дубли строк расхода: без фильтра
+    # «Баланс (транзакции)» расходится на десятки миллионов ₸, с фильтром —
+    # сходится).
+    page_expense_cs_ys: Dict[int, set] = {}
+    for _tx in stmt.transactions:
+        if _tx.sign == -1 and _tx.y_pdf_rounded > 0:
+            _lo = _tx.y_pdf_rounded - _Y_OFFSET - _Y_TOL
+            _hi = _tx.y_pdf_rounded - _Y_OFFSET + _Y_TOL
+            page_expense_cs_ys.setdefault(_tx.page_num, set()).update(range(_lo, _hi + 1))
+
     # ─── 2. Очередь замен ────────────────────────────────────
     replacement_queue: Dict[str, _deque] = {}
 
@@ -2215,7 +2286,13 @@ def process_pdf_bytes_raw(
             replacement_queue[key] = _deque()
         replacement_queue[key].extend(entries)
 
-    # Расходные транзакции — НЕ масштабируются, НЕ добавляем в очередь
+    # Расходные транзакции ТЕПЕРЬ масштабируются (balance_end заморожен, расход
+    # растёт вместе с доходом — см. recalculate_statement) — каждая резервирует
+    # свой OUT:-слот (см. build_expense_replacement_entries).
+    for key, entries in build_expense_replacement_entries(stmt).items():
+        if key not in replacement_queue:
+            replacement_queue[key] = _deque()
+        replacement_queue[key].extend(entries)
 
     if stmt.total_income_text and stmt.total_income > 0:
         key = _clean(stmt.total_income_text, prefix="HDR:")
@@ -2714,21 +2791,28 @@ def process_pdf_bytes_raw(
 
                 # Кандидаты ключей в порядке предпочтения
                 candidates = []
+                _y_int = round(float(y_str))
                 if has_plus_decoded:
                     # Per-page фильтр: принимаем IN: только если content-stream Y
                     # совпадает с ожидаемой позицией salary-транзакции на ЭТОЙ странице.
-                    _y_int = round(float(y_str))
                     _page_ys = page_income_cs_ys.get(page_num)
                     if _page_ys is not None and _y_int in _page_ys:
                         candidates.append(("IN:" + clean_digits, False))
                 elif has_minus_decoded:
-                    candidates.append(("OUT:" + clean_digits, False))
+                    # Тот же per-page Y-фильтр, что у IN: — расходные транзакции
+                    # теперь тоже масштабируются (см. build_expense_replacement_entries)
+                    # и подвержены той же ловушке рендер-дублей на других Y.
+                    _page_out_ys = page_expense_cs_ys.get(page_num)
+                    if _page_out_ys is not None and _y_int in _page_out_ys:
+                        candidates.append(("OUT:" + clean_digits, False))
                 elif prefix_text:
                     # Знак присутствует но не декодирован (например, "?"): пробуем оба.
                     # Пустой prefix_text означает отсутствие знака (running balance,
                     # заголовочное число) — в этот блок не заходим, чтобы не съедать
                     # слоты транзакционной очереди.
-                    candidates.append(("OUT:" + clean_digits, False))
+                    _page_out_ys = page_expense_cs_ys.get(page_num)
+                    if _page_out_ys is not None and _y_int in _page_out_ys:
+                        candidates.append(("OUT:" + clean_digits, False))
                     candidates.append(("IN:" + clean_digits, False))
                 # HDR (peek) как последний шанс
                 candidates.append(("HDR:" + clean_digits, True))

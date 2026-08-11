@@ -286,8 +286,17 @@ def recalculate_statement_downscale(
     # balance_end заморожен — та же инвариант, что и в upscale-движке.
     stmt.new_balance_end = stmt.balance_end
 
+    # refund_credit_total: is_refund-кредиты (self-transfer + возвраты покупок)
+    # пишутся по тождеству (не масштабируются), но реально проходят через
+    # счёт — расход обязан их покрыть (см. подробный комментарий в
+    # pdf_service.recalculate_statement, та же формула).
+    refund_credit_total = sum(
+        tx.amount for tx in stmt.transactions if tx.sign == 1 and tx.is_refund
+    )
     target_total_expense = round(
-        stmt.balance_start + stmt.new_total_income - stmt.new_balance_end, 2
+        stmt.balance_start + stmt.new_total_income + refund_credit_total
+        - stmt.new_balance_end,
+        2,
     )
     if target_total_expense < 0:
         new_min = target_monthly_income * 1.10
@@ -340,7 +349,9 @@ def recalculate_statement_downscale(
                 break
             donor = max(donors, key=lambda t: t.new_amount - t.amount)
             receiver = max(receivers, key=lambda t: t.amount)
-            step = min(donor.new_amount - donor.amount, max(1000.0, 0.05 * donor.new_amount))
+            # round(step, 2) ДО применения — см. тот же фикс и комментарий в
+            # pdf_service.recalculate_statement.
+            step = round(min(donor.new_amount - donor.amount, max(1000.0, 0.05 * donor.new_amount)), 2)
             donor.new_amount = round(donor.new_amount - step, 2)
             receiver.new_amount = round(receiver.new_amount + step, 2)
 

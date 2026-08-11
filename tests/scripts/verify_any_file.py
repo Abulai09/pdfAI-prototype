@@ -191,6 +191,8 @@ def criteria_kaspi_gold(raw: bytes, out_bytes: bytes) -> dict[str, list[str]]:
             "3 округление": vgold.check_natural_rounding(out, start),
             "3b разброс по месяцам": vgold.check_variance_preserved(orig, out, start),
             "3c эскалация шага": vgold.check_rounding_escalation(orig, out, start),
+            "1b баланс/справка заморожены": vgold.check_balance_frozen(orig, out),
+            "1c Σ категорий расхода": vgold.check_expense_categories_sum(out, start),
             "4 стиль": style,
         }
         if note:
@@ -217,6 +219,7 @@ def criteria_kaspi_ip(raw: bytes, out_bytes: bytes) -> dict[str, list[str]]:
         "2a наложения слов": overlaps,
         "2c правый край «Дебет»": vip.check_column_alignment(raw, out_bytes),
         "2d сумма в назначении": vip.check_purpose_amount_consistency(raw, out_bytes),
+        "1d тариф комиссии": vip.check_fee_tariff_ratio(raw, out_bytes),
         "3c эскалация шага": vip.check_rounding_escalation(raw, out_bytes),
         "4 стиль": vip.style_check(raw, out_bytes),
     }
