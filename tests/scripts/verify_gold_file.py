@@ -314,6 +314,12 @@ def check_expense_categories_sum(out: "fitz.Document", start_page: int) -> list[
     stmt = p.parse_full_statement(out, start_page=start_page)
     if not stmt.expense_categories:
         return issues
+    if stmt.expense_categories_ambiguous:
+        # ≥2 физические строки шапки схлопнулись в один ключ dict (см.
+        # expense_categories_ambiguous) — recalculate_statement сознательно
+        # НЕ трогает категории в этом случае (см. её комментарий), проверять
+        # тут нечего: расхождение ожидаемо и не является регрессией.
+        return issues
     refund_credit_total = sum(
         t.amount for t in stmt.transactions if t.sign == 1 and t.is_refund
     )

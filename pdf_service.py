@@ -128,6 +128,14 @@ class StatementData:
     # Расходы по категориям (как в Kaspi PDF заголовке)
     expense_categories: Dict[str, float] = field(default_factory=dict)  # {"Переводы": 47404891.0, ...}
     expense_category_texts: Dict[str, str] = field(default_factory=dict)  # {"Переводы": "47 404 891,00", ...}
+    # True, если ≥2 физические строки шапки совпали по ПЕРВОМУ слову (напр.
+    # «Переводы» и «Переводы на свои счета» — обе матчатся как first_word ==
+    # 'Переводы' и перезаписывают друг друга в expense_categories/_texts).
+    # Масштабировать/переписывать категории в этом случае небезопасно —
+    # видна только ОДНА из физических строк, вторая осталась бы со старым
+    # значением (см. recalculate_statement — категории не масштабируются,
+    # если этот флаг True).
+    expense_categories_ambiguous: bool = False
     transactions: List[Transaction] = field(default_factory=list)
     # Новые значения после пересчёта
     new_balance_end: float = 0.0
@@ -988,6 +996,12 @@ def parse_full_statement(doc, start_page: int = 0) -> StatementData:
         if first_word in expense_labels:
             amount_text, sign, val = _collect_amount_on_line(words, x_min=_x_min)
             if val > 0:
+                if first_word in stmt.expense_categories:
+                    # Вторая физическая строка с тем же первым словом (напр.
+                    # «Переводы на свои счета» вслед за «Переводы») —
+                    # перезаписывает предыдущую в dict, одна из двух строк
+                    # становится невидимой для последующего масштабирования.
+                    stmt.expense_categories_ambiguous = True
                 total_expense_parts[first_word] = val
                 stmt.expense_categories[first_word] = val
                 stmt.expense_category_texts[first_word] = amount_text or ""
@@ -1453,7 +1467,15 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
                 print(f"  ⚠️ Нет донора/приёмника для переноса на {neg_date} — коррекция невозможна")
                 break
             donor = max(donors, key=lambda t: t.new_amount - t.amount)
-            receiver = max(receivers, key=lambda t: t.amount)
+            # Приёмник — САМАЯ ПОЗДНЯЯ дата, не самая крупная сумма: чем позже
+            # дата, тем больше накопленного буфера у running balance к этому
+            # моменту, тем меньше риск, что прирост создаст НОВЫЙ дефицит
+            # прямо в точке приёмника. Выбор «крупнейшая сумма» (прежняя
+            # версия) минимизировал % искажение одной транзакции, но часто
+            # выбирал приёмника рядом с исходным дефицитом — коррекция
+            # застревала (min_rb переставал улучшаться, срабатывал guard
+            # стагнации), хотя структурно решение существовало.
+            receiver = max(receivers, key=lambda t: _date_sort_key(t.date))
             # round(step, 2) ДО применения к обеим сторонам — иначе донор и
             # приёмник округляют (new_amount ∓ step) НЕЗАВИСИМО и теряют доли
             # копейки в разные стороны, накапливая дрейф за много итераций
@@ -1506,10 +1528,20 @@ def recalculate_statement(stmt: StatementData, target_monthly_income: float) -> 
         )
 
     # ── Категории расхода шапки — масштабируются пропорционально, сумма
-    # точно совпадает с target_total_expense (см. _scale_expense_categories). ──
-    stmt.new_expense_categories = _scale_expense_categories(
-        stmt.expense_categories, target_total_expense, stmt.total_expense
-    )
+    # точно совпадает с target_total_expense (см. _scale_expense_categories).
+    # Если ≥2 физические строки шапки схлопнулись в один ключ dict
+    # (expense_categories_ambiguous) — НЕ трогаем категории вовсе: видна
+    # только ОДНА из физических строк, вторая осталась бы с чужим значением
+    # (найдено на реальных файлах: gold5/gold_6/gold7/gold_format3.pdf —
+    # «Переводы на свои счета» перезаписывает «Переводы» при парсинге). ──
+    if stmt.expense_categories_ambiguous:
+        print("[Engine] ⚠️ Категории расхода неоднозначны (≥2 строки с общим "
+              "первым словом) — не масштабируем, оставляем оригинальными")
+        stmt.new_expense_categories = {}
+    else:
+        stmt.new_expense_categories = _scale_expense_categories(
+            stmt.expense_categories, target_total_expense, stmt.total_expense
+        )
     for cat, val in stmt.new_expense_categories.items():
         if abs(val) > _HEADER_CELL_MAX_SAFE_VALUE:
             raise HeaderCellOverflowError(

@@ -348,7 +348,9 @@ def recalculate_statement_downscale(
                 print(f"  ⚠️ Нет донора/приёмника для переноса на {neg_date}")
                 break
             donor = max(donors, key=lambda t: t.new_amount - t.amount)
-            receiver = max(receivers, key=lambda t: t.amount)
+            # Приёмник — самая поздняя дата (не крупнейшая сумма) — см. тот же
+            # фикс и комментарий в pdf_service.recalculate_statement.
+            receiver = max(receivers, key=lambda t: _date_sort_key(t.date))
             # round(step, 2) ДО применения — см. тот же фикс и комментарий в
             # pdf_service.recalculate_statement.
             step = round(min(donor.new_amount - donor.amount, max(1000.0, 0.05 * donor.new_amount)), 2)
@@ -384,10 +386,16 @@ def recalculate_statement_downscale(
                 ),
             )
 
-    # ── Категории расхода — масштабируются пропорционально (как в upscale) ──
-    stmt.new_expense_categories = _scale_expense_categories(
-        stmt.expense_categories, target_total_expense, stmt.total_expense
-    )
+    # ── Категории расхода — масштабируются пропорционально (как в upscale),
+    # кроме случая неоднозначных категорий (см. тот же гард и комментарий в
+    # pdf_service.recalculate_statement). ──
+    if stmt.expense_categories_ambiguous:
+        print("[Downscale] ⚠️ Категории расхода неоднозначны — не масштабируем")
+        stmt.new_expense_categories = {}
+    else:
+        stmt.new_expense_categories = _scale_expense_categories(
+            stmt.expense_categories, target_total_expense, stmt.total_expense
+        )
 
     # ── Помесячная статистика ──
     new_monthly: Dict[str, float] = {}

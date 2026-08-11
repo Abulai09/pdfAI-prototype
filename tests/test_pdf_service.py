@@ -946,3 +946,63 @@ def test_build_cert_replacement_entries_still_writes_when_changed():
     entries = p.build_cert_replacement_entries(cert)
     assert "CERT_KZT:14317028" in entries
     assert entries["CERT_KZT:14317028"][0] == 200000.00
+
+
+# ─── Найдено при прогоне на реальном корпусе testpdf/gold (2026-08-11) ────────
+
+def test_recalculate_statement_accounts_for_refund_credit_in_expense_target():
+    """self-transfer/возвратные кредиты (is_refund=True, sign=+1) пишутся по
+    тождеству (не масштабируются, см. build_income_replacement_entries), но
+    реально увеличивают деньги на счёте. Без refund_credit_total в формуле
+    target_total_expense расход занижался бы ровно на их сумму, и «Баланс
+    (транзакции)» переставал сходиться (найдено на реальных файлах —
+    goldformat1/2/4, gold5/gold_6/gold7, Δ от 21 тыс. до 19 млн ₸)."""
+    random.seed(5)
+    txs = [
+        _tx_full("10.01.26", -1, 300_000.0, description="Покупка"),
+        _tx_full("05.01.26", +1, 1_000_000.0, is_salary=True, description="Пополнение"),
+        _tx_full("03.01.26", +1, 500_000.0, is_salary=False, is_refund=True,
+                 description="Поступление"),
+    ]
+    stmt = p.StatementData(
+        balance_start=200_000.0,
+        balance_end=1_400_000.0,  # 200k + 1M(salary) + 500k(self-transfer) - 300k
+        total_income=1_000_000.0,
+        total_expense=300_000.0,
+        transactions=txs,
+    )
+    result = p.recalculate_statement(stmt, target_monthly_income=2_000_000.0)
+
+    assert result.new_balance_end == 1_400_000.0
+    refund_tx = next(t for t in result.transactions if t.is_refund)
+    assert refund_tx.new_amount == refund_tx.amount == 500_000.0  # тождество, не масштабируется
+    debit_tx = next(t for t in result.transactions if t.sign == -1)
+    expected_expense = round(
+        result.balance_start + result.new_total_income + 500_000.0 - result.new_balance_end, 2
+    )
+    assert debit_tx.new_amount == expected_expense
+
+
+def test_recalculate_statement_skips_ambiguous_expense_categories():
+    """Если ≥2 физические строки шапки схлопнулись в один ключ dict (см.
+    parse_full_statement — 'Переводы' и 'Переводы на свои счета' обе матчатся
+    как first_word=='Переводы'), масштабировать категории небезопасно: видна
+    только ОДНА физическая строка, вторая осталась бы с чужим значением.
+    Найдено на реальных файлах gold5/gold_6/gold7/gold_format3.pdf."""
+    random.seed(6)
+    txs = [
+        _tx_full("10.01.26", -1, 300_000.0, description="Покупка"),
+        _tx_full("05.01.26", +1, 1_000_000.0, is_salary=True, description="Пополнение"),
+    ]
+    stmt = p.StatementData(
+        balance_start=500_000.0,
+        balance_end=1_200_000.0,
+        total_income=1_000_000.0,
+        total_expense=300_000.0,
+        expense_categories={"Переводы": 300_000.0},
+        expense_categories_ambiguous=True,
+        transactions=txs,
+    )
+    result = p.recalculate_statement(stmt, target_monthly_income=2_000_000.0)
+
+    assert result.new_expense_categories == {}
