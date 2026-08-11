@@ -541,6 +541,46 @@ def _round_to_natural(val: float, original: Optional[float] = None) -> float:
     return float(round(val / unit) * unit)
 
 
+def _scale_expense_categories(
+    categories: Dict[str, float], new_total_expense: float, old_total_expense: float
+) -> Dict[str, float]:
+    """Пропорционально масштабирует категории расхода шапки стр.1 («Переводы»,
+    «Покупки», «Снятия», «Разное») так, чтобы их сумма ТОЧНО совпадала с
+    new_total_expense — не приближённо, потому что баланс на конец периода
+    теперь заморожен (см. recalculate_statement), и сумма видимых категорий
+    обязана сходиться с балансовым тождеством, которое реальный ревьюер может
+    проверить сложением четырёх строк шапки.
+
+    old_total_expense — это stmt.total_expense (значение из УРАВНЕНИЯ баланса
+    при парсинге, см. parse_full_statement), а НЕ Σ(categories.values()) — эти
+    две суммы могут расходиться на реальном файле из-за дублирующихся меток
+    («Переводы» и «Переводы на свои счета» перезаписывают друг друга в dict
+    при парсинге). Коэффициент считается от надёжного old_total_expense;
+    расхождение между ним и Σ(categories) поглощается последней категорией
+    вместе с обычным остатком округления — на практике оно мало (см. комментарий
+    в parse_full_statement про effective_expense).
+
+    Последняя категория (по порядку словаря — совпадает с порядком появления
+    в PDF, см. parse_full_statement) получает остаток вместо своей доли —
+    тот же приём распределения остатка, что уже используется в проекте
+    (например, в build_cert_replacement_entries для округления валют).
+    """
+    if not categories or old_total_expense <= 0:
+        return {}
+    factor = new_total_expense / old_total_expense
+    keys = list(categories.keys())
+    result: Dict[str, float] = {}
+    running = 0.0
+    for i, cat in enumerate(keys):
+        if i == len(keys) - 1:
+            result[cat] = round(new_total_expense - running, 2)
+        else:
+            val = round(categories[cat] * factor, 2)
+            result[cat] = val
+            running += val
+    return result
+
+
 # ---------------------------------------------------------------------------
 #  ЭТАП 1: Полный парсинг выписки Kaspi Gold
 # ---------------------------------------------------------------------------

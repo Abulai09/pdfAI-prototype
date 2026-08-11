@@ -800,3 +800,31 @@ def test_downscale_succeeds_with_slack():
     with pytest.raises(IncomeTooLowError) as exc_info:
         recalculate_statement_downscale(stmt_copy, avg * (MAX_DOWNSCALE_FACTOR - 0.05))
     assert exc_info.value.reason == "too_aggressive"
+
+
+# ─── _scale_expense_categories: точное попадание в сумму (без фикстур) ────────
+# Часть плана "заморозка баланса/справки Kaspi Gold" (2026-08-11) — расход
+# теперь производная величина, категории шапки должны масштабироваться так,
+# чтобы их сумма ТОЧНО совпадала с новым total_expense.
+
+def test_scale_expense_categories_sum_matches_target_exactly():
+    """Сумма отмасштабированных категорий должна ТОЧНО равняться
+    new_total_expense, даже если сами категории (из-за дублирующихся меток
+    в шапке — см. docstring парсера) не суммировались в старый total_expense.
+    Последняя категория по порядку словаря получает остаток."""
+    categories = {"Переводы": 300_000.0, "Покупки": 100_000.0, "Снятия": 50_000.0}
+    # Σ(categories) = 450000, но old_total_expense (из уравнения баланса) = 500000 —
+    # намеренное расхождение, как в реальных файлах с дублирующимися метками.
+    result = p._scale_expense_categories(
+        categories, new_total_expense=1_000_000.0, old_total_expense=500_000.0
+    )
+    assert set(result.keys()) == set(categories.keys())
+    assert round(sum(result.values()), 2) == 1_000_000.0
+
+
+def test_scale_expense_categories_empty_when_no_categories():
+    assert p._scale_expense_categories({}, 1000.0, 500.0) == {}
+
+
+def test_scale_expense_categories_empty_when_old_total_zero():
+    assert p._scale_expense_categories({"Переводы": 100.0}, 1000.0, 0.0) == {}
