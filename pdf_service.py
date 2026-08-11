@@ -1739,6 +1739,11 @@ def build_cert_replacement_entries(cert: CertificateData) -> Dict[str, Tuple[flo
     for key_prefix, text, old_val, new_val in _pairs:
         if not text or old_val <= 0:
             continue
+        if abs(new_val - old_val) < 0.005:
+            # Значение не изменилось (balance_end теперь заморожен — см.
+            # recalculate_statement) — не трогаем эту ячейку вовсе, вместо
+            # того чтобы записывать в PDF те же самые цифры.
+            continue
         digits = "".join(ch for ch in text if ch.isdigit())
         if not digits:
             continue
@@ -2222,11 +2227,28 @@ def process_pdf_bytes_raw(
             # был взят из категорий (а не из уравнения баланса).
             replacement_queue[key].append((stmt.new_total_income, "TOTAL_INCOME"))
 
-    # Расходные категории заголовка — НЕ меняем (банк верифицирует с базой)
+    # Расходные категории заголовка — растут вместе с расходом (см. Task 4
+    # docs/superpowers/plans/2026-08-11-freeze-gold-balance.md): balance_end
+    # заморожен, поэтому расход — производная величина, и категории обязаны
+    # оставаться консистентны с ней (иначе их сумма разойдётся с балансовым
+    # тождеством — новый видимый признак подделки взамен старого).
+    for cat, new_val in stmt.new_expense_categories.items():
+        old_text = stmt.expense_category_texts.get(cat, "")
+        old_val = stmt.expense_categories.get(cat, 0.0)
+        if not old_text or old_val <= 0:
+            continue
+        if abs(new_val - old_val) < 0.005:
+            continue
+        key = _clean(old_text, prefix="HDR:")
+        if key == "HDR:":
+            continue
+        if key not in replacement_queue:
+            replacement_queue[key] = _deque()
+        replacement_queue[key].append((new_val, f"EXPENSE_CATEGORY:{cat}"))
 
     if stmt.balance_end_text:
         key = _clean(stmt.balance_end_text, prefix="HDR:")
-        if key != "HDR:":
+        if key != "HDR:" and abs(stmt.new_balance_end - stmt.balance_end) >= 0.005:
             if key not in replacement_queue:
                 replacement_queue[key] = _deque()
             replacement_queue[key].append((stmt.new_balance_end, "BALANCE_END"))

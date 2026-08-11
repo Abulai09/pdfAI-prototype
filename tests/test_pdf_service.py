@@ -904,3 +904,33 @@ def test_scale_debit_transactions_exact_without_noise_is_deterministic():
     p._scale_debit_transactions_exact(txs_b, target_total=300_000.0, noise=False)
     assert [t.new_amount for t in txs_a] == [t.new_amount for t in txs_b]
     assert round(sum(t.new_amount for t in txs_a), 2) == 300_000.0
+
+
+# ─── build_cert_replacement_entries: не трогать, если значение не изменилось ──
+
+def test_build_cert_replacement_entries_skips_unchanged_balance():
+    """Раньше эта функция ставила запись в очередь всегда, если old_val > 0.
+    Теперь balance_end заморожен, поэтому cert.new_balance_kzt всегда равен
+    cert.balance_kzt — писать в PDF нечего, и функция обязана вернуть пустой
+    словарь (иначе байты страницы справки будут ничем не оправданно
+    затронуты записью, даже если итоговое число совпадает)."""
+    cert = p.CertificateData(
+        balance_kzt_text="143 170,28", balance_kzt=143170.28,
+        balance_usd_text="308,20", balance_usd=308.20,
+        balance_eur_text="263,31", balance_eur=263.31,
+        new_balance_kzt=143170.28, new_balance_usd=308.20, new_balance_eur=263.31,
+    )
+    entries = p.build_cert_replacement_entries(cert)
+    assert entries == {}
+
+
+def test_build_cert_replacement_entries_still_writes_when_changed():
+    """Регрессия: guard не должен ломать случай, когда значение ДЕЙСТВИТЕЛЬНО
+    изменилось."""
+    cert = p.CertificateData(
+        balance_kzt_text="143 170,28", balance_kzt=143170.28,
+        new_balance_kzt=200000.00, new_balance_usd=0.0, new_balance_eur=0.0,
+    )
+    entries = p.build_cert_replacement_entries(cert)
+    assert "CERT_KZT:14317028" in entries
+    assert entries["CERT_KZT:14317028"][0] == 200000.00
