@@ -828,3 +828,41 @@ def test_scale_expense_categories_empty_when_no_categories():
 
 def test_scale_expense_categories_empty_when_old_total_zero():
     assert p._scale_expense_categories({"Переводы": 100.0}, 1000.0, 0.0) == {}
+
+
+# ─── _scale_debit_transactions_exact: точное попадание в сумму (без фикстур) ──
+
+def test_scale_debit_transactions_exact_sum_matches_target():
+    random.seed(1)
+    txs = [
+        p.Transaction(index=0, sign=-1, amount=100_000.0, date="10.01.26"),
+        p.Transaction(index=1, sign=-1, amount=50_000.0, date="11.01.26"),
+        p.Transaction(index=2, sign=-1, amount=10_000.0, date="12.01.26"),
+        p.Transaction(index=3, sign=1, amount=999_999.0, date="13.01.26"),  # доход — не трогаем
+    ]
+    p._scale_debit_transactions_exact(txs, target_total=320_000.0)
+    debit_sum = round(sum(t.new_amount for t in txs if t.sign == -1), 2)
+    assert debit_sum == 320_000.0
+    # доходная транзакция не тронута функцией (new_amount остаётся дефолтным 0.0)
+    assert txs[3].new_amount == 0.0
+
+
+def test_scale_debit_transactions_exact_noop_when_no_debits():
+    txs = [p.Transaction(index=0, sign=1, amount=1000.0)]
+    p._scale_debit_transactions_exact(txs, target_total=5000.0)
+    assert txs[0].new_amount == 0.0  # не упало, ничего не сделало
+
+
+def test_scale_debit_transactions_exact_without_noise_is_deterministic():
+    txs_a = [
+        p.Transaction(index=0, sign=-1, amount=100_000.0, date="10.01.26"),
+        p.Transaction(index=1, sign=-1, amount=50_000.0, date="11.01.26"),
+    ]
+    txs_b = [
+        p.Transaction(index=0, sign=-1, amount=100_000.0, date="10.01.26"),
+        p.Transaction(index=1, sign=-1, amount=50_000.0, date="11.01.26"),
+    ]
+    p._scale_debit_transactions_exact(txs_a, target_total=300_000.0, noise=False)
+    p._scale_debit_transactions_exact(txs_b, target_total=300_000.0, noise=False)
+    assert [t.new_amount for t in txs_a] == [t.new_amount for t in txs_b]
+    assert round(sum(t.new_amount for t in txs_a), 2) == 300_000.0

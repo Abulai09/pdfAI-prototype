@@ -581,6 +581,48 @@ def _scale_expense_categories(
     return result
 
 
+def _scale_debit_transactions_exact(
+    transactions: List["Transaction"], target_total: float, noise: bool = True
+) -> None:
+    """Масштабирует ВСЕ расходные транзакции (sign == -1) пропорционально так,
+    чтобы Σ(new_amount) ТОЧНО равнялась target_total — баланс на конец периода
+    теперь заморожен (см. recalculate_statement), и сумма расходов обязана
+    попасть в цель без остатка от округления/шума.
+
+    Округление — round(x, 2), НЕ _round_to_natural: в отличие от зарплатных
+    пополнений, у которых реальные суммы всегда целые тенге на «человеческом»
+    шаге (см. докстринг _round_to_natural), для расходных транзакций Kaspi
+    Gold это не подтверждено измерением на реальном файле — расходы (покупки,
+    переводы, снятия) правдоподобно несут копейки, как обычные чеки. Решение
+    временное: см. TODO в комментарии ниже, куда смотреть при появлении
+    доступа к реальным файлам testpdf/gold.
+
+    Транзакция с наибольшей исходной amount получает остаток вместо своей
+    шумной доли — минимизирует относительное искажение (то же соображение,
+    что и в _scale_expense_categories).
+    """
+    debit_txs = [t for t in transactions if t.sign == -1]
+    if not debit_txs:
+        return
+    current_total = sum(t.amount for t in debit_txs)
+    if current_total <= 0:
+        return
+    factor = target_total / current_total
+    largest = max(debit_txs, key=lambda t: t.amount)
+    running = 0.0
+    for tx in debit_txs:
+        if tx is largest:
+            continue
+        # TODO(проверить на реальных файлах testpdf/gold): если окажется, что
+        # реальные расходные суммы Kaspi Gold всегда целые тенге (как salary),
+        # заменить round(x, 2) на _round_to_natural(x, original=tx.amount) —
+        # см. критерий 3 в CLAUDE.md.
+        epsilon = random.uniform(-0.03, 0.03) if noise else 0.0
+        tx.new_amount = round(tx.amount * factor * (1 + epsilon), 2)
+        running += tx.new_amount
+    largest.new_amount = round(target_total - running, 2)
+
+
 # ---------------------------------------------------------------------------
 #  ЭТАП 1: Полный парсинг выписки Kaspi Gold
 # ---------------------------------------------------------------------------
